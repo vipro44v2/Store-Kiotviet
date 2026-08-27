@@ -1,0 +1,2 @@
+import { query } from "@/lib/db/client";
+export const settingsRepository={async get<T>(key:string){return(await query<{value:T}>("SELECT value FROM system_settings WHERE key=$1",[key]))[0]?.value;},set:(key:string,value:unknown)=>query("INSERT INTO system_settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",[key,JSON.stringify(value)]),list:()=>query<Record<string,unknown>>("SELECT * FROM system_settings ORDER BY key")};

@@ -1,0 +1,2 @@
+import { query } from "@/lib/db/client";
+export function createConflict(entityType:string,entityKey:string,type:string,shopifyValue?:unknown,kiotVietValue?:unknown){return query("INSERT INTO sync_conflicts(entity_type,entity_key,conflict_type,shopify_value,kiotviet_value) VALUES($1,$2,$3,$4,$5)",[entityType,entityKey,type,shopifyValue?JSON.stringify(shopifyValue):null,kiotVietValue?JSON.stringify(kiotVietValue):null]);}

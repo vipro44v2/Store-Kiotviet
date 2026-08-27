@@ -1,0 +1,1 @@
+import { BranchMapping } from "@/components/admin/branch-mapping";export default function BranchesPage(){return <><header className="admin-header"><div><p className="eyebrow">Inventory routing</p><h1>Branch mappings</h1></div></header><BranchMapping/></>}

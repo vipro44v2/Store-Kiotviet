@@ -1,0 +1,2 @@
+import { getHealth } from "../services/health-service";import { closeDatabase } from "../lib/db/client";import { closeQueues } from "../lib/queue/queues";import { closeRedis } from "../lib/redis/client";
+getHealth().then(result=>{process.stdout.write(`${JSON.stringify(result,null,2)}\n`);if(result.status!=="healthy")process.exitCode=1;}).finally(async()=>{await closeQueues();await closeRedis();await closeDatabase();}).catch((error:unknown)=>{process.stderr.write(`${error instanceof Error?error.message:String(error)}\n`);process.exitCode=1;});

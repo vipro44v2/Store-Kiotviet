@@ -1,0 +1,6 @@
+import type { KiotVietProduct } from "@/lib/kiotviet/types";
+import type { ShopifyVariant } from "@/types/shopify";
+
+export function normalizeSku(value:string):string{return value.trim().normalize("NFKC").toUpperCase();}
+export function indexBySku<T>(items:T[],sku:(item:T)=>string){const index=new Map<string,T[]>();for(const item of items){const key=normalizeSku(sku(item));if(!key)continue;index.set(key,[...(index.get(key)??[]),item]);}return index;}
+export function buildSkuMapping(shopify:ShopifyVariant[],kiotviet:KiotVietProduct[]){const s=indexBySku(shopify,v=>v.sku),k=indexBySku(kiotviet,p=>p.code);const matched:Array<{sku:string;shopify:ShopifyVariant;kiotviet:KiotVietProduct}>=[],duplicateShopify:string[]=[],duplicateKiotViet:string[]=[],unmatchedShopify:string[]=[],unmatchedKiotViet:string[]=[];for(const [sku,variants] of s){if(variants.length>1){duplicateShopify.push(sku);continue;}const products=k.get(sku);if(!products){unmatchedShopify.push(sku);continue;}if(products.length>1){duplicateKiotViet.push(sku);continue;}matched.push({sku,shopify:variants[0],kiotviet:products[0]});}for(const sku of k.keys())if(!s.has(sku))unmatchedKiotViet.push(sku);return{matched,duplicateShopify,duplicateKiotViet,unmatchedShopify,unmatchedKiotViet};}

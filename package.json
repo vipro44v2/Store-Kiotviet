@@ -1,0 +1,40 @@
+{
+  "name": "shopify-kiotviet-sync",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "worker": "tsx src/worker.ts",
+    "scheduler": "tsx src/scheduler.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:seed": "tsx scripts/seed.ts",
+    "webhooks:register": "tsx scripts/register-shopify-webhooks.ts",
+    "health:check": "tsx scripts/check-integrations.ts"
+  },
+  "dependencies": {
+    "bullmq": "latest",
+    "ioredis": "latest",
+    "jose": "latest",
+    "next": "latest",
+    "pg": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/pg": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "eslint": "latest",
+    "eslint-config-next": "latest",
+    "tsx": "latest",
+    "typescript": "latest",
+    "vitest": "latest"
+  }
+}

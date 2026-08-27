@@ -1,0 +1,32 @@
+import { Queue } from "bullmq";
+import { getRedis } from "@/lib/redis/client";
+import type { JobPriority, JobType, SyncJobPayload } from "./jobs";
+import { priorityNumber } from "./jobs";
+import { getEnv } from "@/lib/env";
+import { jobsRepository } from "@/repositories/jobs";
+
+export const QUEUE_NAMES = ["sync", "webhooks", "reconciliation", "maintenance"] as const;
+export type QueueName = (typeof QUEUE_NAMES)[number];
+const queues = new Map<QueueName, Queue<SyncJobPayload>>();
+
+export function getQueue(name: QueueName): Queue<SyncJobPayload> {
+  let queue = queues.get(name);
+  if (!queue) { queue = new Queue<SyncJobPayload>(name, { connection: getRedis() }); queues.set(name, queue); }
+  return queue;
+}
+
+export async function enqueueJob(name: QueueName, type: JobType, payload: SyncJobPayload, priority: JobPriority = "normal", deduplicationId?: string) {
+  const auditId = await jobsRepository.create(type, payload, priority, getEnv().JOB_MAX_ATTEMPTS);
+  const job = await getQueue(name).add(type, { ...payload, auditJobId: auditId }, {
+    attempts: getEnv().JOB_MAX_ATTEMPTS,
+    backoff: { type: "custom" },
+    priority: priorityNumber[priority],
+    removeOnComplete: { age: 86_400 * 30, count: 10_000 },
+    removeOnFail: false,
+    jobId: deduplicationId,
+  });
+  await jobsRepository.attachQueueJob(auditId, String(job.id));
+  return job;
+}
+
+export async function closeQueues(): Promise<void> { await Promise.all([...queues.values()].map((queue) => queue.close())); queues.clear(); }
