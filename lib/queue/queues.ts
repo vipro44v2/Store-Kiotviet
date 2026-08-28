@@ -1,5 +1,5 @@
 import { Queue } from "bullmq";
-import { getRedis } from "@/lib/redis/client";
+import { getRedis, isRedisEnabled } from "@/lib/redis/client";
 import type { JobPriority, JobType, SyncJobPayload } from "./jobs";
 import { priorityNumber } from "./jobs";
 import { getEnv } from "@/lib/env";
@@ -17,6 +17,21 @@ export function getQueue(name: QueueName): Queue<SyncJobPayload> {
 
 export async function enqueueJob(name: QueueName, type: JobType, payload: SyncJobPayload, priority: JobPriority = "normal", deduplicationId?: string) {
   const auditId = await jobsRepository.create(type, payload, priority, getEnv().JOB_MAX_ATTEMPTS);
+  if (!isRedisEnabled()) {
+    await jobsRepository.attachQueueJob(auditId, `local-${auditId}`);
+    await jobsRepository.start(auditId, 1);
+    try {
+      const { processSyncJob } = await import("./worker");
+      await processSyncJob({ name: type, data: { ...payload, auditJobId: auditId } } as never);
+      await jobsRepository.complete(auditId);
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      const { isManualReview } = await import("./worker");
+      await jobsRepository.fail(auditId, failure, isManualReview(failure));
+      throw failure;
+    }
+    return { id: `local-${auditId}` };
+  }
   const job = await getQueue(name).add(type, { ...payload, auditJobId: auditId }, {
     attempts: getEnv().JOB_MAX_ATTEMPTS,
     backoff: { type: "custom" },

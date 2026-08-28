@@ -10,10 +10,12 @@ export function verifyShopifyHmac(rawBody: string, signature: string | null, sec
 }
 export function verifyKiotVietHmac(rawBody: string, signature: string | null, base64Secret: string): boolean {
   if (!signature || !base64Secret) return false;
+  // KiotViet currently labels its 64-character SHA-256 digest with `sha1=`.
+  const normalizedSignature = signature.replace(/^sha(?:1|256)=/i, "").trim();
   const keys = [Buffer.from(base64Secret, "base64"), Buffer.from(base64Secret, "utf8")];
   return keys.some((key) => {
     const hex = createHmac("sha256", key).update(rawBody, "utf8").digest("hex");
     const base64 = createHmac("sha256", key).update(rawBody, "utf8").digest("base64");
-    return safeEqual(hex.toLowerCase(), signature.toLowerCase()) || safeEqual(base64, signature);
+    return safeEqual(hex.toLowerCase(), normalizedSignature.toLowerCase()) || safeEqual(base64, normalizedSignature);
   });
 }

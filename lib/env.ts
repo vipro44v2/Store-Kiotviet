@@ -5,14 +5,15 @@ const optionalUrl = z.string().url().optional().or(z.literal(""));
 const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   APP_URL: z.string().url().default("http://localhost:3000"),
+  PUBLIC_APP_URL: optionalUrl,
   APP_PORT: z.coerce.number().int().positive().default(3000),
   DATABASE_URL: optionalUrl,
   DATABASE_POOL_MIN: z.coerce.number().int().nonnegative().default(1),
   DATABASE_POOL_MAX: z.coerce.number().int().positive().default(10),
   REDIS_URL: optionalUrl,
-  SHOPIFY_SHOP_DOMAIN: z.string().default(""),
-  SHOPIFY_ACCESS_TOKEN: z.string().default(""),
-  SHOPIFY_API_SECRET: z.string().default(""),
+  SHOPIFY_SHOP: z.string().regex(/^[a-z0-9][a-z0-9-]*$/i).default(""),
+  SHOPIFY_CLIENT_ID: z.string().default(""),
+  SHOPIFY_CLIENT_SECRET: z.string().default(""),
   SHOPIFY_API_VERSION: z.string().regex(/^\d{4}-\d{2}$/).default("2026-07"),
   KIOTVIET_CLIENT_ID: z.string().default(""),
   KIOTVIET_CLIENT_SECRET: z.string().default(""),
@@ -37,8 +38,8 @@ export function getEnv(): AppEnv {
 export function assertProductionEnv(): AppEnv {
   const env = getEnv();
   const required: Array<keyof AppEnv> = [
-    "DATABASE_URL", "REDIS_URL", "SHOPIFY_SHOP_DOMAIN", "SHOPIFY_ACCESS_TOKEN",
-    "SHOPIFY_API_SECRET", "KIOTVIET_CLIENT_ID", "KIOTVIET_CLIENT_SECRET",
+    "DATABASE_URL", "REDIS_URL", "SHOPIFY_SHOP", "SHOPIFY_CLIENT_ID",
+    "SHOPIFY_CLIENT_SECRET", "KIOTVIET_CLIENT_ID", "KIOTVIET_CLIENT_SECRET",
     "KIOTVIET_RETAILER", "KIOTVIET_WEBHOOK_SECRET", "SESSION_SECRET",
     "ADMIN_USERNAME", "ADMIN_PASSWORD",
   ];
@@ -50,4 +51,9 @@ export function assertProductionEnv(): AppEnv {
 
 export function resetEnvForTests(): void {
   cached = undefined;
+}
+
+export function getPublicAppUrl(): string {
+  const env = getEnv();
+  return (env.PUBLIC_APP_URL || env.APP_URL).replace(/\/$/, "");
 }

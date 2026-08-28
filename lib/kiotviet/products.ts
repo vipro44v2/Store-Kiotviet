@@ -1,5 +1,6 @@
 import { kiotVietFetch } from "./client";
 import type { GetProductsParams, KiotVietProductsResponse } from "./types";
+import type { KiotVietProduct } from "./types";
 
 const SEARCH_PARAMETER = "name";
 
@@ -21,4 +22,8 @@ export async function getKiotVietProducts(
   }
 
   return kiotVietFetch<KiotVietProductsResponse>(`/products?${query.toString()}`);
+}
+
+export function getKiotVietProduct(id: number): Promise<KiotVietProduct> {
+  return kiotVietFetch<KiotVietProduct>(`/products/${id}`);
 }

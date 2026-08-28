@@ -46,12 +46,16 @@ npm run db:seed
 npm run dev
 ```
 
-Trong terminal khác:
+Để test webhook local, Redis là bắt buộc để request chỉ enqueue BullMQ và trả về nhanh. Chạy PostgreSQL/Redis, web và worker ở các terminal riêng:
 
 ```bash
+docker compose up -d postgres redis
+npx tsx --env-file=.env.local scripts/migrate.ts
+npm run dev
 npm run worker
-npm run scheduler
 ```
+
+Không để trống `REDIS_URL` khi test webhook. Chế độ inline chỉ phù hợp phát triển các chức năng không liên quan webhook.
 
 - Catalog: http://localhost:3000
 - Admin: http://localhost:3000/admin
@@ -69,6 +73,44 @@ npm run health:check
 
 Nếu máy local có Docker, có thể khởi động riêng PostgreSQL/Redis bằng `docker compose up -d`; production không phụ thuộc Docker.
 
+## Test webhook local qua Cloudflare Tunnel
+
+Giữ Next.js chạy tại `http://localhost:3000`, sau đó mở tunnel ở terminal khác:
+
+```bash
+cloudflared tunnel --url http://localhost:3000
+```
+
+Cloudflare in ra một URL ngẫu nhiên dạng `https://abc.trycloudflare.com`. Cập nhật `.env.local` (không hardcode URL này trong code), rồi restart web và worker:
+
+```env
+APP_URL=http://localhost:3000
+PUBLIC_APP_URL=https://abc.trycloudflare.com
+REDIS_URL=redis://127.0.0.1:6379
+```
+
+Đăng ký URL sau trong KiotViet:
+
+```text
+https://abc.trycloudflare.com/api/webhooks/kiotviet
+```
+
+Route xác minh `X-Hub-Signature`, ghi event vào PostgreSQL, log payload đã che token/secret/signature/email/phone/address và chỉ enqueue vào BullMQ. Worker xử lý sync ngoài request. Route cũ `/api/kiotviet/webhooks` vẫn được giữ để tương thích.
+
+Test chữ ký và đường truyền trực tiếp qua localhost:
+
+```bash
+npm run webhooks:test:kiotviet
+```
+
+Test qua tunnel:
+
+```bash
+npm run webhooks:test:kiotviet -- https://abc.trycloudflare.com
+```
+
+Script dùng payload `stock.update` rỗng nên xác minh đầy đủ HTTP/HMAC/PostgreSQL/BullMQ mà không thay đổi tồn kho thật. Kết quả mong đợi là HTTP `200` với `success: true`.
+
 ## Environment variables
 
 Xem `.env.example`. Các secret bắt buộc chỉ nằm ở server:
@@ -76,14 +118,15 @@ Xem `.env.example`. Các secret bắt buộc chỉ nằm ở server:
 ```env
 NODE_ENV=production
 APP_URL=https://sync.example.com
+PUBLIC_APP_URL=https://sync.example.com
 APP_PORT=3000
 DATABASE_URL=postgresql://shopify_sync:STRONG_PASSWORD@127.0.0.1:5432/shopify_kiotviet
 DATABASE_POOL_MIN=1
 DATABASE_POOL_MAX=10
 REDIS_URL=redis://127.0.0.1:6379
-SHOPIFY_SHOP_DOMAIN=store.myshopify.com
-SHOPIFY_ACCESS_TOKEN=shpat_xxx
-SHOPIFY_API_SECRET=xxx
+SHOPIFY_SHOP=store
+SHOPIFY_CLIENT_ID=xxx
+SHOPIFY_CLIENT_SECRET=xxx
 SHOPIFY_API_VERSION=2026-07
 KIOTVIET_CLIENT_ID=xxx
 KIOTVIET_CLIENT_SECRET=xxx
@@ -127,7 +170,7 @@ read_customers, write_customers
 read_fulfillments, write_fulfillments
 ```
 
-Điền access token và API secret, sau đó đăng ký topics:
+Điền shop handle, Client ID và Client Secret. Access token được lấy tự động bằng client credentials, cache trong Redis và refresh trước khi hết hạn. Sau đó đăng ký topics:
 
 ```bash
 npm run webhooks:register
@@ -135,7 +178,7 @@ npm run webhooks:register
 
 Topics: orders create/update/cancel, refunds create, fulfillments create/update, products create/update/delete, inventory levels update, customers create/update, app uninstalled.
 
-Webhook URL có dạng `https://sync.example.com/api/shopify/webhooks/orders_create`. Shopify HMAC được kiểm tra bằng `SHOPIFY_API_SECRET` trên raw body.
+Webhook URL có dạng `https://sync.example.com/api/shopify/webhooks/orders_create`. Shopify HMAC được kiểm tra bằng `SHOPIFY_CLIENT_SECRET` trên raw body.
 
 ## KiotViet configuration
 
@@ -157,6 +200,8 @@ Content-Type: application/json
 ```
 
 Endpoint xác minh `X-Hub-Signature`. KiotViet yêu cầu phản hồi dưới 5 giây; route chỉ persist/enqueue rồi trả về, worker xử lý sau.
+
+Đăng ký thêm webhook thay đổi sản phẩm (ví dụ `product.update`) vào cùng URL. Sự kiện sản phẩm sẽ tự lấy bản ghi đầy đủ từ KiotViet rồi upsert title, mô tả, loại, trạng thái, SKU, giá, barcode và tồn kho sang Shopify. Sự kiện `stock.update` tiếp tục dùng luồng tồn kho riêng.
 
 ## Mapping branch/location
 

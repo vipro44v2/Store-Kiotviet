@@ -3,6 +3,10 @@ import { getEnv } from "@/lib/env";
 
 const globalRedis = globalThis as typeof globalThis & { __shopifyKiotVietRedis?: IORedis };
 
+export function isRedisEnabled(): boolean {
+  return Boolean(getEnv().REDIS_URL);
+}
+
 export function getRedis(): IORedis {
   if (globalRedis.__shopifyKiotVietRedis) return globalRedis.__shopifyKiotVietRedis;
   const url = getEnv().REDIS_URL;
