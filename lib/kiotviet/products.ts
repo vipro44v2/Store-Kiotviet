@@ -27,3 +27,18 @@ export async function getKiotVietProducts(
 export function getKiotVietProduct(id: number): Promise<KiotVietProduct> {
   return kiotVietFetch<KiotVietProduct>(`/products/${id}`);
 }
+
+export async function getKiotVietVariantFamily(product: KiotVietProduct): Promise<KiotVietProduct[]> {
+  if (!product.hasVariants && !product.masterProductId && !product.attributes?.length) return [product];
+  const rootId = product.masterProductId ?? product.id;
+  const family: KiotVietProduct[] = [];
+  let currentItem = 0;
+  let total = 1;
+  while (currentItem < total) {
+    const page = await getKiotVietProducts({ currentItem, pageSize: 100, includeInventory: true });
+    family.push(...page.data.filter((item) => item.id === rootId || item.masterProductId === rootId));
+    total = page.total;
+    currentItem += page.pageSize;
+  }
+  return family.length ? family : [product];
+}

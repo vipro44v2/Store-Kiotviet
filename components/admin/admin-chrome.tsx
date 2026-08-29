@@ -1,3 +1,44 @@
-"use client";import Link from "next/link";import { usePathname } from "next/navigation";import { LogoutButton } from "./logout-button";
-const links=["products","mappings","inventory","branches","orders","customers","jobs","conflicts","webhooks","logs","notifications","settings"];
-export function AdminChrome({children}:{children:React.ReactNode}){const pathname=usePathname();if(pathname==="/admin/login")return children;return <div className="admin-shell"><aside><Link className="admin-brand" href="/admin">SK Sync</Link><nav><Link href="/admin">Dashboard</Link>{links.map(link=><Link href={`/admin/${link}`} key={link}>{link[0].toUpperCase()+link.slice(1)}</Link>)}<Link href="/admin/connections/shopify">Shopify connection</Link><Link href="/admin/connections/kiotviet">KiotViet connection</Link></nav><LogoutButton/></aside><main className="admin-content">{children}</main></div>}
+"use client";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { LogoutButton } from "./logout-button";
+const links = [
+  "manual",
+  "products",
+  "mappings",
+  "inventory",
+  "branches",
+  "orders",
+  "customers",
+  "jobs",
+  "conflicts",
+  "webhooks",
+  "logs",
+  "notifications",
+  "settings",
+];
+export function AdminChrome({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  if (pathname === "/admin/login") return children;
+  return (
+    <div className="admin-shell">
+      <aside>
+        <Link className="admin-brand" href="/admin">
+          SK Sync
+        </Link>
+        <nav>
+          <Link href="/admin">Dashboard</Link>
+          {links.map((link) => (
+            <Link href={`/admin/${link}`} key={link}>
+              {link[0].toUpperCase() + link.slice(1)}
+            </Link>
+          ))}
+          <Link href="/admin/connections/shopify">Shopify connection</Link>
+          <Link href="/admin/connections/kiotviet">KiotViet connection</Link>
+        </nav>
+        <LogoutButton />
+      </aside>
+      <main className="admin-content">{children}</main>
+    </div>
+  );
+}

@@ -1,5 +1,89 @@
-import { z } from "zod";import { requireAdmin } from "@/lib/auth/middleware";import { assertTrustedOrigin } from "@/lib/security/csrf";import { query } from "@/lib/db/client";import { enqueueJob,getQueue,QUEUE_NAMES,type QueueName } from "@/lib/queue/queues";import type { JobPriority,JobType,SyncJobPayload } from "@/lib/queue/jobs";
+import { z } from "zod";
+import { requireAdmin } from "@/lib/auth/middleware";
+import { assertTrustedOrigin } from "@/lib/security/csrf";
+import { query } from "@/lib/db/client";
+import {
+  enqueueJob,
+  getQueue,
+  QUEUE_NAMES,
+  type QueueName,
+} from "@/lib/queue/queues";
+import type { JobPriority, JobType, SyncJobPayload } from "@/lib/queue/jobs";
 import { isRedisEnabled } from "@/lib/redis/client";
-const schema=z.object({action:z.enum(["retry","cancel","resolve"])});interface JobRow{type:JobType;payload:SyncJobPayload;priority:JobPriority;queue_job_id:string|null;status:string}
-function queueFor(type:JobType):QueueName{if(type.includes("reconciliation"))return"reconciliation";if(type==="cleanup_old_data"||type==="webhook_recovery")return"maintenance";if(type.startsWith("shopify_")||type.startsWith("kiotviet_"))return"webhooks";return"sync";}
-export async function POST(request:Request,{params}:{params:Promise<{id:string}>}){try{await requireAdmin();assertTrustedOrigin(request);const{id}=await params,{action}=schema.parse(await request.json());const rows=await query<JobRow>("SELECT type,payload,priority,queue_job_id,status FROM sync_jobs WHERE id=$1",[id]);const job=rows[0];if(!job)return Response.json({success:false,error:"Job not found"},{status:404});if(action==="retry"){const queued=await enqueueJob(queueFor(job.type),job.type,job.payload,job.priority);await query("UPDATE sync_jobs SET status='cancelled',updated_at=now() WHERE id=$1",[id]);return Response.json({success:true,jobId:queued.id});}if(action==="cancel"){if(isRedisEnabled()&&job.queue_job_id)for(const name of QUEUE_NAMES){const queued=await getQueue(name).getJob(job.queue_job_id);if(queued){await queued.remove().catch(()=>undefined);break;}}await query("UPDATE sync_jobs SET status='cancelled',completed_at=now(),updated_at=now() WHERE id=$1",[id]);}else await query("UPDATE sync_jobs SET status='completed',completed_at=now(),error=NULL,error_code=NULL,updated_at=now() WHERE id=$1 AND status='manual_review'",[id]);return Response.json({success:true});}catch(error){return Response.json({success:false,error:error instanceof Error?error.message:"Action failed"},{status:400});}}
+const schema = z.object({ action: z.enum(["retry", "cancel", "resolve"]) });
+interface JobRow {
+  type: JobType;
+  payload: SyncJobPayload;
+  priority: JobPriority;
+  queue_job_id: string | null;
+  status: string;
+}
+function queueFor(type: JobType): QueueName {
+  if (type.includes("reconciliation")) return "reconciliation";
+  if (type === "cleanup_old_data" || type === "webhook_recovery")
+    return "maintenance";
+  if (type.startsWith("shopify_") || type.startsWith("kiotviet_"))
+    return "webhooks";
+  return "sync";
+}
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  try {
+    await requireAdmin();
+    assertTrustedOrigin(request);
+    const { id } = await params,
+      { action } = schema.parse(await request.json());
+    const rows = await query<JobRow>(
+      "SELECT type,payload,priority,queue_job_id,status FROM sync_jobs WHERE id=$1",
+      [id],
+    );
+    const job = rows[0];
+    if (!job)
+      return Response.json(
+        { success: false, error: "Job not found" },
+        { status: 404 },
+      );
+    if (action === "retry") {
+      const queued = await enqueueJob(
+        queueFor(job.type),
+        job.type,
+        job.payload,
+        job.priority,
+      );
+      await query(
+        "UPDATE sync_jobs SET status='cancelled',updated_at=now() WHERE id=$1",
+        [id],
+      );
+      return Response.json({ success: true, jobId: queued.id });
+    }
+    if (action === "cancel") {
+      if (isRedisEnabled() && job.queue_job_id)
+        for (const name of QUEUE_NAMES) {
+          const queued = await getQueue(name).getJob(job.queue_job_id);
+          if (queued) {
+            await queued.remove().catch(() => undefined);
+            break;
+          }
+        }
+      await query(
+        "UPDATE sync_jobs SET status='cancelled',completed_at=now(),updated_at=now() WHERE id=$1",
+        [id],
+      );
+    } else
+      await query(
+        "UPDATE sync_jobs SET status='completed',completed_at=now(),error=NULL,error_code=NULL,updated_at=now() WHERE id=$1 AND status='manual_review'",
+        [id],
+      );
+    return Response.json({ success: true });
+  } catch (error) {
+    return Response.json(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : "Action failed",
+      },
+      { status: 400 },
+    );
+  }
+}

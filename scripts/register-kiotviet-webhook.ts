@@ -25,6 +25,11 @@ async function main() {
   const listResponse = await fetch("https://public.kiotapi.com/webhooks?pageSize=100", { headers });
   if (!listResponse.ok) throw new Error(`Could not list KiotViet webhooks (${listResponse.status})`);
   const list = await listResponse.json() as { data?: WebhookRecord[] };
+  const stale = list.data?.filter((webhook) => webhook.type === type && webhook.url !== url) ?? [];
+  for (const webhook of stale) {
+    const deleteResponse = await fetch(`https://public.kiotapi.com/webhooks/${webhook.id}`, { method: "DELETE", headers });
+    if (!deleteResponse.ok) throw new Error(`Could not remove stale KiotViet webhook ${webhook.id} (${deleteResponse.status})`);
+  }
   const existing = list.data?.find((webhook) => webhook.type === type && webhook.url === url);
   if (existing?.isActive) {
     process.stdout.write(`${JSON.stringify({ status: "already_registered", webhook: existing })}\n`);
@@ -43,7 +48,7 @@ async function main() {
         Type: type,
         Url: url,
         IsActive: true,
-        Description: type === "stock.update" ? "Shopify inventory synchronization" : "Shopify product synchronization",
+        Description: type === "stock.update" ? "Shopify inventory synchronization" : type === "order.update" ? "Shopify order cancellation synchronization" : "Shopify product synchronization",
         Secret: env.KIOTVIET_WEBHOOK_SECRET,
       },
     }),

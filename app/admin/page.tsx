@@ -1,3 +1,50 @@
-import { connection } from "next/server";import { getDashboardData } from "@/repositories/dashboard";import { ActionButton } from "@/components/admin/action-button";
-export default async function Dashboard(){await connection();let data:Awaited<ReturnType<typeof getDashboardData>>|null=null;try{data=await getDashboardData();}catch{}const counts=Object.fromEntries(data?.jobs.map(j=>[j.status,j.count])??[]);return <><header className="admin-header"><div><p className="eyebrow">Operations overview</p><h1>Dashboard</h1></div><div className="header-actions"><ActionButton action="mappings" label="Initialize mappings"/><ActionButton action="reconcile" label="Reconcile inventory"/></div></header>{!data&&<div className="error-banner">PostgreSQL is not configured or migrations have not been run.</div>}<section className="metric-grid"><Metric label="Products mapped" value={data?.mappings.mapped}/><Metric label="Products unmapped" value={data?.mappings.unmapped}/><Metric label="Pending jobs" value={counts.pending}/><Metric label="Failed jobs" value={counts.failed}/><Metric label="Manual reviews" value={counts.manual_review}/><Metric label="Open conflicts" value={data?.conflicts}/><Metric label="Webhooks today" value={data?.webhooksToday}/><Metric label="Worker" value="Heartbeat monitored"/></section></>}
-function Metric({label,value}:{label:string;value?:string}){return <article className="metric"><span>{label}</span><strong>{value??"0"}</strong></article>}
+import { connection } from "next/server";
+import { getDashboardData } from "@/repositories/dashboard";
+import { ActionButton } from "@/components/admin/action-button";
+export default async function Dashboard() {
+  await connection();
+  let data: Awaited<ReturnType<typeof getDashboardData>> | null = null;
+  try {
+    data = await getDashboardData();
+  } catch {}
+  const counts = Object.fromEntries(
+    data?.jobs.map((j) => [j.status, j.count]) ?? [],
+  );
+  return (
+    <>
+      <header className="admin-header">
+        <div>
+          <p className="eyebrow">Operations overview</p>
+          <h1>Dashboard</h1>
+        </div>
+        <div className="header-actions">
+          <ActionButton action="mappings" label="Initialize mappings" />
+          <ActionButton action="reconcile" label="Reconcile inventory" />
+        </div>
+      </header>
+      {!data && (
+        <div className="error-banner">
+          PostgreSQL is not configured or migrations have not been run.
+        </div>
+      )}
+      <section className="metric-grid">
+        <Metric label="Products mapped" value={data?.mappings.mapped} />
+        <Metric label="Products unmapped" value={data?.mappings.unmapped} />
+        <Metric label="Pending jobs" value={counts.pending} />
+        <Metric label="Failed jobs" value={counts.failed} />
+        <Metric label="Manual reviews" value={counts.manual_review} />
+        <Metric label="Open conflicts" value={data?.conflicts} />
+        <Metric label="Webhooks today" value={data?.webhooksToday} />
+        <Metric label="Worker" value="Heartbeat monitored" />
+      </section>
+    </>
+  );
+}
+function Metric({ label, value }: { label: string; value?: string }) {
+  return (
+    <article className="metric">
+      <span>{label}</span>
+      <strong>{value ?? "0"}</strong>
+    </article>
+  );
+}

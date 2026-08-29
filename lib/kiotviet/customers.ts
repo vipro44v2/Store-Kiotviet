@@ -1,3 +1,4 @@
 import { kiotVietClient } from "./client";
 export interface KiotVietCustomerInput{name:string;contactNumber?:string;email?:string;address?:string;comments?:string}
-export function createKiotVietCustomer(input:KiotVietCustomerInput){return kiotVietClient.post<{id:number;code:string}>("/customers",input);}
+export async function createKiotVietCustomer(input:KiotVietCustomerInput&{branchId:number}){const response=await kiotVietClient.post<{id?:number;Id?:number;code?:string;Code?:string;data?:{id?:number;Id?:number;code?:string;Code?:string}}>("/customers",input),value=response.data??response,id=Number(value.id??value.Id);if(!Number.isSafeInteger(id)||id<=0)throw new Error("KiotViet created the customer but did not return its ID");return{id,code:String(value.code??value.Code??"")};}
+export function updateKiotVietCustomer(id:number,input:KiotVietCustomerInput){return kiotVietClient.put<{id:number;code:string}>(`/customers/${id}`,input);}

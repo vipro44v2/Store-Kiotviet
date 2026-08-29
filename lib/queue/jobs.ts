@@ -1,8 +1,8 @@
 export const JOB_TYPES = [
   "shopify_order_create", "shopify_order_update", "shopify_order_cancel", "shopify_refund", "shopify_fulfillment",
-  "shopify_product_to_kiotviet", "kiotviet_product_to_shopify", "kiotviet_inventory_to_shopify",
+  "shopify_product_to_kiotviet", "kiotviet_product_to_shopify", "kiotviet_inventory_to_shopify", "kiotviet_order_to_shopify", "kiotviet_invoice_to_shopify",
   "inventory_reconciliation", "shopify_customer_to_kiotviet", "full_product_sync", "full_inventory_sync",
-  "full_order_reconciliation", "product_mapping_scan", "webhook_recovery", "cleanup_old_data",
+  "full_order_reconciliation", "kiotviet_return_reconciliation", "kiotviet_return_to_shopify", "product_mapping_scan", "webhook_recovery", "cleanup_old_data",
 ] as const;
 export type JobType = (typeof JOB_TYPES)[number];
 export type JobPriority = "critical" | "high" | "normal" | "low";

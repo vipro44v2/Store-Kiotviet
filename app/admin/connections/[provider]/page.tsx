@@ -1,2 +1,21 @@
-import { notFound } from "next/navigation";import { ConnectionCard } from "@/components/admin/connection-card";
-export default async function ConnectionPage({params}:{params:Promise<{provider:string}>}){const{provider}=await params;if(provider!=="shopify"&&provider!=="kiotviet")notFound();return <><header className="admin-header"><div><p className="eyebrow">Integration</p><h1>{provider==="shopify"?"Shopify":"KiotViet"} connection</h1></div></header><ConnectionCard provider={provider}/></>}
+import { notFound } from "next/navigation";
+import { ConnectionCard } from "@/components/admin/connection-card";
+export default async function ConnectionPage({
+  params,
+}: {
+  params: Promise<{ provider: string }>;
+}) {
+  const { provider } = await params;
+  if (provider !== "shopify" && provider !== "kiotviet") notFound();
+  return (
+    <>
+      <header className="admin-header">
+        <div>
+          <p className="eyebrow">Integration</p>
+          <h1>{provider === "shopify" ? "Shopify" : "KiotViet"} connection</h1>
+        </div>
+      </header>
+      <ConnectionCard provider={provider} />
+    </>
+  );
+}

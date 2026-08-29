@@ -1,3 +1,61 @@
-import { getPool } from "@/lib/db/client";import { getRedis,isRedisEnabled } from "@/lib/redis/client";import { getQueue } from "@/lib/queue/queues";import { getKiotVietAccessToken } from "@/lib/kiotviet/auth";import { shopifyGraphql } from "@/lib/shopify/graphql";import { query } from "@/lib/db/client";
-async function check(task:()=>Promise<unknown>){try{await task();return"healthy" as const;}catch{return"unhealthy" as const;}}
-export async function getHealth(){const local=!isRedisEnabled();const [database,redis,queue,shopify,kiotviet,heartbeats]=await Promise.all([check(()=>getPool().query("SELECT 1")),local?Promise.resolve("disabled" as const):check(()=>getRedis().ping()),local?Promise.resolve("inline" as const):check(()=>getQueue("sync").getJobCounts()),check(()=>shopifyGraphql(`query Health{shop{id}}`)),check(()=>getKiotVietAccessToken()),local?Promise.resolve([]):query<{last_seen_at:string}>("SELECT last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC LIMIT 1").catch(()=>[])]);const last=heartbeats[0]?new Date(heartbeats[0].last_seen_at).getTime():0;const worker=local?"inline":Date.now()-last<45000?"healthy":"stale";const infrastructureHealthy=local||redis==="healthy"&&queue==="healthy"&&worker==="healthy";const status=[database,shopify,kiotviet].every(v=>v==="healthy")&&infrastructureHealthy?"healthy":"degraded";return{status,database,redis,queue,worker,shopify,kiotviet,version:process.env.npm_package_version??"1.0.0",timestamp:new Date().toISOString()};}
+import { getPool } from "@/lib/db/client";
+import { getRedis, isRedisEnabled } from "@/lib/redis/client";
+import { getQueue } from "@/lib/queue/queues";
+import { getKiotVietAccessToken } from "@/lib/kiotviet/auth";
+import { shopifyGraphql } from "@/lib/shopify/graphql";
+import { query } from "@/lib/db/client";
+async function check(task: () => Promise<unknown>) {
+  try {
+    await task();
+    return "healthy" as const;
+  } catch {
+    return "unhealthy" as const;
+  }
+}
+export async function getHealth() {
+  const local = !isRedisEnabled();
+  const [database, redis, queue, shopify, kiotviet, heartbeats] =
+    await Promise.all([
+      check(() => getPool().query("SELECT 1")),
+      local
+        ? Promise.resolve("disabled" as const)
+        : check(() => getRedis().ping()),
+      local
+        ? Promise.resolve("inline" as const)
+        : check(() => getQueue("sync").getJobCounts()),
+      check(() => shopifyGraphql(`query Health{shop{id}}`)),
+      check(() => getKiotVietAccessToken()),
+      local
+        ? Promise.resolve([])
+        : query<{ last_seen_at: string }>(
+            "SELECT last_seen_at FROM worker_heartbeats ORDER BY last_seen_at DESC LIMIT 1",
+          ).catch(() => []),
+    ]);
+  const last = heartbeats[0]
+    ? new Date(heartbeats[0].last_seen_at).getTime()
+    : 0;
+  const worker = local
+    ? "inline"
+    : Date.now() - last < 45000
+      ? "healthy"
+      : "stale";
+  const infrastructureHealthy =
+    local ||
+    (redis === "healthy" && queue === "healthy" && worker === "healthy");
+  const status =
+    [database, shopify, kiotviet].every((v) => v === "healthy") &&
+    infrastructureHealthy
+      ? "healthy"
+      : "degraded";
+  return {
+    status,
+    database,
+    redis,
+    queue,
+    worker,
+    shopify,
+    kiotviet,
+    version: process.env.npm_package_version ?? "1.0.0",
+    timestamp: new Date().toISOString(),
+  };
+}

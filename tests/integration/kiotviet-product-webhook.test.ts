@@ -21,4 +21,44 @@ describe("KiotViet product webhook", () => {
     expect(enqueue).toHaveBeenCalledWith("webhooks", "kiotviet_product_to_shopify", { eventId: "event-product-1" }, "high", "kiotviet-kv-product-1");
     expect(store.mock.calls[0][4]["x-hub-signature"]).toBe("[REDACTED]");
   });
+
+  it("queues single and bulk price changes for Shopify synchronization", async () => {
+    store.mockResolvedValueOnce({ id: "event-pricebook-1", inserted: true, status: "received" });
+    const body = JSON.stringify({
+      Id: "kv-pricebook-1",
+      Attempt: 1,
+      Notifications: [{
+        Action: "pricebookdetail.update",
+        Data: [
+          { PriceBookId: 0, ProductId: 43043436, Price: 125000 },
+          { PriceBookId: 0, ProductId: 43043437, Price: 135000 },
+        ],
+      }],
+    });
+    const signature = createHmac("sha256", Buffer.from(process.env.KIOTVIET_WEBHOOK_SECRET!, "base64")).update(body).digest("hex");
+    const { receiveKiotVietWebhook } = await import("@/lib/kiotviet/webhooks");
+    const result = await receiveKiotVietWebhook(new Request("https://sync.example.com/api/kiotviet/webhooks", { method: "POST", headers: { "x-hub-signature": signature }, body }));
+    expect(result.status).toBe(200);
+    expect(enqueue).toHaveBeenCalledWith("webhooks", "kiotviet_product_to_shopify", { eventId: "event-pricebook-1" }, "high", "kiotviet-kv-pricebook-1");
+  });
+
+  it("queues deleted variants for Shopify synchronization", async () => {
+    store.mockResolvedValueOnce({ id: "event-product-delete", inserted: true, status: "received" });
+    const body = JSON.stringify({ Id: "kv-product-delete", Attempt: 1, RemoveId: [43095701], Notifications: [] });
+    const signature = createHmac("sha256", Buffer.from(process.env.KIOTVIET_WEBHOOK_SECRET!, "base64")).update(body).digest("hex");
+    const { receiveKiotVietWebhook } = await import("@/lib/kiotviet/webhooks");
+    const result = await receiveKiotVietWebhook(new Request("https://sync.example.com/api/kiotviet/webhooks", { method: "POST", headers: { "x-hub-signature": signature }, body }));
+    expect(result.status).toBe(200);
+    expect(enqueue).toHaveBeenCalledWith("webhooks", "kiotviet_product_to_shopify", { eventId: "event-product-delete" }, "high", "kiotviet-kv-product-delete");
+  });
+
+  it("queues KiotViet order updates for Shopify cancellation", async () => {
+    store.mockResolvedValueOnce({ id: "event-order-update", inserted: true, status: "received" });
+    const body = JSON.stringify({ Id: "kv-order-update", Attempt: 1, Notifications: [{ Action: "order.update.501195938", Data: [{ Id: 24102572, Status: 4, StatusValue: "Đã hủy" }] }] });
+    const signature = createHmac("sha256", Buffer.from(process.env.KIOTVIET_WEBHOOK_SECRET!, "base64")).update(body).digest("hex");
+    const { receiveKiotVietWebhook } = await import("@/lib/kiotviet/webhooks");
+    const result = await receiveKiotVietWebhook(new Request("https://sync.example.com/api/kiotviet/webhooks", { method: "POST", headers: { "x-hub-signature": signature }, body }));
+    expect(result.status).toBe(200);
+    expect(enqueue).toHaveBeenCalledWith("webhooks", "kiotviet_order_to_shopify", { eventId: "event-order-update" }, "high", "kiotviet-kv-order-update");
+  });
 });

@@ -1,0 +1,5 @@
+import { getKiotVietInvoice,getKiotVietInvoices } from "@/lib/kiotviet/returns";
+import { closeDatabase,query } from "@/lib/db/client";
+import { closeRedis } from "@/lib/redis/client";
+async function main(){const page=await getKiotVietInvoices(new Date(Date.now()-7*24*60*60_000).toISOString(),0,100),rows=[];for(const summary of page.data){const invoice=await getKiotVietInvoice(summary.id),raw=invoice as unknown as Record<string,unknown>;if(!invoice.orderCode)continue;const mapped=await query<{shopify_order_id:string}>("SELECT shopify_order_id FROM order_mappings WHERE kiotviet_order_code=$1",[invoice.orderCode]);if(mapped[0])rows.push({invoiceId:invoice.id,invoiceCode:invoice.code,orderCode:invoice.orderCode,shopifyOrderId:mapped[0].shopify_order_id,status:invoice.status,statusValue:invoice.statusValue,delivery:invoice.invoiceDelivery??raw.InvoiceDelivery??raw.deliveryDetail,keys:Object.keys(raw)});}process.stdout.write(`${JSON.stringify(rows,null,2)}\n`);}
+main().finally(async()=>{await closeRedis();await closeDatabase();});

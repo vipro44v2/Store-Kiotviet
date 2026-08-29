@@ -1,2 +1,17 @@
 import { receiveShopifyWebhook } from "@/lib/shopify/webhooks";
-export const runtime="nodejs";export async function POST(request:Request,context:{params:Promise<{topic:string}>}){try{const {topic}=await context.params;const result=await receiveShopifyWebhook(request,topic);return Response.json(result.body,{status:result.status});}catch{return Response.json({success:false,error:"Webhook service unavailable"},{status:503});}}
+export const runtime = "nodejs";
+export async function POST(
+  request: Request,
+  context: { params: Promise<{ topic: string }> },
+) {
+  try {
+    const { topic } = await context.params;
+    const result = await receiveShopifyWebhook(request, topic);
+    return Response.json(result.body, { status: result.status });
+  } catch {
+    return Response.json(
+      { success: false, error: "Webhook service unavailable" },
+      { status: 503 },
+    );
+  }
+}

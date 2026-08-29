@@ -1,1 +1,15 @@
-import { getHealth } from "@/services/health-service";export const dynamic="force-dynamic";export async function GET(){try{const health=await getHealth();return Response.json(health,{status:health.status==="healthy"?200:503});}catch{return Response.json({status:"unhealthy",timestamp:new Date().toISOString()},{status:503});}}
+import { getHealth } from "@/services/health-service";
+export const dynamic = "force-dynamic";
+export async function GET() {
+  try {
+    const health = await getHealth();
+    return Response.json(health, {
+      status: health.status === "healthy" ? 200 : 503,
+    });
+  } catch {
+    return Response.json(
+      { status: "unhealthy", timestamp: new Date().toISOString() },
+      { status: 503 },
+    );
+  }
+}

@@ -7,6 +7,9 @@ export async function POST(request: Request) {
     const result = await receiveKiotVietWebhook(request);
     return Response.json(result.body, { status: result.status });
   } catch {
-    return Response.json({ success: false, error: "Webhook service unavailable" }, { status: 503 });
+    return Response.json(
+      { success: false, error: "Webhook service unavailable" },
+      { status: 503 },
+    );
   }
 }
