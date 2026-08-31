@@ -1,11 +1,17 @@
 import { describe,expect,it } from "vitest";
 import { shouldSkipUnchangedProduct } from "@/lib/sync/kiotviet-product-sync";
 import { matchKiotVietOrderByShopifyReference } from "@/lib/kiotviet/orders";
+import { isOrderRecoveryWindowOpen,ORDER_RECOVERY_WINDOW_MS } from "@/lib/sync/order-sync";
 
 describe("order recovery",()=>{
   it("finds the KiotViet order using the exact Shopify ID reference",()=>{
     const orders=[{id:1,code:"DH1",description:"Shopify #10 (10)"},{id:2,code:"DH2",description:"Shopify #100 (100)"}];
     expect(matchKiotVietOrderByShopifyReference(orders,"10")?.id).toBe(1);
+  });
+  it("blocks recreation during the recovery window and permits it afterward",()=>{
+    const now=new Date("2026-08-31T00:10:00Z");
+    expect(isOrderRecoveryWindowOpen(new Date(now.getTime()-ORDER_RECOVERY_WINDOW_MS+1),now)).toBe(true);
+    expect(isOrderRecoveryWindowOpen(new Date(now.getTime()-ORDER_RECOVERY_WINDOW_MS),now)).toBe(false);
   });
 });
 

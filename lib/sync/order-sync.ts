@@ -1,5 +1,5 @@
 import type { ShopifyOrderWebhook } from "@/types/shopify";
-import { MappingError, PermanentError } from "@/lib/errors";
+import { MappingError, PermanentError, RetryableError } from "@/lib/errors";
 import { normalizeSku } from "./mappings";
 import { mappingsRepository } from "@/repositories/mappings";
 import { createKiotVietOrder, cancelKiotVietOrder, findKiotVietOrderByShopifyReference, updateKiotVietOrderCustomer } from "@/lib/kiotviet/orders";
@@ -14,6 +14,9 @@ interface OrderSettings {
   syncCancellation?: boolean;
   defaultBranchId?: number | string;
 }
+
+export const ORDER_RECOVERY_WINDOW_MS=5*60_000;
+export function isOrderRecoveryWindowOpen(createdAt:string|Date,now=new Date()){return now.getTime()-new Date(createdAt).getTime()<ORDER_RECOVERY_WINDOW_MS;}
 
 export async function syncShopifyOrder(order: ShopifyOrderWebhook) {
   const orderId = String(order.id);
@@ -36,7 +39,7 @@ export async function syncShopifyOrder(order: ShopifyOrderWebhook) {
 
     const settingsResult = await client.query<{ value: OrderSettings }>("SELECT value FROM system_settings WHERE key='orders'");
     const settings = settingsResult.rows[0]?.value ?? {};
-    const existing = await client.query<{ kiotviet_order_id: string | null; status: string | null }>("SELECT kiotviet_order_id,status FROM order_mappings WHERE shopify_order_id=$1", [orderId]);
+    const existing = await client.query<{ kiotviet_order_id: string | null; status: string | null; created_at:string|Date }>("SELECT kiotviet_order_id,status,created_at FROM order_mappings WHERE shopify_order_id=$1", [orderId]);
     if (existing.rowCount && !claimed) {
       let status = existing.rows[0]?.status ?? "created";
       if (status === "creating" && !existing.rows[0]?.kiotviet_order_id) {
@@ -45,6 +48,7 @@ export async function syncShopifyOrder(order: ShopifyOrderWebhook) {
           await client.query("UPDATE order_mappings SET kiotviet_order_id=$2,kiotviet_order_code=$3,status='created',financial_status=$4,fulfillment_status=$5,sync_status='synced',last_sync_at=now(),updated_at=now() WHERE shopify_order_id=$1 AND status='creating'", [orderId, recovered.id, recovered.code, order.financial_status, order.fulfillment_status ?? null]);
           return;
         }
+        if(isOrderRecoveryWindowOpen(existing.rows[0].created_at))throw new RetryableError(`Order ${order.id} is still inside the recovery window`);
       } else {
       if (settings.syncCustomers !== false && order.customer && existing.rows[0]?.kiotviet_order_id && status === "created") {
         await syncShopifyCustomer(order.customer);
