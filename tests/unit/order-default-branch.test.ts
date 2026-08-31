@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { PoolClient } from "pg";
+import type { SettingsClient } from "@/lib/sync/default-branch";
 
 const mocks = vi.hoisted(() => ({ getActiveBranches: vi.fn() }));
 
@@ -7,10 +7,10 @@ vi.mock("@/lib/kiotviet/branches", () => ({
   getActiveKiotVietBranches: mocks.getActiveBranches,
 }));
 
-import { resolveDefaultBranchId } from "@/lib/sync/order-sync";
+import { resolveDefaultBranchId } from "@/lib/sync/default-branch";
 
 function clientWith(query: ReturnType<typeof vi.fn>) {
-  return { query } as unknown as PoolClient;
+  return { query } as unknown as SettingsClient;
 }
 
 beforeEach(() => vi.clearAllMocks());
@@ -18,12 +18,15 @@ beforeEach(() => vi.clearAllMocks());
 describe("default KiotViet branch initialization", () => {
   it("uses an existing valid defaultBranchId", async () => {
     const query = vi.fn();
+    mocks.getActiveBranches.mockResolvedValue([
+      { id: 42, branchName: "Main", isActive: true },
+    ]);
 
     await expect(
       resolveDefaultBranchId(clientWith(query), { defaultBranchId: "42" }),
     ).resolves.toBe(42);
 
-    expect(mocks.getActiveBranches).not.toHaveBeenCalled();
+    expect(mocks.getActiveBranches).toHaveBeenCalledOnce();
     expect(query).not.toHaveBeenCalled();
   });
 
@@ -41,8 +44,53 @@ describe("default KiotViet branch initialization", () => {
 
     expect(query).toHaveBeenCalledWith(
       expect.stringContaining("jsonb_build_object('defaultBranchId'"),
-      [42],
+      [42, [42]],
     );
+  });
+
+  it("replaces a stale defaultBranchId with the only active branch", async () => {
+    mocks.getActiveBranches.mockResolvedValue([
+      { id: 42, branchName: "Main", isActive: true },
+    ]);
+    const query = vi.fn().mockResolvedValue({
+      rows: [{ default_branch_id: "42" }],
+    });
+
+    await expect(
+      resolveDefaultBranchId(clientWith(query), { defaultBranchId: 99 }),
+    ).resolves.toBe(42);
+
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining("system_settings.value || EXCLUDED.value"),
+      [42, [42]],
+    );
+  });
+
+  it("rejects a stale defaultBranchId when multiple branches are active", async () => {
+    mocks.getActiveBranches.mockResolvedValue([
+      { id: 42, branchName: "Main", isActive: true },
+      { id: 43, branchName: "Secondary", isActive: true },
+    ]);
+    const query = vi.fn();
+
+    await expect(
+      resolveDefaultBranchId(clientWith(query), { defaultBranchId: 99 }),
+    ).rejects.toThrow("Multiple active KiotViet branches");
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("does not use an inactive configured branch", async () => {
+    mocks.getActiveBranches.mockResolvedValue([
+      { id: 42, branchName: "Active", isActive: true },
+    ]);
+    const query = vi.fn().mockResolvedValue({
+      rows: [{ default_branch_id: "42" }],
+    });
+
+    await expect(
+      resolveDefaultBranchId(clientWith(query), { defaultBranchId: 99 }),
+    ).resolves.toBe(42);
+    expect(query).toHaveBeenCalled();
   });
 
   it("fails safely when multiple active branches exist", async () => {
@@ -84,7 +132,7 @@ describe("default KiotViet branch initialization", () => {
     expect(sql).not.toContain("value=EXCLUDED.value");
   });
 
-  it("is idempotent when concurrent webhooks initialize settings", async () => {
+  it("does not corrupt settings during concurrent order/customer initialization", async () => {
     mocks.getActiveBranches.mockResolvedValue([
       { id: 42, branchName: "Main", isActive: true },
     ]);
