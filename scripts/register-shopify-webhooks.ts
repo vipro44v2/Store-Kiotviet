@@ -1,24 +1,9 @@
 import { shopifyGraphql } from "../lib/shopify/graphql";
 import { assertProductionEnv, getEnv, getPublicAppUrl } from "../lib/env";
 import { closeRedis } from "../lib/redis/client";
+import { SHOPIFY_REGISTRATION_TOPICS } from "../lib/shopify/registration-topics";
 
 if (getEnv().NODE_ENV === "production") assertProductionEnv();
-
-const topics = {
-  "orders/create": "ORDERS_CREATE",
-  "orders/updated": "ORDERS_UPDATED",
-  "orders/cancelled": "ORDERS_CANCELLED",
-  "customers/create": "CUSTOMERS_CREATE",
-  "customers/update": "CUSTOMERS_UPDATE",
-  "refunds/create": "REFUNDS_CREATE",
-  "fulfillments/create": "FULFILLMENTS_CREATE",
-  "fulfillments/update": "FULFILLMENTS_UPDATE",
-  "products/create": "PRODUCTS_CREATE",
-  "products/update": "PRODUCTS_UPDATE",
-  "products/delete": "PRODUCTS_DELETE",
-  "inventory_levels/update": "INVENTORY_LEVELS_UPDATE",
-  "app/uninstalled": "APP_UNINSTALLED",
-} as const;
 
 async function main() {
   const current = await shopifyGraphql<{
@@ -27,7 +12,9 @@ async function main() {
     `query ExistingWebhooks { webhookSubscriptions(first:100) { nodes { id topic } } }`,
   );
 
-  for (const [topic, enumTopic] of Object.entries(topics)) {
+  for (const [topic, enumTopic] of Object.entries(
+    SHOPIFY_REGISTRATION_TOPICS,
+  )) {
     const uri = `${getPublicAppUrl()}/api/shopify/webhooks/${topic.replace("/", "_")}`;
     const existing = current.webhookSubscriptions.nodes.find(
       (item) => item.topic === enumTopic,

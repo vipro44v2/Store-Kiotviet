@@ -52,7 +52,7 @@ export async function syncInventoryNotification(
       );
 
     const activeLocation = activeLocations[0];
-    locations = await query<{
+    const inserted = await query<{
       shopify_location_id: string;
       safety_stock: string;
       created?: boolean;
@@ -61,13 +61,8 @@ export async function syncInventoryNotification(
         kiotviet_branch_id,kiotviet_branch_name,shopify_location_id,
         shopify_location_name,enabled,safety_stock
       ) VALUES($1,$2,$3,$4,true,0)
-      ON CONFLICT(kiotviet_branch_id,shopify_location_id) DO UPDATE SET
-        kiotviet_branch_name=EXCLUDED.kiotviet_branch_name,
-        shopify_location_name=EXCLUDED.shopify_location_name,
-        enabled=true,
-        safety_stock=0,
-        updated_at=now()
-      RETURNING shopify_location_id,safety_stock::text,(xmax=0) AS created`,
+      ON CONFLICT(kiotviet_branch_id,shopify_location_id) DO NOTHING
+      RETURNING shopify_location_id,safety_stock::text,true AS created`,
       [
         notification.BranchId,
         notification.BranchName || String(notification.BranchId),
@@ -75,7 +70,29 @@ export async function syncInventoryNotification(
         activeLocation.name,
       ],
     );
-    if (locations[0]?.created)
+    locations = inserted;
+    if (!locations.length) {
+      const existing = await query<{
+        shopify_location_id: string;
+        safety_stock: string;
+        enabled: boolean;
+      }>(
+        `SELECT shopify_location_id,safety_stock::text,enabled
+        FROM branch_location_mappings
+        WHERE kiotviet_branch_id=$1 AND shopify_location_id=$2`,
+        [notification.BranchId, activeLocation.id],
+      );
+      if (!existing.length)
+        throw new MappingError(
+          `Unable to create Shopify location mapping for KiotViet branch ${notification.BranchId}`,
+        );
+      if (!existing[0].enabled)
+        throw new MappingError(
+          `Shopify location mapping for KiotViet branch ${notification.BranchId} is disabled and must be enabled manually`,
+        );
+      locations = existing;
+    }
+    if (inserted.length)
       await log("info", "Automatic branch/location mapping created", {
         action: "auto_map_branch_location",
         provider: "shopify",

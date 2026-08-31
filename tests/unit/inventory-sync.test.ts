@@ -79,6 +79,7 @@ describe("syncInventoryNotification", () => {
     await syncInventoryNotification(notification);
 
     expect(mocks.query.mock.calls[1][0]).toContain("ON CONFLICT");
+    expect(mocks.query.mock.calls[1][0]).toContain("DO NOTHING");
     expect(mocks.query.mock.calls[1][1]).toEqual([
       10,
       "Main branch",
@@ -121,15 +122,19 @@ describe("syncInventoryNotification", () => {
     expect(mocks.setInventory).not.toHaveBeenCalled();
   });
 
-  it("uses an idempotent upsert for concurrent webhooks", async () => {
+  it("uses an idempotent insert for concurrent webhooks", async () => {
     const rows: Array<{ shopify_location_id: string; safety_stock: string }> = [];
     mocks.query.mockImplementation(async (sql: string) => {
-      if (sql.startsWith("SELECT shopify_location_id")) return [];
+      if (sql.includes("enabled=true")) return [];
       if (sql.includes("INSERT INTO branch_location_mappings")) {
-        if (!rows.length)
+        if (!rows.length) {
           rows.push({ shopify_location_id: "location-1", safety_stock: "0" });
-        return rows.map((row, index) => ({ ...row, created: index === 0 }));
+          return [{ ...rows[0], created: true }];
+        }
+        return [];
       }
+      if (sql.includes("FROM branch_location_mappings"))
+        return [{ ...rows[0], enabled: true }];
       return [];
     });
     mocks.getActiveLocations.mockResolvedValue([
@@ -147,6 +152,57 @@ describe("syncInventoryNotification", () => {
         String(sql).includes("ON CONFLICT(kiotviet_branch_id,shopify_location_id)"),
       ),
     ).toHaveLength(2);
+  });
+
+  it("leaves an existing disabled mapping disabled and requires manual action", async () => {
+    mocks.query
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          shopify_location_id: "location-1",
+          safety_stock: "4",
+          enabled: false,
+        },
+      ]);
+    mocks.getActiveLocations.mockResolvedValue([
+      { id: "location-1", name: "Primary" },
+    ]);
+
+    await expect(syncInventoryNotification(notification)).rejects.toThrow(
+      "is disabled and must be enabled manually",
+    );
+    expect(mocks.query.mock.calls[1][0]).toContain("DO NOTHING");
+    expect(mocks.query.mock.calls[1][0]).not.toContain("DO UPDATE");
+    expect(mocks.setInventory).not.toHaveBeenCalled();
+  });
+
+  it("preserves safety stock when a concurrent mapping already exists", async () => {
+    mocks.query
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          shopify_location_id: "location-1",
+          safety_stock: "5",
+          enabled: true,
+        },
+      ])
+      .mockResolvedValueOnce([]);
+    mocks.getActiveLocations.mockResolvedValue([
+      { id: "location-1", name: "Primary" },
+    ]);
+    mocks.getInventory.mockResolvedValue(9);
+
+    await syncInventoryNotification(notification);
+
+    expect(mocks.setInventory).toHaveBeenCalledWith(
+      "gid://shopify/InventoryItem/1",
+      "location-1",
+      3,
+      9,
+    );
+    expect(mocks.query.mock.calls[1][0]).not.toContain("safety_stock=");
   });
 
   it("clamps negative calculated inventory to zero", async () => {
