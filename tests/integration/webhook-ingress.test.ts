@@ -9,7 +9,10 @@ beforeAll(() => {
   process.env.KIOTVIET_WEBHOOK_SECRET =
     Buffer.from("kiotviet-secret").toString("base64");
 });
-beforeEach(() => { store.mockReset(); enqueue.mockReset(); });
+beforeEach(() => {
+  store.mockReset();
+  enqueue.mockReset();
+});
 describe("webhook ingress", () => {
   it("persists and queues a verified Shopify event", async () => {
     store.mockResolvedValueOnce({
@@ -47,11 +50,28 @@ describe("webhook ingress", () => {
     );
   });
   it("does not enqueue a duplicate Shopify delivery", async () => {
-    store.mockResolvedValueOnce({ id: "event-1", inserted: false, status: "received" });
+    store.mockResolvedValueOnce({
+      id: "event-1",
+      inserted: false,
+      status: "received",
+    });
     const body = JSON.stringify({ id: 123 });
-    const signature = createHmac("sha256", "shopify-secret").update(body).digest("base64");
+    const signature = createHmac("sha256", "shopify-secret")
+      .update(body)
+      .digest("base64");
     const { receiveShopifyWebhook } = await import("@/lib/shopify/webhooks");
-    const result = await receiveShopifyWebhook(new Request("https://sync.example.com", { method: "POST", headers: { "x-shopify-hmac-sha256": signature, "x-shopify-webhook-id": "delivery-1", "x-shopify-topic": "orders/create" }, body }), "orders_create");
+    const result = await receiveShopifyWebhook(
+      new Request("https://sync.example.com", {
+        method: "POST",
+        headers: {
+          "x-shopify-hmac-sha256": signature,
+          "x-shopify-webhook-id": "delivery-1",
+          "x-shopify-topic": "orders/create",
+        },
+        body,
+      }),
+      "orders_create",
+    );
     expect(result.body.duplicate).toBe(true);
     expect(enqueue).not.toHaveBeenCalled();
   });
@@ -98,12 +118,33 @@ describe("webhook ingress", () => {
     );
   });
   it("acknowledges but does not misroute an unsupported KiotViet event", async () => {
-    store.mockResolvedValueOnce({ id: "event-unsupported", inserted: true, status: "received" });
-    const body = JSON.stringify({ Id: "kv-unsupported", Notifications: [{ Action: "customer.update", Data: [{ Id: 1 }] }] });
-    const signature = createHmac("sha256", Buffer.from(process.env.KIOTVIET_WEBHOOK_SECRET!, "base64")).update(body).digest("hex");
+    store.mockResolvedValueOnce({
+      id: "event-unsupported",
+      inserted: true,
+      status: "received",
+    });
+    const body = JSON.stringify({
+      Id: "kv-unsupported",
+      Notifications: [{ Action: "customer.update", Data: [{ Id: 1 }] }],
+    });
+    const signature = createHmac(
+      "sha256",
+      Buffer.from(process.env.KIOTVIET_WEBHOOK_SECRET!, "base64"),
+    )
+      .update(body)
+      .digest("hex");
     const { receiveKiotVietWebhook } = await import("@/lib/kiotviet/webhooks");
-    const result = await receiveKiotVietWebhook(new Request("https://sync.example.com", { method: "POST", headers: { "x-hub-signature": signature }, body }));
-    expect(result).toMatchObject({ status: 200, body: { success: true, unsupported: true } });
+    const result = await receiveKiotVietWebhook(
+      new Request("https://sync.example.com", {
+        method: "POST",
+        headers: { "x-hub-signature": signature },
+        body,
+      }),
+    );
+    expect(result).toMatchObject({
+      status: 200,
+      body: { success: true, unsupported: true },
+    });
     expect(enqueue).not.toHaveBeenCalled();
   });
 });
