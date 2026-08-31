@@ -7,6 +7,27 @@ import {
   type MappingRecord,
 } from "@/repositories/mappings";
 import { normalizeSku } from "./mappings";
+import type { KiotVietProduct } from "@/lib/kiotviet/types";
+
+async function findExactKiotVietProducts(sku: string) {
+  const matches: KiotVietProduct[] = [];
+  let currentItem = 0;
+  let total = 1;
+  while (currentItem < total) {
+    const page = await getKiotVietProducts({
+      searchTerm: sku,
+      pageSize: 100,
+      currentItem,
+      includeInventory: false,
+    });
+    matches.push(
+      ...page.data.filter((product) => normalizeSku(product.code) === sku),
+    );
+    total = page.total;
+    currentItem += page.pageSize;
+  }
+  return matches;
+}
 
 export async function ensureProductMapping(
   skuValue: string,
@@ -23,20 +44,12 @@ export async function ensureProductMapping(
     throw new MappingError(`Product mapping for SKU ${sku} is incomplete`);
   }
 
-  const [shopifyCandidates, kiotVietPage] = await Promise.all([
+  const [shopifyCandidates, kiotVietMatches] = await Promise.all([
     findShopifyVariantsBySku(sku),
-    getKiotVietProducts({
-      searchTerm: sku,
-      pageSize: 100,
-      currentItem: 0,
-      includeInventory: false,
-    }),
+    findExactKiotVietProducts(sku),
   ]);
   const shopifyMatches = shopifyCandidates.filter(
     (variant) => normalizeSku(variant.sku) === sku,
-  );
-  const kiotVietMatches = kiotVietPage.data.filter(
-    (product) => normalizeSku(product.code) === sku,
   );
   if (shopifyMatches.length !== 1 || kiotVietMatches.length !== 1)
     throw new MappingError(
@@ -45,7 +58,7 @@ export async function ensureProductMapping(
 
   const shopify = shopifyMatches[0];
   const kiotViet = kiotVietMatches[0];
-  const mapping = await mappingsRepository.upsert({
+  await mappingsRepository.upsert({
     sku: kiotViet.code,
     normalized_sku: sku,
     shopify_product_id: shopify.product.id,
@@ -56,6 +69,11 @@ export async function ensureProductMapping(
     sync_direction: "kiotviet_to_shopify",
     sync_status: "mapped",
   });
+  const reconciled = await mappingsRepository.findBySku(sku);
+  if (reconciled.length !== 1 || !reconciled[0].kiotviet_product_id)
+    throw new MappingError(
+      `Product mapping for SKU ${sku} could not be reconciled after concurrent auto-map`,
+    );
   await log("info", "Product mapping automatically created for order", {
     action: "auto_map_order_product",
     provider: "shopify",
@@ -67,5 +85,5 @@ export async function ensureProductMapping(
     kiotVietProductId: kiotViet.id,
     jobId,
   });
-  return mapping;
+  return reconciled[0];
 }

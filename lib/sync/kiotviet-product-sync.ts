@@ -158,7 +158,7 @@ export async function syncDeletedKiotVietProducts(
     }>(
       `SELECT shopify_product_id,kiotviet_product_id,sync_status
       FROM product_mappings
-      WHERE ($1::bigint IS NOT NULL AND kiotviet_product_id=$1)
+      WHERE ($1::text IS NOT NULL AND kiotviet_product_id=$1)
         OR ($2::text IS NOT NULL AND (kiotviet_code=$2 OR normalized_sku=$3))`,
       [productId ? String(productId) : null, code ?? null, normalizedCode || null],
     );
@@ -185,7 +185,7 @@ export async function syncDeletedKiotVietProducts(
       ),
     ];
     const familyMappings = await query<{ kiotviet_product_id: string | null }>(
-      "SELECT kiotviet_product_id FROM product_mappings WHERE shopify_product_id=$1 AND NOT (kiotviet_product_id=ANY($2::bigint[])) AND sync_status<>'archived'",
+      "SELECT kiotviet_product_id FROM product_mappings WHERE shopify_product_id=$1 AND NOT (kiotviet_product_id=ANY($2::text[])) AND sync_status<>'archived'",
       [shopifyProductId, mappedKiotVietIds],
     );
     const remaining = (
@@ -243,7 +243,7 @@ export async function syncDeletedKiotVietProducts(
       }
     }
     await query(
-      "UPDATE product_mappings SET sync_status='archived',updated_at=now() WHERE kiotviet_product_id=ANY($1::bigint[])",
+      "UPDATE product_mappings SET sync_status='archived',updated_at=now() WHERE kiotviet_product_id=ANY($1::text[])",
       [mappedKiotVietIds],
     );
   }

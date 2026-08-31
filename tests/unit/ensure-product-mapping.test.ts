@@ -60,7 +60,9 @@ describe("ensureProductMapping", () => {
   });
 
   it("uses only one exact match and ignores fuzzy candidates", async () => {
-    mocks.findBySku.mockResolvedValue([]);
+    mocks.findBySku
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([mapping]);
     mocks.findShopify.mockResolvedValue([
       shopifyVariant("fuzzy", "NU012-X"),
       shopifyVariant("v1", " nu012 "),
@@ -90,6 +92,32 @@ describe("ensureProductMapping", () => {
       "info",
       "Product mapping automatically created for order",
       expect.objectContaining({ action: "auto_map_order_product", sku: "NU012" }),
+    );
+  });
+
+  it("searches every KiotViet result page before choosing an exact match", async () => {
+    mocks.findBySku
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([mapping]);
+    mocks.findShopify.mockResolvedValue([shopifyVariant("v1", "NU012")]);
+    mocks.getKiotViet
+      .mockResolvedValueOnce({
+        total: 101,
+        pageSize: 100,
+        data: [{ id: 999, code: "NU012-X", name: "Fuzzy" }],
+      })
+      .mockResolvedValueOnce({
+        total: 101,
+        pageSize: 100,
+        data: [{ id: 501, code: "NU012", name: "Exact" }],
+      });
+    mocks.upsert.mockResolvedValue(mapping);
+
+    await expect(ensureProductMapping("NU012")).resolves.toBe(mapping);
+
+    expect(mocks.getKiotViet).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ searchTerm: "NU012", currentItem: 100 }),
     );
   });
 
@@ -141,7 +169,14 @@ describe("ensureProductMapping", () => {
 
   it("converges concurrent mapping attempts on one mapping", async () => {
     const stored: typeof mapping[] = [];
-    mocks.findBySku.mockResolvedValue([]);
+    let initialReads = 0;
+    mocks.findBySku.mockImplementation(async () => {
+      if (initialReads < 2) {
+        initialReads++;
+        return [];
+      }
+      return stored;
+    });
     mocks.findShopify.mockResolvedValue([shopifyVariant("v1", "NU012")]);
     mocks.getKiotViet.mockResolvedValue({
       total: 1,

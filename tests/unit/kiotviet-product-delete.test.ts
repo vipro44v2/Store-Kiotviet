@@ -57,6 +57,10 @@ describe("KiotViet product deletion", () => {
 
     expect(mocks.archive).toHaveBeenCalledWith("gid://shopify/Product/1");
     expect(mocks.query.mock.calls[2][0]).toContain("sync_status='archived'");
+    const sql = mocks.query.mock.calls.map(([statement]) => String(statement));
+    expect(sql.some((statement) => statement.includes("$1::text"))).toBe(true);
+    expect(sql.some((statement) => statement.includes("$2::text[]"))).toBe(true);
+    expect(sql.some((statement) => statement.includes("bigint"))).toBe(false);
   });
 
   it("is safe when the same delete webhook is processed again", async () => {
@@ -118,6 +122,7 @@ describe("KiotViet product deletion", () => {
     );
     expect(mocks.query.mock.calls.some(([sql]) =>
       String(sql).includes("kiotviet_product_id=ANY") &&
+      String(sql).includes("$1::text[]") &&
       String(sql).includes("sync_status='archived'"),
     )).toBe(true);
   });
