@@ -14,6 +14,8 @@ import {
   cancelShopifyOrderById,
   fulfillShopifyOrderById,
 } from "@/lib/shopify/orders";
+import { getActiveKiotVietBranches } from "@/lib/kiotviet/branches";
+import type { PoolClient } from "pg";
 
 interface OrderSettings {
   autoCreate?: boolean;
@@ -21,6 +23,50 @@ interface OrderSettings {
   syncCustomers?: boolean;
   syncCancellation?: boolean;
   defaultBranchId?: number | string;
+}
+
+export async function resolveDefaultBranchId(
+  client: PoolClient,
+  settings: OrderSettings,
+): Promise<number> {
+  const configuredBranchId = Number(settings.defaultBranchId);
+  if (Number.isInteger(configuredBranchId) && configuredBranchId > 0)
+    return configuredBranchId;
+
+  const activeBranches = await getActiveKiotVietBranches();
+  if (!activeBranches.length)
+    throw new PermanentError(
+      "No active KiotViet branches exist; configure a default branch manually",
+    );
+  if (activeBranches.length > 1)
+    throw new PermanentError(
+      "Multiple active KiotViet branches exist; configure orders.defaultBranchId manually",
+    );
+
+  const branchId = activeBranches[0].id;
+  const updated = await client.query<{ default_branch_id: string }>(
+    `INSERT INTO system_settings(key,value,updated_at)
+    VALUES('orders',jsonb_build_object('defaultBranchId',$1::bigint),now())
+    ON CONFLICT(key) DO UPDATE SET
+      value=system_settings.value || EXCLUDED.value,
+      updated_at=now()
+    WHERE system_settings.value->>'defaultBranchId' IS NULL
+      OR system_settings.value->>'defaultBranchId' !~ '^[1-9][0-9]*$'
+    RETURNING value->>'defaultBranchId' AS default_branch_id`,
+    [branchId],
+  );
+  if (updated.rows[0]?.default_branch_id)
+    return Number(updated.rows[0].default_branch_id);
+
+  const current = await client.query<{ default_branch_id: string }>(
+    "SELECT value->>'defaultBranchId' AS default_branch_id FROM system_settings WHERE key='orders'",
+  );
+  const currentBranchId = Number(current.rows[0]?.default_branch_id);
+  if (Number.isInteger(currentBranchId) && currentBranchId > 0)
+    return currentBranchId;
+  throw new PermanentError(
+    "Default KiotViet branch could not be initialized; configure orders.defaultBranchId manually",
+  );
 }
 
 export const ORDER_RECOVERY_WINDOW_MS = 5 * 60_000;
@@ -140,13 +186,11 @@ export async function syncShopifyOrder(order: ShopifyOrderWebhook) {
     if (settings.paidOnly !== false && order.financial_status !== "paid")
       return;
 
-    const branchId = Number(settings.defaultBranchId);
-    if (!branchId)
-      throw new PermanentError("Default KiotViet branch is not configured");
+    const branchId = await resolveDefaultBranchId(client, settings);
 
     let customerId: number | undefined;
     if (settings.syncCustomers !== false && order.customer) {
-      await syncShopifyCustomer(order.customer);
+      await syncShopifyCustomer(order.customer, branchId);
       const customer = await client.query<{ kiotviet_customer_id: string }>(
         "SELECT kiotviet_customer_id FROM customer_mappings WHERE shopify_customer_id=$1",
         [String(order.customer.id)],
