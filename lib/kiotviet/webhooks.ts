@@ -12,6 +12,7 @@ function jobForAction(action:string){
   if(action.startsWith("stock.update"))return "kiotviet_inventory_to_shopify" as const;
   if(action.startsWith("order.update"))return "kiotviet_order_to_shopify" as const;
   if(action.startsWith("invoice.update"))return "kiotviet_invoice_to_shopify" as const;
+  if(action.startsWith("category.update"))return "kiotviet_category_to_shopify" as const;
   if(action.startsWith("product.")||action.startsWith("pricebookdetail.update"))return "kiotviet_product_to_shopify" as const;
   return undefined;
 }

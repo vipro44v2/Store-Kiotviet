@@ -13,6 +13,7 @@ import { query } from "@/lib/db/client";
 import { notify } from "@/lib/notifications/service";
 import { cleanupOldData, reconcileInventoryPage } from "@/lib/sync/reconciliation";
 import { reconcileKiotVietReturns, syncKiotVietReturn } from "@/lib/sync/return-sync";
+import { syncKiotVietCategoryToShopify } from "@/lib/sync/category-sync";
 
 function recordPayload(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object") throw new ValidationError("Webhook payload is invalid");
@@ -75,6 +76,13 @@ export async function processSyncJob(job: Job<SyncJobPayload>) {
         const priceOverrides = String(event?.event_type ?? "").startsWith("pricebookdetail.update") ? productPriceOverrides(body) : new Map<number, number>();
         for (const id of productIds(body)) await syncKiotVietProductToShopify(id, String(job.data.auditJobId), priceOverrides);
       }
+      break;
+    }
+    case "kiotviet_category_to_shopify": {
+      const body=payload as unknown as KiotVietWebhookPayload,ids=new Set<number>();
+      for(const notification of body.Notifications??[])for(const value of notification.Data??[]){const item=recordPayload(value),id=Number(item.CategoryId??item.categoryId??item.Id??item.id);if(Number.isSafeInteger(id)&&id>0)ids.add(id);}
+      if(!ids.size)throw new ValidationError("KiotViet category webhook contains no category ID");
+      for(const id of ids)await syncKiotVietCategoryToShopify(id,String(job.data.auditJobId));
       break;
     }
     case "kiotviet_order_to_shopify": {

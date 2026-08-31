@@ -2,6 +2,8 @@ import { kiotVietFetch } from "./client";
 import type { GetProductsParams, KiotVietProductsResponse } from "./types";
 import type { KiotVietProduct } from "./types";
 
+export interface KiotVietCategory{id:number;categoryId?:number;name?:string;categoryName?:string}
+
 const SEARCH_PARAMETER = "name";
 
 export async function getKiotVietProducts(
@@ -27,6 +29,8 @@ export async function getKiotVietProducts(
 export function getKiotVietProduct(id: number): Promise<KiotVietProduct> {
   return kiotVietFetch<KiotVietProduct>(`/products/${id}`);
 }
+
+export function getKiotVietCategory(id:number):Promise<KiotVietCategory>{return kiotVietFetch<KiotVietCategory>(`/categories/${id}`);}
 
 export async function getKiotVietVariantFamily(product: KiotVietProduct): Promise<KiotVietProduct[]> {
   if (!product.hasVariants && !product.masterProductId && !product.attributes?.length) return [product];

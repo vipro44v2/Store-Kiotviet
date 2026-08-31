@@ -62,4 +62,13 @@ describe("KiotViet product webhook", () => {
     expect(result.status).toBe(200);
     expect(enqueue).toHaveBeenCalledWith("webhooks", "kiotviet_order_to_shopify", { eventId: "event-order-update" }, "high", "kiotviet-kv-order-update");
   });
+
+  it("queues category updates for Shopify collection synchronization",async()=>{
+    store.mockResolvedValueOnce({id:"event-category",inserted:true,status:"received"});
+    const body=JSON.stringify({Id:"kv-category",Attempt:1,Notifications:[{Action:"category.update",Data:[{CategoryId:42}]}]});
+    const signature=createHmac("sha256",Buffer.from(process.env.KIOTVIET_WEBHOOK_SECRET!,"base64")).update(body).digest("hex");
+    const {receiveKiotVietWebhook}=await import("@/lib/kiotviet/webhooks");
+    await receiveKiotVietWebhook(new Request("https://sync.example.com",{method:"POST",headers:{"x-hub-signature":signature},body}));
+    expect(enqueue).toHaveBeenCalledWith("webhooks","kiotviet_category_to_shopify",{eventId:"event-category"},"high","kiotviet-kv-category");
+  });
 });
