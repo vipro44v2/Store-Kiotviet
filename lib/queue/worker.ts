@@ -58,7 +58,9 @@ function productIds(payload: KiotVietWebhookPayload): number[] {
   return [...ids];
 }
 
-function deletedProductIds(payload: KiotVietWebhookPayload): number[] {
+function deletedProductReferences(
+  payload: KiotVietWebhookPayload,
+): Array<{ id?: number; code?: string }> {
   const ids = new Set<number>(
     [...(payload.RemoveId ?? []), ...(payload.removeId ?? [])].map(Number),
   );
@@ -70,16 +72,32 @@ function deletedProductIds(payload: KiotVietWebhookPayload): number[] {
       ids.add(Number(id));
     for (const value of notification.Data ?? []) {
       const item = recordPayload(value);
+      const directId = Number(
+        item.ProductId ?? item.productId ?? item.Id ?? item.id,
+      );
+      if (Number.isSafeInteger(directId) && directId > 0) ids.add(directId);
       const values = item.RemoveId ?? item.removeId;
       if (Array.isArray(values)) for (const id of values) ids.add(Number(id));
     }
   }
   const valid = [...ids].filter((id) => Number.isSafeInteger(id) && id > 0);
-  if (!valid.length)
+  const codes = new Set<string>();
+  for (const notification of payload.Notifications ?? [])
+    for (const value of notification.Data ?? []) {
+      const item = recordPayload(value);
+      const code = String(
+        item.ProductCode ?? item.productCode ?? item.Code ?? item.code ?? item.Sku ?? item.sku ?? "",
+      ).trim();
+      if (code) codes.add(code);
+    }
+  if (!valid.length && !codes.size)
     throw new ValidationError(
-      "KiotViet product delete webhook contains no product ID",
+      "KiotViet product delete webhook contains no product ID or code",
     );
-  return valid;
+  return [
+    ...valid.map((id) => ({ id })),
+    ...[...codes].map((code) => ({ code })),
+  ];
 }
 
 function productPriceOverrides(
@@ -130,7 +148,7 @@ export async function processSyncJob(job: Job<SyncJobPayload>) {
       const body = payload as unknown as KiotVietWebhookPayload;
       if (String(event?.event_type ?? "").startsWith("product.delete"))
         await syncDeletedKiotVietProducts(
-          deletedProductIds(body),
+          deletedProductReferences(body),
           String(job.data.auditJobId),
         );
       else {

@@ -1,7 +1,6 @@
 import type { ShopifyOrderWebhook } from "@/types/shopify";
 import { MappingError, PermanentError, RetryableError } from "@/lib/errors";
 import { normalizeSku } from "./mappings";
-import { mappingsRepository } from "@/repositories/mappings";
 import {
   createKiotVietOrder,
   cancelKiotVietOrder,
@@ -18,6 +17,7 @@ import {
   resolveDefaultBranchId,
   type OrderSettings,
 } from "./default-branch";
+import { ensureProductMapping } from "./ensure-product-mapping";
 
 export const ORDER_RECOVERY_WINDOW_MS = 5 * 60_000;
 export function isOrderRecoveryWindowOpen(
@@ -153,13 +153,9 @@ export async function syncShopifyOrder(order: ShopifyOrderWebhook) {
     const details = [];
     for (const line of order.line_items) {
       const sku = normalizeSku(line.sku);
-      const maps = await mappingsRepository.findBySku(sku);
-      if (maps.length !== 1 || !maps[0].kiotviet_product_id)
-        throw new MappingError(
-          `Missing or ambiguous mapping for SKU ${sku || "(empty)"}`,
-        );
+      const mapping = await ensureProductMapping(sku);
       details.push({
-        productId: Number(maps[0].kiotviet_product_id),
+        productId: Number(mapping.kiotviet_product_id),
         productCode: line.sku,
         productName: line.name,
         quantity: line.quantity,
