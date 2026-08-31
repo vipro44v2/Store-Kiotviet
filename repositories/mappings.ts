@@ -10,6 +10,7 @@ export interface MappingRecord {
   kiotviet_product_id: string | null;
   kiotviet_code: string | null;
   sync_direction: string;
+  sync_status?: string;
   last_sync_hash: string | null;
 }
 export const mappingsRepository = {

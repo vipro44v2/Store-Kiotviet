@@ -25,6 +25,8 @@ function productState(product: KiotVietProduct) {
   };
 }
 
+export function shouldSkipUnchangedProduct(hash:string, mappings:Array<{last_sync_hash:string|null;sync_status?:string}>, relatedMappings=mappings){return mappings.length===1&&mappings[0].last_sync_hash===hash&&!relatedMappings.some(mapping=>mapping.sync_status==="archived");}
+
 async function saveMapping(product: KiotVietProduct, saved: { id: string; product: { id: string }; inventoryItem: { id: string } }, hash: string) {
   const sku = normalizeSku(product.code);
   await mappingsRepository.upsert({
@@ -61,9 +63,8 @@ async function syncInventory(product: KiotVietProduct, jobId?: string) {
 async function syncVariantFamily(products: KiotVietProduct[], trigger: KiotVietProduct, jobId?: string) {
   const hash = syncHash(products.map(productState).sort((left, right) => left.code.localeCompare(right.code)));
   const triggerMappings = await mappingsRepository.findBySku(normalizeSku(trigger.code));
-  if (triggerMappings.length === 1 && triggerMappings[0].last_sync_hash === hash) return { sku: trigger.code, updated: false, reason: "unchanged" };
-
   const familyMappings = (await Promise.all(products.map((product) => mappingsRepository.findBySku(normalizeSku(product.code))))).flat();
+  if (shouldSkipUnchangedProduct(hash,triggerMappings,familyMappings)) return { sku: trigger.code, updated: false, reason: "unchanged" };
   const productIds = [...new Set(familyMappings.map((mapping) => mapping.shopify_product_id).filter((id): id is string => Boolean(id)))];
   if (productIds.length > 1) throw new Error(`KiotViet variant family is mapped to multiple Shopify products: ${productIds.join(", ")}`);
   const saved = await setShopifyVariantGroup(products, productIds[0]);
@@ -145,7 +146,7 @@ export async function syncKiotVietProductToShopify(productId: number, jobId?: st
     product: { id: mappings[0].shopify_product_id!, title: product.name },
     inventoryItem: { id: mappings[0].shopify_inventory_item_id!, tracked: true },
   } : undefined;
-  if (mappings.length === 1 && mappings[0].last_sync_hash === hash) return { sku, updated: false, reason: "unchanged" };
+  if (shouldSkipUnchangedProduct(hash,mappings)) return { sku, updated: false, reason: "unchanged" };
   if (!variant) {
     const matches = await findShopifyVariantsBySku(product.code);
     if (matches.length > 1) throw new Error(`Multiple Shopify variants found for SKU ${sku}`);

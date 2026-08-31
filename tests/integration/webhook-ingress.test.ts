@@ -37,6 +37,7 @@ describe("webhook ingress", () => {
     const result = await receiveShopifyWebhook(request, "orders_create");
     expect(result.status).toBe(200);
     expect(store).toHaveBeenCalledOnce();
+    expect(store.mock.calls[0][4]["x-shopify-hmac-sha256"]).toBe("[REDACTED]");
     expect(enqueue).toHaveBeenCalledWith(
       "webhooks",
       "shopify_order_create",

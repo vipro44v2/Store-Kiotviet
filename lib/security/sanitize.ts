@@ -1,5 +1,5 @@
 const sensitiveKey =
-  /authorization|cookie|email|phone|address|password|secret|signature|token/i;
+  /authorization|cookie|email|phone|address|password|secret|signature|hmac|token/i;
 
 export function sanitizeForLog(value: unknown, depth = 0): unknown {
   if (depth > 6) return "[TRUNCATED]";
