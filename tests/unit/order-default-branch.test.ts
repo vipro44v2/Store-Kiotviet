@@ -93,6 +93,32 @@ describe("default KiotViet branch initialization", () => {
     expect(query).toHaveBeenCalled();
   });
 
+  it.each([null, "", "abc", "-7", "1.5"])(
+    "safely replaces malformed defaultBranchId %j",
+    async (defaultBranchId) => {
+      mocks.getActiveBranches.mockResolvedValue([
+        { id: 42, branchName: "Main", isActive: true },
+      ]);
+      const query = vi.fn().mockResolvedValue({
+        rows: [{ default_branch_id: "42" }],
+      });
+
+      await expect(
+        resolveDefaultBranchId(clientWith(query), { defaultBranchId }),
+      ).resolves.toBe(42);
+
+      const sql = String(query.mock.calls[0][0]);
+      expect(sql).toContain("WHERE CASE");
+      expect(sql).toContain(
+        "WHEN system_settings.value->>'defaultBranchId' ~ '^[1-9][0-9]*$'",
+      );
+      expect(sql).toContain(
+        "THEN (system_settings.value->>'defaultBranchId')::bigint",
+      );
+      expect(query.mock.calls[0][1]).toEqual([42, [42]]);
+    },
+  );
+
   it("fails safely when multiple active branches exist", async () => {
     mocks.getActiveBranches.mockResolvedValue([
       { id: 42, branchName: "Main", isActive: true },

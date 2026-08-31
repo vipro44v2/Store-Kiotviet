@@ -9,7 +9,7 @@ export interface OrderSettings {
   syncCustomers?: boolean;
   syncCancellation?: boolean;
   syncRefunds?: boolean;
-  defaultBranchId?: number | string;
+  defaultBranchId?: number | string | null;
   [key: string]: unknown;
 }
 
@@ -68,9 +68,11 @@ export async function resolveDefaultBranchId(
     ON CONFLICT(key) DO UPDATE SET
       value=system_settings.value || EXCLUDED.value,
       updated_at=now()
-    WHERE system_settings.value->>'defaultBranchId' IS NULL
-      OR system_settings.value->>'defaultBranchId' !~ '^[1-9][0-9]*$'
-      OR (system_settings.value->>'defaultBranchId')::bigint <> ALL($2::bigint[])
+    WHERE CASE
+      WHEN system_settings.value->>'defaultBranchId' ~ '^[1-9][0-9]*$'
+      THEN (system_settings.value->>'defaultBranchId')::bigint <> ALL($2::bigint[])
+      ELSE true
+    END
     RETURNING value->>'defaultBranchId' AS default_branch_id`,
     [branchId, activeBranchIds],
   );
