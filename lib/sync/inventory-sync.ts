@@ -6,6 +6,7 @@ import {
   getShopifyInventory,
   setShopifyInventory,
 } from "@/lib/shopify/inventory";
+import { getActiveShopifyLocations } from "@/lib/shopify/locations";
 import { log } from "@/lib/logger";
 import type { KiotVietStockNotification } from "@/lib/kiotviet/types";
 export function calculateInventory(
@@ -31,17 +32,60 @@ export async function syncInventoryNotification(
   const mapping = mappings[0];
   if (!mapping.shopify_inventory_item_id)
     throw new MappingError(`Mapping ${sku} has no Shopify inventory item`);
-  const locations = await query<{
+  let locations = await query<{
     shopify_location_id: string;
     safety_stock: string;
+    created?: boolean;
   }>(
     "SELECT shopify_location_id,safety_stock::text FROM branch_location_mappings WHERE kiotviet_branch_id=$1 AND enabled=true",
     [notification.BranchId],
   );
-  if (!locations.length)
-    throw new MappingError(
-      `No Shopify location mapped for KiotViet branch ${notification.BranchId}`,
+  if (!locations.length) {
+    const activeLocations = await getActiveShopifyLocations();
+    if (!activeLocations.length)
+      throw new MappingError(
+        `No active Shopify locations exist for KiotViet branch ${notification.BranchId}`,
+      );
+    if (activeLocations.length > 1)
+      throw new MappingError(
+        `KiotViet branch ${notification.BranchId} must be mapped manually because Shopify has multiple active locations`,
+      );
+
+    const activeLocation = activeLocations[0];
+    locations = await query<{
+      shopify_location_id: string;
+      safety_stock: string;
+      created?: boolean;
+    }>(
+      `INSERT INTO branch_location_mappings(
+        kiotviet_branch_id,kiotviet_branch_name,shopify_location_id,
+        shopify_location_name,enabled,safety_stock
+      ) VALUES($1,$2,$3,$4,true,0)
+      ON CONFLICT(kiotviet_branch_id,shopify_location_id) DO UPDATE SET
+        kiotviet_branch_name=EXCLUDED.kiotviet_branch_name,
+        shopify_location_name=EXCLUDED.shopify_location_name,
+        enabled=true,
+        safety_stock=0,
+        updated_at=now()
+      RETURNING shopify_location_id,safety_stock::text,(xmax=0) AS created`,
+      [
+        notification.BranchId,
+        notification.BranchName || String(notification.BranchId),
+        activeLocation.id,
+        activeLocation.name,
+      ],
     );
+    if (locations[0]?.created)
+      await log("info", "Automatic branch/location mapping created", {
+        action: "auto_map_branch_location",
+        provider: "shopify",
+        entityType: "branch_location_mapping",
+        entityId: String(notification.BranchId),
+        kiotVietBranchId: notification.BranchId,
+        shopifyLocationId: activeLocation.id,
+        jobId,
+      });
+  }
   for (const location of locations) {
     const expected = calculateInventory(
       notification.OnHand,
