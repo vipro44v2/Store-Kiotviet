@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const store = vi.fn();
 const enqueue = vi.fn();
@@ -9,6 +9,7 @@ vi.mock("@/lib/queue/queues", () => ({ enqueueJob: enqueue }));
 beforeAll(() => {
   process.env.KIOTVIET_WEBHOOK_SECRET = Buffer.from("kiotviet-product-secret").toString("base64");
 });
+beforeEach(() => { store.mockReset(); enqueue.mockReset(); });
 
 describe("KiotViet product webhook", () => {
   it("queues product changes for Shopify synchronization", async () => {

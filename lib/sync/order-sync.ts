@@ -16,23 +16,34 @@ interface OrderSettings {
 }
 
 export async function syncShopifyOrder(order: ShopifyOrderWebhook) {
+  const orderId = String(order.id);
+  const claimed = await transaction(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`shopify-order:${orderId}`]);
+    const existing = await client.query("SELECT 1 FROM order_mappings WHERE shopify_order_id=$1", [orderId]);
+    if (existing.rowCount) return false;
+    const settingsResult = await client.query<{ value: OrderSettings }>("SELECT value FROM system_settings WHERE key='orders'");
+    const settings = settingsResult.rows[0]?.value ?? {};
+    if (settings.autoCreate === false || (settings.paidOnly !== false && order.financial_status !== "paid")) return false;
+    await client.query(
+      "INSERT INTO order_mappings(shopify_order_id,shopify_order_number,status,financial_status,fulfillment_status,sync_status) VALUES($1,$2,'creating',$3,$4,'pending')",
+      [orderId, order.name, order.financial_status, order.fulfillment_status ?? null],
+    );
+    return true;
+  });
+
   await transaction(async (client) => {
-    const orderId = String(order.id);
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`shopify-order:${orderId}`]);
 
     const settingsResult = await client.query<{ value: OrderSettings }>("SELECT value FROM system_settings WHERE key='orders'");
     const settings = settingsResult.rows[0]?.value ?? {};
     const existing = await client.query<{ kiotviet_order_id: string | null; status: string | null }>("SELECT kiotviet_order_id,status FROM order_mappings WHERE shopify_order_id=$1", [orderId]);
-    if (existing.rowCount) {
+    if (existing.rowCount && !claimed) {
       let status = existing.rows[0]?.status ?? "created";
+      if (status === "creating" && !existing.rows[0]?.kiotviet_order_id) return;
       if (settings.syncCustomers !== false && order.customer && existing.rows[0]?.kiotviet_order_id && status === "created") {
         await syncShopifyCustomer(order.customer);
         const customer = await client.query<{ kiotviet_customer_id: string }>("SELECT kiotviet_customer_id FROM customer_mappings WHERE shopify_customer_id=$1", [String(order.customer.id)]);
         if (customer.rows[0]?.kiotviet_customer_id) await updateKiotVietOrderCustomer(Number(existing.rows[0].kiotviet_order_id), Number(customer.rows[0].kiotviet_customer_id));
-      }
-      if (settings.syncCancellation !== false && order.financial_status === "refunded" && existing.rows[0]?.kiotviet_order_id && status !== "cancelled") {
-        await cancelKiotVietOrder(Number(existing.rows[0].kiotviet_order_id));
-        status = "cancelled";
       }
       await client.query("UPDATE order_mappings SET status=$4,financial_status=$2,fulfillment_status=$3,sync_status='synced',last_sync_at=now(),updated_at=now() WHERE shopify_order_id=$1", [orderId, order.financial_status, order.fulfillment_status ?? null, status]);
       return;
@@ -70,7 +81,7 @@ export async function syncShopifyOrder(order: ShopifyOrderWebhook) {
       orderDetails: details,
     });
 
-    await client.query("INSERT INTO order_mappings(shopify_order_id,shopify_order_number,kiotviet_order_id,kiotviet_order_code,status,financial_status,fulfillment_status,sync_status,last_sync_at) VALUES($1,$2,$3,$4,'created',$5,$6,'synced',now())", [orderId, order.name, created.id, created.code, order.financial_status, order.fulfillment_status ?? null]);
+    await client.query("UPDATE order_mappings SET kiotviet_order_id=$2,kiotviet_order_code=$3,status='created',financial_status=$4,fulfillment_status=$5,sync_status='synced',last_sync_at=now(),updated_at=now() WHERE shopify_order_id=$1 AND status='creating'", [orderId, created.id, created.code, order.financial_status, order.fulfillment_status ?? null]);
   });
 }
 

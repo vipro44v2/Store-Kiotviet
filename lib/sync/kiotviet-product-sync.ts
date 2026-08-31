@@ -1,5 +1,5 @@
 import { getKiotVietProduct, getKiotVietVariantFamily } from "@/lib/kiotviet/products";
-import { collapseShopifyVariantGroup, createShopifyProduct, deleteShopifyProduct, findShopifyVariantsBySku, setShopifyVariantGroup, shopifyProductHasCustomOptions, updateShopifyProduct } from "@/lib/shopify/products";
+import { archiveShopifyProduct, collapseShopifyVariantGroup, createShopifyProduct, findShopifyVariantsBySku, setShopifyVariantGroup, shopifyProductHasCustomOptions, updateShopifyProduct } from "@/lib/shopify/products";
 import { mappingsRepository } from "@/repositories/mappings";
 import { normalizeSku } from "./mappings";
 import { syncHash } from "./hashes";
@@ -103,8 +103,8 @@ export async function syncDeletedKiotVietProducts(productIds: number[], jobId?: 
     }))).filter((product): product is KiotVietProduct => Boolean(product));
 
     if (!remaining.length) {
-      await deleteShopifyProduct(shopifyProductId);
-      await query("DELETE FROM product_mappings WHERE shopify_product_id=$1", [shopifyProductId]);
+      await archiveShopifyProduct(shopifyProductId);
+      await query("UPDATE product_mappings SET sync_status='archived',updated_at=now() WHERE shopify_product_id=$1", [shopifyProductId]);
       continue;
     }
 

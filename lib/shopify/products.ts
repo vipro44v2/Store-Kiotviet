@@ -105,10 +105,10 @@ export async function collapseShopifyVariantGroup(product: KiotVietProduct, prod
   return updateShopifyProduct(product, defaultVariant, false);
 }
 
-export async function deleteShopifyProduct(productId: string) {
-  const result = await shopifyGraphql<{ productDelete: { deletedProductId?: string; userErrors: Array<{ message: string }> } }>(
-    `mutation DeleteSyncedProduct($input:ProductDeleteInput!){productDelete(input:$input){deletedProductId userErrors{message}}}`,
-    { input: { id: productId } },
+export async function archiveShopifyProduct(productId: string) {
+  const result = await shopifyGraphql<{ productUpdate: { product?: { id: string; status: string }; userErrors: Array<{ message: string }> } }>(
+    `mutation ArchiveSyncedProduct($product:ProductUpdateInput!){productUpdate(product:$product){product{id status} userErrors{message}}}`,
+    { product: { id: productId, status: "ARCHIVED" } },
   );
-  if (result.productDelete.userErrors.length || !result.productDelete.deletedProductId) throw new Error(result.productDelete.userErrors.map((error) => error.message).join("; ") || "Shopify did not delete the product");
+  if (result.productUpdate.userErrors.length || !result.productUpdate.product) throw new Error(result.productUpdate.userErrors.map((error) => error.message).join("; ") || "Shopify did not archive the product");
 }
