@@ -16,6 +16,9 @@ vi.mock("@/lib/security/csrf", () => ({ assertTrustedOrigin: mocks.assertOrigin 
 vi.mock("@/lib/kiotviet/products", () => ({ getAllKiotVietProducts: mocks.getAllProducts }));
 vi.mock("@/lib/queue/product-sync-batches", () => ({
   enqueueKiotVietProductSyncJobs: mocks.enqueueBatches,
+  dedupeKiotVietSyncProducts: (products: Array<{ id: number; masterProductId?: number }>) => [
+    ...new Set(products.map((product) => product.masterProductId ?? product.id).filter((id) => id > 0)),
+  ],
 }));
 vi.mock("@/lib/logger", () => ({ log: mocks.log }));
 
@@ -31,6 +34,7 @@ describe("sync all products from KiotViet", () => {
       { id: 1, code: "A", name: "A" },
       { id: 2, code: "B", name: "B" },
       { id: 2, code: "B", name: "duplicate response" },
+      { id: 3, masterProductId: 1, code: "A-BLUE", name: "A blue" },
       { id: 0, code: "invalid", name: "invalid" },
     ]);
     mocks.enqueueBatches.mockResolvedValue({ queued: 2, failed: 0 });
@@ -50,10 +54,9 @@ describe("sync all products from KiotViet", () => {
     await expect(response.json()).resolves.toMatchObject({
       direction: "kiotviet_to_shopify",
       queued: 2,
-      skipped: 2,
+      skipped: 3,
       failed: 0,
     });
     expect(mocks.enqueueBatches).toHaveBeenCalledWith([1, 2]);
   });
 });
-

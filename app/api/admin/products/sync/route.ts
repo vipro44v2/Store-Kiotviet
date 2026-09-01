@@ -1,75 +1,28 @@
 import { z } from "zod";
 import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
-import { query } from "@/lib/db/client";
 import { enqueueKiotVietProductSyncJobs } from "@/lib/queue/product-sync-batches";
 import { log } from "@/lib/logger";
-import { ensureKiotVietProductMapping } from "@/lib/sync/ensure-kiotviet-product-mapping";
 
 const schema = z.object({
-  mappingIds: z.array(z.string().uuid()).min(1).max(200),
+  productIds: z.array(z.number().int().positive()).min(1).max(200),
 });
-
-interface ProductMappingRow {
-  id: string;
-  kiotviet_product_id: string | null;
-}
 
 export async function POST(request: Request) {
   try {
     await requireAdmin();
     assertTrustedOrigin(request);
     const input = schema.parse(await request.json());
-    const mappingIds = [...new Set(input.mappingIds)];
-    const rows = await query<ProductMappingRow>(
-      `SELECT id,kiotviet_product_id::text AS kiotviet_product_id
-       FROM product_mappings WHERE id=ANY($1::uuid[])`,
-      [mappingIds],
-    );
-    const byMappingId = new Map(rows.map((row) => [row.id, row]));
-    const missingMappingIds = mappingIds.filter(
-      (id) => !byMappingId.get(id)?.kiotviet_product_id,
-    );
-    const productIds = [
-      ...new Set(
-        rows
-          .map((row) => row.kiotviet_product_id)
-          .filter((id): id is string => Boolean(id)),
-      ),
-    ];
-
-    const mappingResults = await Promise.allSettled(
-      productIds.map((productId) => ensureKiotVietProductMapping(productId)),
-    );
-    const readyProductIds: string[] = [];
-    let missingShopify = 0;
-    let duplicateShopify = 0;
-    const mappingErrors: string[] = [];
-    mappingResults.forEach((result, index) => {
-      if (result.status === "rejected") {
-        mappingErrors.push(
-          `${productIds[index]}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
-        );
-      } else if (result.value.status === "mapped") {
-        readyProductIds.push(result.value.productId);
-      } else if (result.value.status === "missing_shopify") missingShopify++;
-      else duplicateShopify++;
-    });
-
-    const queueResult = await enqueueKiotVietProductSyncJobs(readyProductIds);
+    const productIds = [...new Set(input.productIds)];
+    const queueResult = await enqueueKiotVietProductSyncJobs(productIds);
     await log("info", "Manual KiotViet to Shopify product sync queued", {
       action: "manual_product_sync_queued",
       provider: "kiotviet",
       entityType: "product",
-      entityId: readyProductIds.length === 1 ? readyProductIds[0] : "bulk",
+      entityId: productIds.length === 1 ? String(productIds[0]) : "bulk",
       direction: "kiotviet_to_shopify",
       queued: queueResult.queued,
       failed: queueResult.failed,
-      missingMappings: missingMappingIds.length,
-      missingShopify,
-      duplicateShopify,
-      mappingErrors,
-      mappingIds,
       kiotVietProductIds: productIds,
     });
     return Response.json(
@@ -78,16 +31,7 @@ export async function POST(request: Request) {
         direction: "kiotviet_to_shopify",
         queued: queueResult.queued,
         failed: queueResult.failed,
-        missingMappings: missingMappingIds.length,
-        missingMappingIds,
-        missingShopify,
-        duplicateShopify,
-        mappingErrors,
-        skipped:
-          missingMappingIds.length +
-          missingShopify +
-          duplicateShopify +
-          mappingErrors.length,
+        skipped: 0,
       },
       { status: 202 },
     );

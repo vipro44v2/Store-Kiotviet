@@ -1,7 +1,7 @@
 import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { getAllKiotVietProducts } from "@/lib/kiotviet/products";
 import { log } from "@/lib/logger";
-import { enqueueKiotVietProductSyncJobs } from "@/lib/queue/product-sync-batches";
+import { dedupeKiotVietSyncProducts, enqueueKiotVietProductSyncJobs } from "@/lib/queue/product-sync-batches";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
 
 export async function POST(request: Request) {
@@ -9,13 +9,7 @@ export async function POST(request: Request) {
     await requireAdmin();
     assertTrustedOrigin(request);
     const products = await getAllKiotVietProducts();
-    const productIds = [
-      ...new Set(
-        products
-          .map((product) => product.id)
-          .filter((id) => Number.isSafeInteger(id) && id > 0),
-      ),
-    ];
+    const productIds = dedupeKiotVietSyncProducts(products);
     const skipped = products.length - productIds.length;
     const queueResult = await enqueueKiotVietProductSyncJobs(productIds);
     const result = {
@@ -37,4 +31,3 @@ export async function POST(request: Request) {
     return adminApiErrorResponse(error, "Could not queue all product sync jobs");
   }
 }
-

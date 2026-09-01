@@ -2,7 +2,7 @@ import { z } from "zod";
 import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
 import { getAllKiotVietProductsByCategory } from "@/lib/kiotviet/products";
-import { enqueueKiotVietProductSyncJobs } from "@/lib/queue/product-sync-batches";
+import { dedupeKiotVietSyncProducts, enqueueKiotVietProductSyncJobs } from "@/lib/queue/product-sync-batches";
 import { normalizeSku } from "@/lib/sync/mappings";
 import { log } from "@/lib/logger";
 
@@ -25,7 +25,7 @@ export async function POST(request: Request) {
       [...bySku.values()].filter((matches) => matches.length > 1).reduce((count, matches) => count + matches.length, 0);
     const unique = [...bySku.values()].filter((matches) => matches.length === 1).map(([product]) => product);
     const queueResult = await enqueueKiotVietProductSyncJobs(
-      unique.map((product) => product.id),
+      dedupeKiotVietSyncProducts(unique),
       { categoryId },
     );
     const result = {

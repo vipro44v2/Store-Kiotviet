@@ -6,10 +6,7 @@ import { ActionButton } from "@/components/admin/action-button";
 import { ProductSyncTable } from "@/components/admin/product-sync-table";
 
 const configs: Record<string, { title: string; sql: string; action?: string }> = {
-  products: {
-    title: "Products",
-    sql: "SELECT id,sku,shopify_product_id,kiotviet_product_id,sync_direction,last_kiotviet_sync_at,sync_status FROM product_mappings ORDER BY updated_at DESC LIMIT 200",
-  },
+  products: { title: "Products", sql: "" },
   mappings: { title: "Product mappings", sql: "SELECT * FROM product_mappings ORDER BY updated_at DESC LIMIT 200", action: "mappings" },
   inventory: { title: "Inventory", sql: "SELECT * FROM inventory_snapshots ORDER BY created_at DESC LIMIT 200", action: "inventory" },
   orders: { title: "Orders", sql: "SELECT * FROM order_mappings ORDER BY created_at DESC LIMIT 200", action: "orders" },
@@ -30,19 +27,20 @@ export default async function SectionPage({ params }: { params: Promise<{ sectio
   let rows: Record<string, unknown>[] = [];
   let error = "";
   try {
-    rows = await query<Record<string, unknown>>(config.sql);
+    if (section !== "products")
+      rows = await query<Record<string, unknown>>(config.sql);
   } catch (caught) {
     error = caught instanceof Error ? caught.message : "Database unavailable";
   }
   return (
     <>
-      <header className="admin-header">
+      {section !== "products" && <header className="admin-header">
         <div><p className="eyebrow">Administration</p><h1>{config.title}</h1></div>
         {config.action && <ActionButton action={config.action} label={`Run ${config.title}`} />}
-      </header>
+      </header>}
       {error && <div className="error-banner">{error}</div>}
       {section === "products"
-        ? <ProductSyncTable rows={rows} />
+        ? <ProductSyncTable />
         : <DataTable rows={rows} resource={section} />}
     </>
   );

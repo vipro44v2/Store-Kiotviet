@@ -1,6 +1,17 @@
 import { enqueueJob } from "@/lib/queue/queues";
+import type { KiotVietProduct } from "@/lib/kiotviet/types";
 
 export const PRODUCT_SYNC_BATCH_SIZE = 40;
+
+export function dedupeKiotVietSyncProducts(products: KiotVietProduct[]): number[] {
+  return [
+    ...new Set(
+      products
+        .map((product) => product.masterProductId ?? product.id)
+        .filter((id) => Number.isSafeInteger(id) && id > 0),
+    ),
+  ];
+}
 
 export async function enqueueKiotVietProductSyncJobs(
   productIds: Array<number | string>,
