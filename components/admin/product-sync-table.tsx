@@ -162,10 +162,10 @@ export function ProductSyncTable() {
   const last = Math.min(catalog.page * catalog.pageSize, catalog.total);
   const filtered = Boolean(search || categoryId);
   return (
-    <div className="admin-table-wrap">
+    <section className="product-page">
       <p className="eyebrow">Administration</p>
-      <div className="product-list-heading"><h1>Products</h1><strong>{catalog.total.toLocaleString()} products</strong></div>
-      <div className="header-actions">
+      <div className="product-list-heading"><div><h1>Products</h1><p className="subtitle">Synchronize your KiotViet catalog to Shopify.</p></div><strong>{catalog.total.toLocaleString()} products</strong></div>
+      <div className="product-toolbar">
         <input aria-label="Search products" placeholder="Search products..." value={searchInput} onChange={(event) => setSearchInput(event.target.value)} />
         <select aria-label="KiotViet category" value={categoryId} onChange={(event) => updateQuery({ categoryId: event.target.value, page: "1" })}>
           <option value="">All categories</option>
@@ -175,7 +175,7 @@ export function ProductSyncTable() {
           {[20, 40, 80, 100].map((size) => <option key={size} value={size}>{size} per page</option>)}
         </select>
       </div>
-      <div className="header-actions">
+      <div className="product-actions">
         <button type="button" disabled={!selectedProductIds.length || bulkRunning} onClick={() => void queue(selectedProductIds)}>{selectedRunning ? "Queueing selected..." : "Sync selected"}</button>
         <button type="button" disabled={!categoryId || bulkRunning} onClick={() => void syncCategory()}>{categoryRunning ? "Queueing category..." : "Sync this category"}</button>
         <button type="button" disabled={bulkRunning} onClick={() => void syncAll()}>{allRunning ? "Queueing all products..." : "Sync all from KiotViet"}</button>
@@ -209,6 +209,6 @@ export function ProductSyncTable() {
         </nav>
         <p>Page {catalog.page} of {catalog.totalPages}</p>
       </div>
-    </div>
+    </section>
   );
 }

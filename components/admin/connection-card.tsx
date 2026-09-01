@@ -13,8 +13,8 @@ export function ConnectionCard({
         Credentials are read from server environment variables and never
         returned to this page.
       </p>
-      <strong>{state}</strong>
-      <button
+      <span className={`status-badge ${state === "Connected" ? "success" : state === "Not checked" ? "neutral" : "danger"}`}><i />{state}</span>
+      <button className="button button-primary" type="button"
         onClick={async () => {
           setState("Checking…");
           const response = await fetch(`/api/admin/connections/${provider}`, {

@@ -7,9 +7,10 @@ export default async function LoginPage() {
   return (
     <main className="login-page">
       <section>
+        <div className="login-brand"><span className="brand-mark">SK</span><strong>Sync Console</strong></div>
         <p className="eyebrow">Secure administration</p>
-        <h1>Shopify KiotViet Sync</h1>
-        <p>Sign in to manage synchronization.</p>
+        <h1>Welcome back</h1>
+        <p>Sign in to manage Shopify and KiotViet synchronization.</p>
         <LoginForm />
       </section>
     </main>

@@ -57,7 +57,7 @@ function Setting({
         spellCheck={false}
       />
       <div>
-        <button onClick={() => void save()}>Save</button>
+        <button className="button button-primary" type="button" onClick={() => void save()}>Save</button>
         <small>{message}</small>
       </div>
     </section>

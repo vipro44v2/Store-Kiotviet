@@ -4,6 +4,7 @@ export function LogoutButton() {
   const router = useRouter();
   return (
     <button
+      type="button"
       className="nav-logout"
       onClick={async () => {
         await fetch("/api/auth/logout", { method: "POST" });

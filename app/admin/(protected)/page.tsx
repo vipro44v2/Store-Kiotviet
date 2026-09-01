@@ -18,7 +18,7 @@ export default async function Dashboard() {
           <h1>Dashboard</h1>
         </div>
         <div className="header-actions">
-          <ActionButton action="mappings" label="Initialize mappings" />
+          <ActionButton action="mappings" label="Initialize mappings" variant="secondary" />
           <ActionButton action="reconcile" label="Reconcile inventory" />
         </div>
       </header>
@@ -43,6 +43,7 @@ export default async function Dashboard() {
 function Metric({ label, value }: { label: string; value?: string }) {
   return (
     <article className="metric">
+      <div className="metric-icon" aria-hidden="true">↗</div>
       <span>{label}</span>
       <strong>{value ?? "0"}</strong>
     </article>

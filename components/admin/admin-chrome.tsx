@@ -1,44 +1,16 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useEffect, useState } from "react";
 import { LogoutButton } from "./logout-button";
-const links = [
-  "manual",
-  "products",
-  "mappings",
-  "inventory",
-  "branches",
-  "orders",
-  "customers",
-  "jobs",
-  "conflicts",
-  "webhooks",
-  "logs",
-  "notifications",
-  "settings",
+type IconName = "dashboard"|"manual"|"products"|"mappings"|"inventory"|"branches"|"orders"|"customers"|"jobs"|"conflicts"|"webhooks"|"logs"|"notifications"|"settings"|"shopify"|"kiotviet";
+type NavItem={href:string;label:string;icon:IconName};
+const groups:Array<{label:string;links:NavItem[]}>= [
+ {label:"Overview",links:[{href:"/admin",label:"Dashboard",icon:"dashboard"}]},
+ {label:"Synchronization",links:[{href:"/admin/manual",label:"Manual sync",icon:"manual"},{href:"/admin/products",label:"Products",icon:"products"},{href:"/admin/mappings",label:"Mappings",icon:"mappings"},{href:"/admin/inventory",label:"Inventory",icon:"inventory"},{href:"/admin/branches",label:"Branches",icon:"branches"},{href:"/admin/orders",label:"Orders",icon:"orders"},{href:"/admin/customers",label:"Customers",icon:"customers"}]},
+ {label:"Monitoring",links:[{href:"/admin/jobs",label:"Background jobs",icon:"jobs"},{href:"/admin/conflicts",label:"Conflicts",icon:"conflicts"},{href:"/admin/webhooks",label:"Webhooks",icon:"webhooks"},{href:"/admin/logs",label:"Sync logs",icon:"logs"},{href:"/admin/notifications",label:"Notifications",icon:"notifications"}]},
+ {label:"Configuration",links:[{href:"/admin/connections/shopify",label:"Shopify",icon:"shopify"},{href:"/admin/connections/kiotviet",label:"KiotViet",icon:"kiotviet"},{href:"/admin/settings",label:"System settings",icon:"settings"}]},
 ];
-export function AdminChrome({ children }: { children: React.ReactNode }) {
-  const pathname = usePathname();
-  if (pathname === "/admin/login") return children;
-  return (
-    <div className="admin-shell">
-      <aside>
-        <Link className="admin-brand" href="/admin">
-          SK Sync
-        </Link>
-        <nav>
-          <Link href="/admin">Dashboard</Link>
-          {links.map((link) => (
-            <Link href={`/admin/${link}`} key={link}>
-              {link[0].toUpperCase() + link.slice(1)}
-            </Link>
-          ))}
-          <Link href="/admin/connections/shopify">Shopify connection</Link>
-          <Link href="/admin/connections/kiotviet">KiotViet connection</Link>
-        </nav>
-        <LogoutButton />
-      </aside>
-      <main className="admin-content">{children}</main>
-    </div>
-  );
-}
+function Icon({name}:{name:IconName}){const paths:Record<IconName,React.ReactNode>={dashboard:<><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,manual:<><path d="M12 3v12"/><path d="m8 11 4 4 4-4M5 21h14"/></>,products:<><path d="m3 6 9-4 9 4-9 4Z"/><path d="m3 6 9 4 9-4v12l-9 4-9-4ZM12 10v12"/></>,mappings:<><path d="M8 7h11l-3-3M19 7l-3 3M16 17H5l3 3M5 17l3-3"/></>,inventory:<><path d="M4 7h16v14H4zM2 3h20v4H2zM9 11h6"/></>,branches:<><circle cx="12" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="19" r="2"/><path d="M12 7v5M6 17v-2h12v2"/></>,orders:<><path d="M6 2h12v20l-3-2-3 2-3-2-3 2ZM9 7h6M9 11h6M9 15h4"/></>,customers:<><circle cx="9" cy="8" r="3"/><path d="M3 21v-2a6 6 0 0 1 12 0v2M16 4a3 3 0 0 1 0 6M18 14a5 5 0 0 1 3 5v2"/></>,jobs:<><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></>,conflicts:<><path d="M12 3 2.5 20h19ZM12 9v5M12 17h.01"/></>,webhooks:<><circle cx="12" cy="5" r="3"/><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/><path d="M9 6.5 6.5 15M15 6.5l2.5 8.5M8 18h8"/></>,logs:<><path d="M5 3h14v18H5zM8 8h8M8 12h8M8 16h5"/></>,notifications:<><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></>,settings:<><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></>,shopify:<><path d="M5 8h14l-1 13H6ZM9 9V7a3 3 0 0 1 6 0v2"/></>,kiotviet:<><path d="M3 10h18M5 10v10h14V10M4 4h16l1 6H3ZM9 20v-6h6v6"/></>};return <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>}
+function Brand(){return <Link className="admin-brand" href="/admin"><span className="brand-mark">SK</span><span><strong>Sync Console</strong><small>Shopify + KiotViet</small></span></Link>}
+export function AdminChrome({children}:{children:React.ReactNode}){const pathname=usePathname(),[open,setOpen]=useState(false);useEffect(()=>setOpen(false),[pathname]);useEffect(()=>{if(!open)return;const close=(event:KeyboardEvent)=>event.key==="Escape"&&setOpen(false);window.addEventListener("keydown",close);return()=>window.removeEventListener("keydown",close)},[open]);if(pathname==="/admin/login")return children;const active=(href:string)=>href==="/admin"?pathname===href:pathname.startsWith(href);const navigation=<>{groups.map(group=><div className="nav-group" key={group.label}><p>{group.label}</p>{group.links.map(link=><Link className={active(link.href)?"active":""} href={link.href} key={link.href} aria-current={active(link.href)?"page":undefined}><Icon name={link.icon}/><span>{link.label}</span></Link>)}</div>)}</>;return <div className="admin-shell"><header className="admin-mobile-header"><Brand/><button className="menu-toggle" type="button" aria-label="Open navigation" aria-expanded={open} onClick={()=>setOpen(true)}><span/><span/><span/></button></header>{open&&<button className="nav-backdrop" type="button" aria-label="Close navigation" onClick={()=>setOpen(false)}/>}<aside className={open?"admin-sidebar open":"admin-sidebar"}><div className="sidebar-head"><Brand/><button className="drawer-close" type="button" aria-label="Close navigation" onClick={()=>setOpen(false)}>×</button></div><nav aria-label="Admin navigation">{navigation}</nav><footer className="sidebar-footer"><div className="system-status"><span/><div><strong>System online</strong><small>Services operational</small></div></div><LogoutButton/></footer></aside><main className="admin-content">{children}</main></div>}

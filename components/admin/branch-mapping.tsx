@@ -77,7 +77,7 @@ export function BranchMapping() {
           Safety stock
           <input name="safetyStock" type="number" min="0" defaultValue="0" />
         </label>
-        <button>Save mapping</button>
+        <button className="button button-primary">Save mapping</button>
         {message && <small>{message}</small>}
       </form>
       <div className="admin-table-wrap">
