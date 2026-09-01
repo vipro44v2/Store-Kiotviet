@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 interface SyncResult {
   queued?: number;
@@ -10,6 +10,7 @@ interface SyncResult {
   existing?: number;
   missing?: number;
   duplicate?: number;
+  failed?: number;
   error?: string;
 }
 
@@ -18,9 +19,24 @@ export function ProductSyncTable({ rows }: { rows: Record<string, unknown>[] }) 
   const [rowStatus, setRowStatus] = useState<Record<string, string>>({});
   const [message, setMessage] = useState("");
   const [mappingMessage, setMappingMessage] = useState("");
+  const [categories, setCategories] = useState<Array<{ id: number; name: string }>>([]);
+  const [categoryId, setCategoryId] = useState("");
+  const [categoryMessage, setCategoryMessage] = useState("");
   const ids = rows.map((row) => String(row.id));
   const allSelected = ids.length > 0 && ids.every((id) => selected.has(id));
   const columns = Object.keys(rows[0] ?? {}).filter((column) => column !== "id").slice(0, 8);
+
+  useEffect(() => {
+    void fetch("/api/admin/products/categories")
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Could not load categories");
+        return response.json() as Promise<{
+          categories: Array<{ id: number; name: string }>;
+        }>;
+      })
+      .then((result) => setCategories(result.categories))
+      .catch(() => setCategoryMessage("Could not load categories"));
+  }, []);
 
   function toggleAll() {
     setSelected(allSelected ? new Set() : new Set(ids));
@@ -75,9 +91,36 @@ export function ProductSyncTable({ rows }: { rows: Record<string, unknown>[] }) 
     }
   }
 
+  async function syncCategory() {
+    const selectedCategory = Number(categoryId);
+    if (!Number.isSafeInteger(selectedCategory) || selectedCategory <= 0) return;
+    setCategoryMessage("Queueing category…");
+    try {
+      const response = await fetch("/api/admin/products/category-sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ categoryId: selectedCategory }),
+      });
+      const result = (await response.json()) as SyncResult;
+      setCategoryMessage(
+        response.ok
+          ? `Queued: ${result.queued ?? 0}; skipped: ${result.skipped ?? 0}; failed: ${result.failed ?? 0}`
+          : result.error ?? "Failed",
+      );
+    } catch {
+      setCategoryMessage("Failed");
+    }
+  }
+
   return (
     <div className="admin-table-wrap">
       <div className="header-actions">
+        <select aria-label="KiotViet category" value={categoryId} onChange={(event) => setCategoryId(event.target.value)}>
+          <option value="">Select KiotViet category</option>
+          {categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
+        </select>
+        <button type="button" disabled={!categoryId} onClick={() => void syncCategory()}>Sync this category</button>
+        {categoryMessage && <small>{categoryMessage}</small>}
         <button type="button" onClick={toggleAll}>Select all</button>
         <button type="button" disabled={!selected.size} onClick={() => void queue([...selected])}>
           Sync selected

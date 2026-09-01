@@ -58,6 +58,7 @@ export interface GetProductsParams {
   orderDirection?: "Asc" | "Desc";
   includeInventory?: boolean;
   searchTerm?: string;
+  categoryId?: number;
 }
 
 export interface KiotVietReturnDetail { productId:number;productCode:string;productName:string;quantity:number;price:number;subTotal?:number }

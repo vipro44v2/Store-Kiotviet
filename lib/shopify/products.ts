@@ -23,6 +23,24 @@ export async function findShopifyVariantsBySku(sku: string) {
   return data.productVariants.nodes;
 }
 
+export async function getShopifyVariant(
+  id: string,
+): Promise<ShopifyVariant | undefined> {
+  const data = await shopifyGraphql<{ productVariant: ShopifyVariant | null }>(
+    `query ProductVariant($id:ID!){productVariant(id:$id){id sku barcode product{id title} inventoryItem{id tracked}}}`,
+    { id },
+  );
+  return data.productVariant ?? undefined;
+}
+
+export async function shopifyProductExists(id: string): Promise<boolean> {
+  const data = await shopifyGraphql<{ product: { id: string } | null }>(
+    `query ProductExists($id:ID!){product(id:$id){id}}`,
+    { id },
+  );
+  return Boolean(data.product);
+}
+
 type ManagedVariant = ShopifyVariant & { price?: string };
 function productInput(product: KiotVietProduct) {
   return {

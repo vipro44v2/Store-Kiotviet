@@ -7,7 +7,9 @@ import {
   collapseShopifyVariantGroup,
   createShopifyProduct,
   findShopifyVariantsBySku,
+  getShopifyVariant,
   setShopifyVariantGroup,
+  shopifyProductExists,
   shopifyProductHasCustomOptions,
   updateShopifyProduct,
 } from "@/lib/shopify/products";
@@ -109,8 +111,6 @@ async function syncVariantFamily(
       ),
     )
   ).flat();
-  if (shouldSkipUnchangedProduct(hash, triggerMappings, familyMappings))
-    return { sku: trigger.code, updated: false, reason: "unchanged" };
   const productIds = [
     ...new Set(
       familyMappings
@@ -122,7 +122,16 @@ async function syncVariantFamily(
     throw new Error(
       `KiotViet variant family is mapped to multiple Shopify products: ${productIds.join(", ")}`,
     );
-  const saved = await setShopifyVariantGroup(products, productIds[0]);
+  const existingProductId =
+    productIds[0] && (await shopifyProductExists(productIds[0]))
+      ? productIds[0]
+      : undefined;
+  if (
+    existingProductId &&
+    shouldSkipUnchangedProduct(hash, triggerMappings, familyMappings)
+  )
+    return { sku: trigger.code, updated: false, reason: "unchanged" };
+  const saved = await setShopifyVariantGroup(products, existingProductId);
   const savedBySku = new Map(
     saved.variants.map((variant) => [normalizeSku(variant.sku), variant]),
   );
@@ -300,20 +309,15 @@ export async function syncKiotVietProductToShopify(
   const mappings = await mappingsRepository.findBySku(sku);
   let variant =
     mappings.length === 1 && mappings[0].shopify_variant_id
-      ? {
-          id: mappings[0].shopify_variant_id,
-          sku: product.code,
-          product: { id: mappings[0].shopify_product_id!, title: product.name },
-          inventoryItem: {
-            id: mappings[0].shopify_inventory_item_id!,
-            tracked: true,
-          },
-        }
+      ? await getShopifyVariant(mappings[0].shopify_variant_id)
       : undefined;
-  if (shouldSkipUnchangedProduct(hash, mappings))
+  if (variant && normalizeSku(variant.sku) !== sku) variant = undefined;
+  if (variant && shouldSkipUnchangedProduct(hash, mappings))
     return { sku, updated: false, reason: "unchanged" };
   if (!variant) {
-    const matches = await findShopifyVariantsBySku(product.code);
+    const matches = (await findShopifyVariantsBySku(product.code)).filter(
+      (match) => normalizeSku(match.sku) === sku,
+    );
     if (matches.length > 1)
       throw new Error(`Multiple Shopify variants found for SKU ${sku}`);
     variant = matches[0];

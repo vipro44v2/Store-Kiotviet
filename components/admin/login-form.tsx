@@ -50,7 +50,12 @@ export function LoginForm() {
 
   if (step === "totp")
     return (
-      <form className="login-form" onSubmit={submitTotp}>
+      <form
+        className="login-form"
+        method="post"
+        action="/api/auth/2fa"
+        onSubmit={submitTotp}
+      >
         <label>
           6-digit authentication code
           <input name="code" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" minLength={6} maxLength={6} autoFocus required />
@@ -61,7 +66,12 @@ export function LoginForm() {
     );
 
   return (
-    <form className="login-form" onSubmit={submitPassword}>
+    <form
+      className="login-form"
+      method="post"
+      action="/api/auth/login"
+      onSubmit={submitPassword}
+    >
       <label>Username<input name="username" autoComplete="username" required /></label>
       <label>Password<input name="password" type="password" autoComplete="current-password" required /></label>
       {error && <p className="form-error">{error}</p>}

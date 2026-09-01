@@ -11,6 +11,11 @@ export interface KiotVietCategory {
 interface KiotVietCategoryResponse {
   data: KiotVietCategory;
 }
+interface KiotVietCategoriesResponse {
+  total: number;
+  pageSize: number;
+  data: KiotVietCategory[];
+}
 
 const SEARCH_PARAMETER = "name";
 
@@ -25,6 +30,7 @@ export async function getKiotVietProducts(
 
   if (params.orderBy) query.set("orderBy", params.orderBy);
   if (params.orderDirection) query.set("orderDirection", params.orderDirection);
+  if (params.categoryId) query.set("categoryId", String(params.categoryId));
   if (params.searchTerm?.trim()) {
     // KiotViet's product filter uses `name` for a code/name search. Keep this
     // mapping isolated here in case the API contract changes.
@@ -34,6 +40,41 @@ export async function getKiotVietProducts(
   return kiotVietFetch<KiotVietProductsResponse>(
     `/products?${query.toString()}`,
   );
+}
+
+export async function getAllKiotVietCategories(): Promise<KiotVietCategory[]> {
+  const categories: KiotVietCategory[] = [];
+  let currentItem = 0;
+  let total = 1;
+  while (currentItem < total) {
+    const page = await kiotVietFetch<KiotVietCategoriesResponse>(
+      `/categories?${new URLSearchParams({ pageSize: "100", currentItem: String(currentItem) })}`,
+    );
+    categories.push(...(page.data ?? []));
+    total = page.total ?? categories.length;
+    currentItem += page.pageSize || 100;
+  }
+  return categories;
+}
+
+export async function getAllKiotVietProductsByCategory(
+  categoryId: number,
+): Promise<KiotVietProduct[]> {
+  const products: KiotVietProduct[] = [];
+  let currentItem = 0;
+  let total = 1;
+  while (currentItem < total) {
+    const page = await getKiotVietProducts({
+      categoryId,
+      currentItem,
+      pageSize: 100,
+      includeInventory: false,
+    });
+    products.push(...page.data);
+    total = page.total;
+    currentItem += page.pageSize || 100;
+  }
+  return products;
 }
 
 export function getKiotVietProduct(id: number): Promise<KiotVietProduct> {
