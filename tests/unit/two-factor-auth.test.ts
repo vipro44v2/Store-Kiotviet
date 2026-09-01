@@ -57,7 +57,57 @@ beforeEach(() => {
 
 describe("admin two-factor login", () => {
   it("rejects an invalid username or password", async () => {
-    expect((await login("wrong", "wrong")).status).toBe(401);
+    const response = await login("wrong", "wrong");
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({ success: false, error: "Invalid credentials" });
+  });
+
+  it("keeps invalid-origin diagnostics server-side", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const response = await passwordLogin(new Request(`${origin}/api/auth/login`, {
+      method: "POST",
+      headers: { origin: "https://untrusted.example", "content-type": "application/json" },
+      body: JSON.stringify({ username: "private-admin", password: "private-password" }),
+    }));
+    expect(response.status).toBe(400);
+    const body = JSON.stringify(await response.json());
+    expect(body).toBe(JSON.stringify({ success: false, error: "Login failed" }));
+    expect(body).not.toContain("private-admin");
+    expect(body).not.toContain("private-password");
+    expect(stderr.mock.calls.flat().join(" ")).toContain('"reason":"invalid_origin"');
+    stderr.mockRestore();
+  });
+
+  it("does not expose malformed request details", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const response = await passwordLogin(new Request(`${origin}/api/auth/login`, {
+      method: "POST",
+      headers: { origin, "content-type": "application/json", "x-forwarded-for": "10.0.0.22" },
+      body: JSON.stringify({ username: "private-admin", password: "" }),
+    }));
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ success: false, error: "Login failed" });
+    const log = stderr.mock.calls.flat().join(" ");
+    expect(log).toContain('"reason":"invalid_request"');
+    expect(log).not.toContain("private-admin");
+    expect(log).not.toContain("too_small");
+    stderr.mockRestore();
+  });
+
+  it("keeps internal session configuration errors generic", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    process.env.SESSION_SECRET = "short";
+    resetEnvForTests();
+    const response = await login("admin", "correct-password", "10.0.0.23");
+    expect(response.status).toBe(400);
+    const body = JSON.stringify(await response.json());
+    expect(body).toBe(JSON.stringify({ success: false, error: "Login failed" }));
+    expect(body).not.toContain("SESSION_SECRET");
+    expect(body).not.toContain("short");
+    const log = stderr.mock.calls.flat().join(" ");
+    expect(log).toContain('"reason":"session_configuration"');
+    expect(log).not.toContain("short");
+    stderr.mockRestore();
   });
 
   it("returns a temporary challenge after a valid password without a final session", async () => {
