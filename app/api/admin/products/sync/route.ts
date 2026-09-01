@@ -2,7 +2,7 @@ import { z } from "zod";
 import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
 import { query } from "@/lib/db/client";
-import { enqueueJob } from "@/lib/queue/queues";
+import { enqueueKiotVietProductSyncJobs } from "@/lib/queue/product-sync-batches";
 import { log } from "@/lib/logger";
 import { ensureKiotVietProductMapping } from "@/lib/sync/ensure-kiotviet-product-mapping";
 
@@ -56,27 +56,15 @@ export async function POST(request: Request) {
       else duplicateShopify++;
     });
 
-    await Promise.all(
-      readyProductIds.map((productId) =>
-        enqueueJob(
-          "sync",
-          "kiotviet_product_to_shopify",
-          {
-            productId,
-            manual: true,
-            direction: "kiotviet_to_shopify",
-          },
-          "normal",
-        ),
-      ),
-    );
+    const queueResult = await enqueueKiotVietProductSyncJobs(readyProductIds);
     await log("info", "Manual KiotViet to Shopify product sync queued", {
       action: "manual_product_sync_queued",
       provider: "kiotviet",
       entityType: "product",
       entityId: readyProductIds.length === 1 ? readyProductIds[0] : "bulk",
       direction: "kiotviet_to_shopify",
-      queued: readyProductIds.length,
+      queued: queueResult.queued,
+      failed: queueResult.failed,
       missingMappings: missingMappingIds.length,
       missingShopify,
       duplicateShopify,
@@ -88,7 +76,8 @@ export async function POST(request: Request) {
       {
         success: true,
         direction: "kiotviet_to_shopify",
-        queued: readyProductIds.length,
+        queued: queueResult.queued,
+        failed: queueResult.failed,
         missingMappings: missingMappingIds.length,
         missingMappingIds,
         missingShopify,

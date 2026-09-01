@@ -22,6 +22,12 @@ export function ProductSyncTable({ rows }: { rows: Record<string, unknown>[] }) 
   const [categories, setCategories] = useState<Array<{ id: number; name: string }>>([]);
   const [categoryId, setCategoryId] = useState("");
   const [categoryMessage, setCategoryMessage] = useState("");
+  const [selectedRunning, setSelectedRunning] = useState(false);
+  const [mappingRunning, setMappingRunning] = useState(false);
+  const [categoryRunning, setCategoryRunning] = useState(false);
+  const [allRunning, setAllRunning] = useState(false);
+  const [allMessage, setAllMessage] = useState("");
+  const [rowRunning, setRowRunning] = useState<Set<string>>(new Set());
   const ids = rows.map((row) => String(row.id));
   const allSelected = ids.length > 0 && ids.every((id) => selected.has(id));
   const columns = Object.keys(rows[0] ?? {}).filter((column) => column !== "id").slice(0, 8);
@@ -53,8 +59,15 @@ export function ProductSyncTable({ rows }: { rows: Record<string, unknown>[] }) 
 
   async function queue(mappingIds: string[], rowId?: string) {
     if (!mappingIds.length) return;
-    if (rowId) setRowStatus((current) => ({ ...current, [rowId]: "Queueing…" }));
-    else setMessage("Queueing…");
+    if (rowId) {
+      if (rowRunning.has(rowId)) return;
+      setRowRunning((current) => new Set(current).add(rowId));
+      setRowStatus((current) => ({ ...current, [rowId]: "Queueing..." }));
+    } else {
+      if (selectedRunning) return;
+      setSelectedRunning(true);
+      setMessage("Queueing selected products...");
+    }
     try {
       const response = await fetch("/api/admin/products/sync", {
         method: "POST",
@@ -63,7 +76,7 @@ export function ProductSyncTable({ rows }: { rows: Record<string, unknown>[] }) 
       });
       const result = (await response.json()) as SyncResult;
       const status = response.ok
-        ? `Queued: ${result.queued ?? 0}; skipped: ${result.skipped ?? result.missingMappings ?? 0}`
+        ? `Queued: ${result.queued ?? 0}; skipped: ${result.skipped ?? result.missingMappings ?? 0}; failed: ${result.failed ?? 0}`
         : result.error ?? "Failed";
       if (rowId) setRowStatus((current) => ({ ...current, [rowId]: status }));
       else {
@@ -73,11 +86,21 @@ export function ProductSyncTable({ rows }: { rows: Record<string, unknown>[] }) 
     } catch {
       if (rowId) setRowStatus((current) => ({ ...current, [rowId]: "Failed" }));
       else setMessage("Failed");
+    } finally {
+      if (rowId)
+        setRowRunning((current) => {
+          const next = new Set(current);
+          next.delete(rowId);
+          return next;
+        });
+      else setSelectedRunning(false);
     }
   }
 
   async function createAllMappings() {
-    setMappingMessage("Creating mappings…");
+    if (mappingRunning) return;
+    setMappingRunning(true);
+    setMappingMessage("Creating mappings...");
     try {
       const response = await fetch("/api/admin/products/mappings", { method: "POST" });
       const result = (await response.json()) as SyncResult;
@@ -88,13 +111,16 @@ export function ProductSyncTable({ rows }: { rows: Record<string, unknown>[] }) 
       );
     } catch {
       setMappingMessage("Failed");
+    } finally {
+      setMappingRunning(false);
     }
   }
 
   async function syncCategory() {
     const selectedCategory = Number(categoryId);
-    if (!Number.isSafeInteger(selectedCategory) || selectedCategory <= 0) return;
-    setCategoryMessage("Queueing category…");
+    if (categoryRunning || !Number.isSafeInteger(selectedCategory) || selectedCategory <= 0) return;
+    setCategoryRunning(true);
+    setCategoryMessage("Queueing category products...");
     try {
       const response = await fetch("/api/admin/products/category-sync", {
         method: "POST",
@@ -109,23 +135,54 @@ export function ProductSyncTable({ rows }: { rows: Record<string, unknown>[] }) 
       );
     } catch {
       setCategoryMessage("Failed");
+    } finally {
+      setCategoryRunning(false);
+    }
+  }
+
+  async function syncAll() {
+    if (allRunning) return;
+    setAllRunning(true);
+    setAllMessage("Queueing all KiotViet products...");
+    try {
+      const response = await fetch("/api/admin/products/sync-all", {
+        method: "POST",
+      });
+      const result = (await response.json()) as SyncResult;
+      setAllMessage(
+        response.ok
+          ? `Queued: ${result.queued ?? 0}; skipped: ${result.skipped ?? 0}; failed: ${result.failed ?? 0}`
+          : result.error ?? "Failed",
+      );
+    } catch {
+      setAllMessage("Failed");
+    } finally {
+      setAllRunning(false);
     }
   }
 
   return (
     <div className="admin-table-wrap">
       <div className="header-actions">
-        <select aria-label="KiotViet category" value={categoryId} onChange={(event) => setCategoryId(event.target.value)}>
+        <select aria-label="KiotViet category" value={categoryId} disabled={categoryRunning} onChange={(event) => setCategoryId(event.target.value)}>
           <option value="">Select KiotViet category</option>
           {categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
         </select>
-        <button type="button" disabled={!categoryId} onClick={() => void syncCategory()}>Sync this category</button>
-        {categoryMessage && <small>{categoryMessage}</small>}
-        <button type="button" onClick={toggleAll}>Select all</button>
-        <button type="button" disabled={!selected.size} onClick={() => void queue([...selected])}>
-          Sync selected
+        <button type="button" disabled={!categoryId || categoryRunning} onClick={() => void syncCategory()}>
+          {categoryRunning ? "Queueing category..." : "Sync this category"}
         </button>
-        <button type="button" onClick={() => void createAllMappings()}>Create all mappings</button>
+        {categoryMessage && <small>{categoryMessage}</small>}
+        <button type="button" disabled={allRunning} onClick={() => void syncAll()}>
+          {allRunning ? "Queueing all products..." : "Sync all from KiotViet"}
+        </button>
+        {allMessage && <small>{allMessage}</small>}
+        <button type="button" onClick={toggleAll}>Select all</button>
+        <button type="button" disabled={!selected.size || selectedRunning} onClick={() => void queue([...selected])}>
+          {selectedRunning ? "Queueing selected..." : "Sync selected"}
+        </button>
+        <button type="button" disabled={mappingRunning} onClick={() => void createAllMappings()}>
+          {mappingRunning ? "Creating mappings..." : "Create all mappings"}
+        </button>
         {message && <small>{message}</small>}
         {mappingMessage && <small>{mappingMessage}</small>}
       </div>
@@ -145,7 +202,9 @@ export function ProductSyncTable({ rows }: { rows: Record<string, unknown>[] }) 
                 <td><input aria-label={`Select ${String(row.sku ?? id)}`} type="checkbox" checked={selected.has(id)} onChange={() => toggle(id)} /></td>
                 {columns.map((column) => <td key={column}>{format(row[column])}</td>)}
                 <td>
-                  <button type="button" onClick={() => void queue([id], id)}>Sync now</button>
+                  <button type="button" disabled={rowRunning.has(id)} onClick={() => void queue([id], id)}>
+                    {rowRunning.has(id) ? "Queueing..." : "Sync now"}
+                  </button>
                   {rowStatus[id] && <small>{rowStatus[id]}</small>}
                 </td>
               </tr>

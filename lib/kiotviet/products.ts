@@ -60,12 +60,18 @@ export async function getAllKiotVietCategories(): Promise<KiotVietCategory[]> {
 export async function getAllKiotVietProductsByCategory(
   categoryId: number,
 ): Promise<KiotVietProduct[]> {
+  return getAllKiotVietProducts({ categoryId });
+}
+
+export async function getAllKiotVietProducts(
+  params: Pick<GetProductsParams, "categoryId"> = {},
+): Promise<KiotVietProduct[]> {
   const products: KiotVietProduct[] = [];
   let currentItem = 0;
   let total = 1;
   while (currentItem < total) {
     const page = await getKiotVietProducts({
-      categoryId,
+      ...params,
       currentItem,
       pageSize: 100,
       includeInventory: false,
