@@ -33,6 +33,19 @@ export function selectKiotVietSyncCandidates(
 ): { candidates: ProductSyncCandidate[]; skipped: number } {
   const candidates: ProductSyncCandidate[] = [];
   let skipped = 0;
+  const productIdsBySku = new Map<string, Set<number>>();
+  for (const product of products) {
+    const sku = normalizeSku(product.code);
+    if (!sku) continue;
+    const ids = productIdsBySku.get(sku) ?? new Set<number>();
+    ids.add(product.id);
+    productIdsBySku.set(sku, ids);
+  }
+  const conflictingSkus = new Set(
+    [...productIdsBySku]
+      .filter(([, ids]) => ids.size > 1)
+      .map(([sku]) => sku),
+  );
   const familyRoots = new Set(
     products
       .map((product) => product.masterProductId)
@@ -40,6 +53,10 @@ export function selectKiotVietSyncCandidates(
   );
   for (const product of products) {
     if (!isBulkSyncEligible(product)) {
+      skipped++;
+      continue;
+    }
+    if (conflictingSkus.has(normalizeSku(product.code))) {
       skipped++;
       continue;
     }
@@ -95,12 +112,9 @@ export async function enqueueKiotVietProductSyncJobs(
 }
 
 export async function queueKiotVietCatalog(input: { categoryId?: number } = {}) {
-  const seenFamilyKeys = new Set<string>();
+  const catalogMetadata: KiotVietProduct[] = [];
   let currentItem = 0;
   let total = 0;
-  let queued = 0;
-  let skipped = 0;
-  let failed = 0;
   while (currentItem === 0 || currentItem < total) {
     const page = await getKiotVietProducts({
       categoryId: input.categoryId,
@@ -109,17 +123,30 @@ export async function queueKiotVietCatalog(input: { categoryId?: number } = {}) 
       includeInventory: false,
     });
     total = page.total;
-    const selection = selectKiotVietSyncCandidates(page.data, seenFamilyKeys);
-    const result = await enqueueKiotVietProductSyncJobs(
-      selection.candidates,
-      input.categoryId ? { categoryId: input.categoryId } : {},
+    catalogMetadata.push(
+      ...page.data.map((product) => ({
+        id: product.id,
+        code: product.code,
+        name: "",
+        masterProductId: product.masterProductId,
+        hasVariants: product.hasVariants,
+        isActive: product.isActive,
+        allowsSale: product.allowsSale,
+      })),
     );
-    queued += result.queued;
-    failed += result.failed;
-    skipped += selection.skipped + result.deduplicated;
     currentItem += page.pageSize || KIOTVIET_PAGE_SIZE;
   }
-  return { total, queued, skipped, failed };
+  const selection = selectKiotVietSyncCandidates(catalogMetadata);
+  const result = await enqueueKiotVietProductSyncJobs(
+    selection.candidates,
+    input.categoryId ? { categoryId: input.categoryId } : {},
+  );
+  return {
+    total,
+    queued: result.queued,
+    skipped: selection.skipped + result.deduplicated,
+    failed: result.failed,
+  };
 }
 
 export async function resolveSelectedKiotVietProducts(productIds: number[]) {

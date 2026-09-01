@@ -70,4 +70,13 @@ describe("manual KiotViet to Shopify product sync", () => {
       expect(call[2]).toMatchObject({ direction: "kiotviet_to_shopify" });
     }
   });
+
+  it("skips all selected products with an ambiguous normalized SKU", async () => {
+    mocks.getProduct.mockImplementation(async (id: number) => ({
+      id, code: id === 501 ? " DUP " : "dup", name: `Product ${id}`,
+    }));
+    const response = await POST(request([501, 502]));
+    await expect(response.json()).resolves.toMatchObject({ queued: 0, skipped: 2 });
+    expect(mocks.enqueue).not.toHaveBeenCalled();
+  });
 });

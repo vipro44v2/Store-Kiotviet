@@ -11,6 +11,7 @@ import {
   dedupeKiotVietSyncProducts,
   enqueueKiotVietProductSyncJobs,
   queueKiotVietCatalog,
+  selectKiotVietSyncCandidates,
   PRODUCT_SYNC_BATCH_SIZE,
 } from "@/lib/queue/product-sync-batches";
 
@@ -59,6 +60,16 @@ describe("product sync queue batching", () => {
     expect(result).toEqual([1]);
   });
 
+  it("blocks every product sharing a duplicate normalized SKU in one page", () => {
+    const result = selectKiotVietSyncCandidates([
+      { id: 1, code: " DUP ", name: "First" },
+      { id: 2, code: "dup", name: "Second" },
+      { id: 3, code: "UNIQUE", name: "Unique" },
+    ]);
+    expect(result.candidates).toEqual([{ productId: 3, familyKey: "product:3" }]);
+    expect(result.skipped).toBe(2);
+  });
+
   it("counts a concurrently deduplicated queue request as skipped", async () => {
     mocks.enqueue.mockReset().mockResolvedValue({ id: "existing", deduplicated: true });
     await expect(enqueueKiotVietProductSyncJobs([501])).resolves.toEqual({
@@ -88,5 +99,21 @@ describe("product sync queue batching", () => {
     });
     expect(mocks.enqueue.mock.calls.map((call) => call[2].productId)).toEqual([11, 20]);
     expect(mocks.getProducts).toHaveBeenCalledTimes(2);
+  });
+
+  it("blocks duplicate normalized SKUs found on different catalog pages", async () => {
+    mocks.getProducts
+      .mockResolvedValueOnce({
+        total: 3, pageSize: 2,
+        data: [{ id: 1, code: "DUP", name: "First" }, { id: 3, code: "OK", name: "Unique" }],
+      })
+      .mockResolvedValueOnce({
+        total: 3, pageSize: 2,
+        data: [{ id: 2, code: " dup ", name: "Second" }],
+      });
+    await expect(queueKiotVietCatalog()).resolves.toEqual({
+      total: 3, queued: 1, skipped: 2, failed: 0,
+    });
+    expect(mocks.enqueue.mock.calls.map((call) => call[2].productId)).toEqual([3]);
   });
 });

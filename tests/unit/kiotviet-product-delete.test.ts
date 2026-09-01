@@ -25,7 +25,7 @@ vi.mock("@/lib/shopify/products", () => ({
   updateShopifyProduct: vi.fn(),
 }));
 vi.mock("@/repositories/mappings", () => ({
-  mappingsRepository: { findBySku: vi.fn(), upsert: mocks.upsert },
+  mappingsRepository: { findBySku: vi.fn(), upsertExact: mocks.upsert },
 }));
 vi.mock("@/lib/sync/inventory-sync", () => ({
   syncInventoryNotification: vi.fn(),
