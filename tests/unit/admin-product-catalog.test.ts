@@ -45,6 +45,8 @@ describe("admin KiotViet product catalog", () => {
     expect(mocks.query).toHaveBeenCalledTimes(1);
     expect(mocks.query).toHaveBeenCalledWith(expect.stringContaining("ANY($1::text[])"), [["A", "B"]]);
     expect(result.products.map((product) => product.syncStatus)).toEqual(["Synced", "Stale mapping"]);
+    expect(result.products.map((product) => product.shopifyMappingStatus)).toEqual(["Mapped", "Stale"]);
+    expect(result.products[1].shopifyProductId).toBeNull();
   });
 
   it("supports an empty KiotViet catalog without querying mappings", async () => {

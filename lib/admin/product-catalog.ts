@@ -14,7 +14,6 @@ interface MappingMetadata {
 
 export interface AdminProductDto {
   id: number;
-  syncProductId: number;
   name: string;
   sku: string;
   image?: string;
@@ -26,6 +25,7 @@ export interface AdminProductDto {
   syncStatus: "Not synced" | "Synced" | "Syncing" | "Failed" | "Stale mapping";
   shopifyProductId: string | null;
   shopifyVariantId: string | null;
+  shopifyMappingStatus: "Mapped" | "Stale" | "—";
 }
 
 function mappingStatus(productId: number, mapping?: MappingMetadata): AdminProductDto["syncStatus"] {
@@ -74,9 +74,14 @@ export async function getAdminProductCatalogPage(input: {
       (mapping) => mapping.kiotviet_product_id === String(product.id),
     );
     const mapping = exact ?? (candidates.length === 1 ? candidates[0] : undefined);
+    const status = candidates.length > 1 && !exact
+      ? "Stale mapping"
+      : mappingStatus(product.id, mapping);
+    const currentMapping = Boolean(
+      mapping && mapping.kiotviet_product_id === String(product.id),
+    );
     return {
       id: product.id,
-      syncProductId: product.masterProductId ?? product.id,
       name: product.fullName || product.name,
       sku: product.code,
       image: product.images?.[0],
@@ -87,9 +92,14 @@ export async function getAdminProductCatalogPage(input: {
         : null,
       active: product.isActive !== false && product.allowsSale !== false,
       variant: Boolean(product.masterProductId || product.hasVariants || product.attributes?.length),
-      syncStatus: candidates.length > 1 && !exact ? "Stale mapping" : mappingStatus(product.id, mapping),
-      shopifyProductId: mapping?.shopify_product_id ?? null,
-      shopifyVariantId: mapping?.shopify_variant_id ?? null,
+      syncStatus: status,
+      shopifyProductId: currentMapping ? mapping?.shopify_product_id ?? null : null,
+      shopifyVariantId: currentMapping ? mapping?.shopify_variant_id ?? null : null,
+      shopifyMappingStatus: status === "Stale mapping"
+        ? "Stale"
+        : currentMapping && mapping?.shopify_product_id
+          ? "Mapped"
+          : "—",
     };
   });
   const total = Number(response.total ?? 0);

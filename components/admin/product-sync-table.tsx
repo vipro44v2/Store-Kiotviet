@@ -55,6 +55,7 @@ export function ProductSyncTable() {
   const [categoryRunning, setCategoryRunning] = useState(false);
   const [allRunning, setAllRunning] = useState(false);
   const [rowRunning, setRowRunning] = useState<Set<number>>(new Set());
+  const bulkRunning = allRunning || categoryRunning || selectedRunning || mappingRunning;
 
   function updateQuery(changes: Record<string, string>) {
     const next = new URLSearchParams(searchParams.toString());
@@ -97,12 +98,12 @@ export function ProductSyncTable() {
   }, [searchInput, search]);
 
   const selectedProductIds = useMemo(() => [
-    ...new Set(catalog.products.filter((product) => selected.has(product.id)).map((product) => product.syncProductId)),
+    ...new Set(catalog.products.filter((product) => selected.has(product.id)).map((product) => product.id)),
   ], [catalog.products, selected]);
   const allSelected = catalog.products.length > 0 && catalog.products.every((product) => selected.has(product.id));
 
   async function queue(productIds: number[], rowId?: number) {
-    if (!productIds.length || (rowId ? rowRunning.has(rowId) : selectedRunning)) return;
+    if (!productIds.length || bulkRunning || (rowId ? rowRunning.has(rowId) : selectedRunning)) return;
     if (rowId) setRowRunning((current) => new Set(current).add(rowId));
     else setSelectedRunning(true);
     setMessage(rowId ? "Queueing product..." : "Queueing selected products...");
@@ -175,10 +176,10 @@ export function ProductSyncTable() {
         </select>
       </div>
       <div className="header-actions">
-        <button type="button" disabled={!selectedProductIds.length || selectedRunning} onClick={() => void queue(selectedProductIds)}>{selectedRunning ? "Queueing selected..." : "Sync selected"}</button>
-        <button type="button" disabled={!categoryId || categoryRunning} onClick={() => void syncCategory()}>{categoryRunning ? "Queueing category..." : "Sync this category"}</button>
-        <button type="button" disabled={allRunning} onClick={() => void syncAll()}>{allRunning ? "Queueing all products..." : "Sync all from KiotViet"}</button>
-        <button type="button" disabled={mappingRunning} onClick={() => void createAllMappings()}>{mappingRunning ? "Creating mappings..." : "Create all mappings"}</button>
+        <button type="button" disabled={!selectedProductIds.length || bulkRunning} onClick={() => void queue(selectedProductIds)}>{selectedRunning ? "Queueing selected..." : "Sync selected"}</button>
+        <button type="button" disabled={!categoryId || bulkRunning} onClick={() => void syncCategory()}>{categoryRunning ? "Queueing category..." : "Sync this category"}</button>
+        <button type="button" disabled={bulkRunning} onClick={() => void syncAll()}>{allRunning ? "Queueing all products..." : "Sync all from KiotViet"}</button>
+        <button type="button" disabled={bulkRunning} onClick={() => void createAllMappings()}>{mappingRunning ? "Creating mappings..." : "Create all mappings"}</button>
       </div>
       {message && <p>{message}</p>}{categoryMessage && <p>{categoryMessage}</p>}{allMessage && <p>{allMessage}</p>}{mappingMessage && <p>{mappingMessage}</p>}
       {error && <div className="error-banner">{error}</div>}
@@ -193,8 +194,8 @@ export function ProductSyncTable() {
               <td><input aria-label={`Select ${product.sku}`} type="checkbox" checked={selected.has(product.id)} onChange={() => setSelected((current) => { const next = new Set(current); next.has(product.id) ? next.delete(product.id) : next.add(product.id); return next; })} /></td>
               <td>{product.image ? <img src={product.image} alt="" width="48" height="48" loading="lazy" /> : "—"}</td>
               <td>{product.name}{product.variant ? <small> Variant</small> : null}</td><td>{product.sku || "—"}</td><td>{product.category}</td>
-              <td>{product.price.toLocaleString()}</td><td>{product.stock ?? "—"}</td><td>{product.syncStatus}</td><td>{product.shopifyProductId ? "Mapped" : "—"}</td>
-              <td><button type="button" disabled={rowRunning.has(product.id)} onClick={() => void queue([product.syncProductId], product.id)}>{rowRunning.has(product.id) ? "Queueing..." : "Sync now"}</button></td>
+              <td>{product.price.toLocaleString()}</td><td>{product.stock ?? "—"}</td><td>{product.syncStatus}</td><td>{product.shopifyMappingStatus}</td>
+              <td><button type="button" disabled={bulkRunning || rowRunning.has(product.id)} onClick={() => void queue([product.id], product.id)}>{rowRunning.has(product.id) ? "Queueing..." : "Sync now"}</button></td>
             </tr>
           ))}</tbody>
         </table>

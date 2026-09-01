@@ -39,7 +39,10 @@ vi.mock("@/lib/db/client", () => ({ query: mocks.query }));
 vi.mock("@/lib/logger", () => ({ log: mocks.log }));
 vi.mock("@/lib/sync/inventory-sync", () => ({ syncInventoryNotification: vi.fn() }));
 
-import { syncKiotVietProductToShopify } from "@/lib/sync/kiotviet-product-sync";
+import {
+  resolveExistingFamilyShopifyProduct,
+  syncKiotVietProductToShopify,
+} from "@/lib/sync/kiotviet-product-sync";
 
 describe("stale Shopify product mapping recovery", () => {
   beforeEach(() => {
@@ -78,5 +81,25 @@ describe("stale Shopify product mapping recovery", () => {
       sync_direction: "kiotviet_to_shopify",
     }));
   });
-});
 
+  it("recreates a family when two mapped Shopify products are both deleted", async () => {
+    mocks.productExists.mockResolvedValue(false);
+    await expect(
+      resolveExistingFamilyShopifyProduct(["deleted-1", "deleted-2"]),
+    ).resolves.toBeUndefined();
+  });
+
+  it("uses the existing product when the other family mapping is stale", async () => {
+    mocks.productExists.mockImplementation(async (id: string) => id === "existing");
+    await expect(
+      resolveExistingFamilyShopifyProduct(["deleted", "existing"]),
+    ).resolves.toBe("existing");
+  });
+
+  it("rejects a family mapped to two existing Shopify products", async () => {
+    mocks.productExists.mockResolvedValue(true);
+    await expect(
+      resolveExistingFamilyShopifyProduct(["existing-1", "existing-2"]),
+    ).rejects.toThrow("multiple existing Shopify products");
+  });
+});

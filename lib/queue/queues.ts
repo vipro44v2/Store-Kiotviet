@@ -15,7 +15,14 @@ export function getQueue(name: QueueName): Queue<SyncJobPayload> {
   return queue;
 }
 
-export async function enqueueJob(name: QueueName, type: JobType, payload: SyncJobPayload, priority: JobPriority = "normal", deduplicationId?: string) {
+export async function enqueueJob(
+  name: QueueName,
+  type: JobType,
+  payload: SyncJobPayload,
+  priority: JobPriority = "normal",
+  jobId?: string,
+  transientDeduplicationId?: string,
+) {
   const auditId = await jobsRepository.create(type, payload, priority, getEnv().JOB_MAX_ATTEMPTS);
   if (!isRedisEnabled()) {
     await jobsRepository.attachQueueJob(auditId, `local-${auditId}`);
@@ -30,7 +37,7 @@ export async function enqueueJob(name: QueueName, type: JobType, payload: SyncJo
       await jobsRepository.fail(auditId, failure, isManualReview(failure));
       throw failure;
     }
-    return { id: `local-${auditId}` };
+    return { id: `local-${auditId}`, deduplicated: false };
   }
   const job = await getQueue(name).add(type, { ...payload, auditJobId: auditId }, {
     attempts: getEnv().JOB_MAX_ATTEMPTS,
@@ -38,10 +45,15 @@ export async function enqueueJob(name: QueueName, type: JobType, payload: SyncJo
     priority: priorityNumber[priority],
     removeOnComplete: { age: 86_400 * 30, count: 10_000 },
     removeOnFail: false,
-    jobId: deduplicationId,
+    jobId,
+    deduplication: transientDeduplicationId
+      ? { id: transientDeduplicationId }
+      : undefined,
   });
+  const deduplicated = job.data.auditJobId !== auditId;
+  if (deduplicated) await jobsRepository.complete(auditId);
   await jobsRepository.attachQueueJob(auditId, String(job.id));
-  return job;
+  return Object.assign(job, { deduplicated });
 }
 
 export async function closeQueues(): Promise<void> { await Promise.all([...queues.values()].map((queue) => queue.close())); queues.clear(); }

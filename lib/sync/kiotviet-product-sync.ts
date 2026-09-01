@@ -118,14 +118,7 @@ async function syncVariantFamily(
         .filter((id): id is string => Boolean(id)),
     ),
   ];
-  if (productIds.length > 1)
-    throw new Error(
-      `KiotViet variant family is mapped to multiple Shopify products: ${productIds.join(", ")}`,
-    );
-  const existingProductId =
-    productIds[0] && (await shopifyProductExists(productIds[0]))
-      ? productIds[0]
-      : undefined;
+  const existingProductId = await resolveExistingFamilyShopifyProduct(productIds);
   if (
     existingProductId &&
     shouldSkipUnchangedProduct(hash, triggerMappings, familyMappings)
@@ -151,6 +144,21 @@ async function syncVariantFamily(
     variants: products.map((product) => product.code),
   });
   return { sku: trigger.code, updated: true, variants: products.length };
+}
+
+export async function resolveExistingFamilyShopifyProduct(
+  mappedProductIds: string[],
+): Promise<string | undefined> {
+  const uniqueIds = [...new Set(mappedProductIds.filter(Boolean))];
+  const existence = await Promise.all(
+    uniqueIds.map(async (id) => ({ id, exists: await shopifyProductExists(id) })),
+  );
+  const existingProductIds = existence.filter((item) => item.exists).map((item) => item.id);
+  if (existingProductIds.length > 1)
+    throw new MappingError(
+      `KiotViet variant family is mapped to multiple existing Shopify products: ${existingProductIds.join(", ")}`,
+    );
+  return existingProductIds[0];
 }
 
 export async function syncDeletedKiotVietProducts(

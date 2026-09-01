@@ -31,6 +31,10 @@ export async function getKiotVietProducts(
   if (params.orderBy) query.set("orderBy", params.orderBy);
   if (params.orderDirection) query.set("orderDirection", params.orderDirection);
   if (params.categoryId) query.set("categoryId", String(params.categoryId));
+  if (params.masterProductId)
+    query.set("masterProductId", String(params.masterProductId));
+  if (params.isActive !== undefined)
+    query.set("isActive", String(params.isActive));
   if (params.searchTerm?.trim()) {
     // KiotViet's product filter uses `name` for a code/name search. Keep this
     // mapping isolated here in case the API contract changes.
@@ -106,22 +110,22 @@ export async function getKiotVietVariantFamily(
   )
     return [product];
   const rootId = product.masterProductId ?? product.id;
-  const family: KiotVietProduct[] = [];
+  const family = new Map<number, KiotVietProduct>();
   let currentItem = 0;
   let total = 1;
   while (currentItem < total) {
     const page = await getKiotVietProducts({
+      masterProductId: rootId,
       currentItem,
       pageSize: 100,
       includeInventory: true,
     });
-    family.push(
-      ...page.data.filter(
-        (item) => item.id === rootId || item.masterProductId === rootId,
-      ),
-    );
+    for (const item of page.data)
+      if (item.id === rootId || item.masterProductId === rootId)
+        family.set(item.id, item);
     total = page.total;
     currentItem += page.pageSize;
   }
-  return family.length ? family : [product];
+  family.set(product.id, product);
+  return [...family.values()];
 }

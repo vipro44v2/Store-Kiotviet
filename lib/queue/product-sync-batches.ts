@@ -1,43 +1,143 @@
-import { enqueueJob } from "@/lib/queue/queues";
+import { getKiotVietProduct, getKiotVietProducts } from "@/lib/kiotviet/products";
 import type { KiotVietProduct } from "@/lib/kiotviet/types";
+import { normalizeSku } from "@/lib/sync/mappings";
+import { enqueueJob } from "@/lib/queue/queues";
 
 export const PRODUCT_SYNC_BATCH_SIZE = 40;
+const KIOTVIET_PAGE_SIZE = 100;
+
+export interface ProductSyncCandidate {
+  productId: number;
+  familyKey: string;
+}
+
+export function isBulkSyncEligible(product: KiotVietProduct): boolean {
+  return (
+    product.isActive !== false &&
+    product.allowsSale !== false &&
+    Boolean(normalizeSku(product.code))
+  );
+}
+
+function familyKey(product: KiotVietProduct, familyRoots: ReadonlySet<number>): string {
+  return product.masterProductId
+    ? `family:${product.masterProductId}`
+    : product.hasVariants || familyRoots.has(product.id)
+      ? `family:${product.id}`
+      : `product:${product.id}`;
+}
+
+export function selectKiotVietSyncCandidates(
+  products: KiotVietProduct[],
+  seenFamilyKeys: Set<string> = new Set(),
+): { candidates: ProductSyncCandidate[]; skipped: number } {
+  const candidates: ProductSyncCandidate[] = [];
+  let skipped = 0;
+  const familyRoots = new Set(
+    products
+      .map((product) => product.masterProductId)
+      .filter((id): id is number => Boolean(id)),
+  );
+  for (const product of products) {
+    if (!isBulkSyncEligible(product)) {
+      skipped++;
+      continue;
+    }
+    const key = familyKey(product, familyRoots);
+    if (seenFamilyKeys.has(key)) {
+      skipped++;
+      continue;
+    }
+    seenFamilyKeys.add(key);
+    // This ID came from KiotViet's response, so /products/{id} is fetchable.
+    candidates.push({ productId: product.id, familyKey: key });
+  }
+  return { candidates, skipped };
+}
 
 export function dedupeKiotVietSyncProducts(products: KiotVietProduct[]): number[] {
-  return [
-    ...new Set(
-      products
-        .map((product) => product.masterProductId ?? product.id)
-        .filter((id) => Number.isSafeInteger(id) && id > 0),
-    ),
-  ];
+  return selectKiotVietSyncCandidates(products).candidates.map(
+    (candidate) => candidate.productId,
+  );
 }
 
 export async function enqueueKiotVietProductSyncJobs(
-  productIds: Array<number | string>,
+  candidates: Array<number | string | ProductSyncCandidate>,
   extra: Record<string, unknown> = {},
 ) {
   let queued = 0;
   let failed = 0;
-  for (let start = 0; start < productIds.length; start += PRODUCT_SYNC_BATCH_SIZE) {
-    const batch = productIds.slice(start, start + PRODUCT_SYNC_BATCH_SIZE);
+  let deduplicated = 0;
+  for (let start = 0; start < candidates.length; start += PRODUCT_SYNC_BATCH_SIZE) {
+    const batch = candidates.slice(start, start + PRODUCT_SYNC_BATCH_SIZE);
     const results = await Promise.allSettled(
-      batch.map((productId) =>
-        enqueueJob(
+      batch.map((candidate) => {
+        const item = typeof candidate === "object"
+          ? candidate
+          : { productId: candidate, familyKey: `product:${candidate}` };
+        return enqueueJob(
           "sync",
           "kiotviet_product_to_shopify",
-          {
-            ...extra,
-            productId,
-            manual: true,
-            direction: "kiotviet_to_shopify",
-          },
+          { ...extra, productId: item.productId, manual: true, direction: "kiotviet_to_shopify" },
           "normal",
-        ),
-      ),
+          undefined,
+          `kiotviet-product-sync:${item.familyKey}`,
+        );
+      }),
     );
-    queued += results.filter((result) => result.status === "fulfilled").length;
-    failed += results.filter((result) => result.status === "rejected").length;
+    for (const result of results) {
+      if (result.status === "rejected") failed++;
+      else if (result.value.deduplicated) deduplicated++;
+      else queued++;
+    }
   }
-  return { queued, failed };
+  return { queued, failed, deduplicated };
+}
+
+export async function queueKiotVietCatalog(input: { categoryId?: number } = {}) {
+  const seenFamilyKeys = new Set<string>();
+  let currentItem = 0;
+  let total = 0;
+  let queued = 0;
+  let skipped = 0;
+  let failed = 0;
+  while (currentItem === 0 || currentItem < total) {
+    const page = await getKiotVietProducts({
+      categoryId: input.categoryId,
+      currentItem,
+      pageSize: KIOTVIET_PAGE_SIZE,
+      includeInventory: false,
+    });
+    total = page.total;
+    const selection = selectKiotVietSyncCandidates(page.data, seenFamilyKeys);
+    const result = await enqueueKiotVietProductSyncJobs(
+      selection.candidates,
+      input.categoryId ? { categoryId: input.categoryId } : {},
+    );
+    queued += result.queued;
+    failed += result.failed;
+    skipped += selection.skipped + result.deduplicated;
+    currentItem += page.pageSize || KIOTVIET_PAGE_SIZE;
+  }
+  return { total, queued, skipped, failed };
+}
+
+export async function resolveSelectedKiotVietProducts(productIds: number[]) {
+  const products: KiotVietProduct[] = [];
+  let failed = 0;
+  const uniqueIds = [...new Set(productIds)];
+  for (let start = 0; start < uniqueIds.length; start += PRODUCT_SYNC_BATCH_SIZE) {
+    const results = await Promise.allSettled(
+      uniqueIds.slice(start, start + PRODUCT_SYNC_BATCH_SIZE).map(getKiotVietProduct),
+    );
+    for (const result of results)
+      if (result.status === "fulfilled") products.push(result.value);
+      else failed++;
+  }
+  const selection = selectKiotVietSyncCandidates(products);
+  return {
+    candidates: selection.candidates,
+    skipped: selection.skipped + (productIds.length - uniqueIds.length),
+    failed,
+  };
 }

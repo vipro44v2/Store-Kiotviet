@@ -59,6 +59,8 @@ export interface GetProductsParams {
   includeInventory?: boolean;
   searchTerm?: string;
   categoryId?: number;
+  masterProductId?: number;
+  isActive?: boolean;
 }
 
 export interface KiotVietReturnDetail { productId:number;productCode:string;productName:string;quantity:number;price:number;subTotal?:number }

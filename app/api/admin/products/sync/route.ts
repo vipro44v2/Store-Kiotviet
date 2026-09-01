@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
-import { enqueueKiotVietProductSyncJobs } from "@/lib/queue/product-sync-batches";
+import { enqueueKiotVietProductSyncJobs, resolveSelectedKiotVietProducts } from "@/lib/queue/product-sync-batches";
 import { log } from "@/lib/logger";
 
 const schema = z.object({
@@ -13,25 +13,28 @@ export async function POST(request: Request) {
     await requireAdmin();
     assertTrustedOrigin(request);
     const input = schema.parse(await request.json());
-    const productIds = [...new Set(input.productIds)];
-    const queueResult = await enqueueKiotVietProductSyncJobs(productIds);
+    const selection = await resolveSelectedKiotVietProducts(input.productIds);
+    const queueResult = await enqueueKiotVietProductSyncJobs(selection.candidates);
     await log("info", "Manual KiotViet to Shopify product sync queued", {
       action: "manual_product_sync_queued",
       provider: "kiotviet",
       entityType: "product",
-      entityId: productIds.length === 1 ? String(productIds[0]) : "bulk",
+      entityId: selection.candidates.length === 1
+        ? String(selection.candidates[0].productId)
+        : "bulk",
       direction: "kiotviet_to_shopify",
       queued: queueResult.queued,
-      failed: queueResult.failed,
-      kiotVietProductIds: productIds,
+      failed: queueResult.failed + selection.failed,
+      skipped: selection.skipped + queueResult.deduplicated,
+      kiotVietProductIds: selection.candidates.map((item) => item.productId),
     });
     return Response.json(
       {
         success: true,
         direction: "kiotviet_to_shopify",
         queued: queueResult.queued,
-        failed: queueResult.failed,
-        skipped: 0,
+        failed: queueResult.failed + selection.failed,
+        skipped: selection.skipped + queueResult.deduplicated,
       },
       { status: 202 },
     );
