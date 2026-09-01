@@ -1,4 +1,4 @@
-import { requireAdmin } from "@/lib/auth/middleware";
+import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { getKiotVietAccessToken } from "@/lib/kiotviet/auth";
 import { shopifyGraphql } from "@/lib/shopify/graphql";
 import { query } from "@/lib/db/client";
@@ -19,12 +19,6 @@ export async function POST(
     );
     return Response.json({ success: true });
   } catch (error) {
-    return Response.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : "Connection failed",
-      },
-      { status: 502 },
-    );
+    return adminApiErrorResponse(error, "Connection failed", 502);
   }
 }

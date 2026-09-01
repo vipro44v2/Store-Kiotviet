@@ -32,7 +32,18 @@ export interface KiotVietProduct {
 
 export interface KiotVietBranch { id: number; branchName: string; isActive?: boolean }
 export interface KiotVietStockNotification { ProductId:number;ProductCode:string;ProductName:string;BranchId:number;BranchName:string;Cost:number;OnHand:number;Reserved:number }
-export interface KiotVietWebhookPayload { Id:string;Attempt:number;RemoveId?:number[];removeId?:number[];Notifications:Array<{Action:string;Data:Array<KiotVietStockNotification|Record<string,unknown>>;RemoveId?:number[];removeId?:number[]}> }
+export interface KiotVietWebhookPayload {
+  Id?: string;
+  Attempt?: number;
+  RemoveId?: unknown;
+  removeId?: unknown;
+  Notifications?: Array<{
+    Action?: string;
+    Data?: unknown[];
+    RemoveId?: unknown;
+    removeId?: unknown;
+  }>;
+}
 
 export interface KiotVietProductsResponse {
   total: number;

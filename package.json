@@ -15,7 +15,9 @@
     "db:seed": "tsx scripts/seed.ts",
     "webhooks:register": "tsx scripts/register-shopify-webhooks.ts",
     "webhooks:test:kiotviet": "tsx --env-file=.env.local scripts/test-kiotviet-webhook.ts",
-    "health:check": "tsx scripts/check-integrations.ts"
+    "health:check": "tsx scripts/check-integrations.ts",
+    "mappings:backfill": "tsx scripts/backfill-mappings.ts",
+    "setup:store": "tsx scripts/setup-store.ts"
   },
   "dependencies": {
     "bullmq": "latest",

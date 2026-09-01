@@ -117,7 +117,10 @@ describe("ensureProductMapping", () => {
 
     expect(mocks.getKiotViet).toHaveBeenNthCalledWith(
       2,
-      expect.objectContaining({ searchTerm: "NU012", currentItem: 100 }),
+      expect.objectContaining({ currentItem: 100 }),
+    );
+    expect(mocks.getKiotViet).not.toHaveBeenCalledWith(
+      expect.objectContaining({ searchTerm: expect.anything() }),
     );
   });
 

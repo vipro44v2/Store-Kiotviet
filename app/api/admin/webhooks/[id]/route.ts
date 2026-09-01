@@ -1,4 +1,4 @@
-import { requireAdmin } from "@/lib/auth/middleware";
+import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
 import { webhooksRepository } from "@/repositories/webhooks";
 import { enqueueJob } from "@/lib/queue/queues";
@@ -43,12 +43,6 @@ export async function POST(
     await enqueueJob("webhooks", type, { eventId: id }, "high");
     return Response.json({ success: true }, { status: 202 });
   } catch (error) {
-    return Response.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : "Action failed",
-      },
-      { status: 400 },
-    );
+    return adminApiErrorResponse(error, "Action failed");
   }
 }

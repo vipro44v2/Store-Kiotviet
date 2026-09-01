@@ -58,7 +58,7 @@ describe("KiotViet product deletion", () => {
     expect(mocks.archive).toHaveBeenCalledWith("gid://shopify/Product/1");
     expect(mocks.query.mock.calls[2][0]).toContain("sync_status='archived'");
     const sql = mocks.query.mock.calls.map(([statement]) => String(statement));
-    expect(sql.some((statement) => statement.includes("$1::text"))).toBe(true);
+    expect(sql.some((statement) => statement.includes("kiotviet_product_id::text"))).toBe(true);
     expect(sql.some((statement) => statement.includes("$2::text[]"))).toBe(true);
     expect(sql.some((statement) => statement.includes("bigint"))).toBe(false);
   });
@@ -66,7 +66,7 @@ describe("KiotViet product deletion", () => {
   it("is safe when the same delete webhook is processed again", async () => {
     let archived = false;
     mocks.query.mockImplementation(async (sql: string) => {
-      if (sql.includes("FROM product_mappings") && sql.includes("WHERE ($1"))
+      if (sql.includes("FROM product_mappings") && sql.includes("kiotviet_product_id::text=$1"))
         return [
           {
             shopify_product_id: "gid://shopify/Product/1",
@@ -87,7 +87,7 @@ describe("KiotViet product deletion", () => {
 
   it("does not archive the Shopify product when another variant remains", async () => {
     mocks.query.mockImplementation(async (sql: string) => {
-      if (sql.includes("WHERE ($1"))
+      if (sql.includes("kiotviet_product_id::text=$1"))
         return [
           {
             shopify_product_id: "gid://shopify/Product/1",
@@ -121,7 +121,7 @@ describe("KiotViet product deletion", () => {
       "gid://shopify/Product/1",
     );
     expect(mocks.query.mock.calls.some(([sql]) =>
-      String(sql).includes("kiotviet_product_id=ANY") &&
+      String(sql).includes("kiotviet_product_id::text=ANY") &&
       String(sql).includes("$1::text[]") &&
       String(sql).includes("sync_status='archived'"),
     )).toBe(true);

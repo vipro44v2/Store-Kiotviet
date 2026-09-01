@@ -130,7 +130,7 @@ SHOPIFY_CLIENT_SECRET=xxx
 SHOPIFY_API_VERSION=2026-07
 KIOTVIET_CLIENT_ID=xxx
 KIOTVIET_CLIENT_SECRET=xxx
-KIOTVIET_RETAILER=shopqt
+KIOTVIET_RETAILER=your-retailer-code
 KIOTVIET_WEBHOOK_SECRET=BASE64_SECRET
 SESSION_SECRET=AT_LEAST_32_RANDOM_CHARACTERS
 ADMIN_USERNAME=admin
@@ -193,7 +193,7 @@ openssl rand -base64 32
 ```http
 POST https://public.kiotapi.com/webhooks
 Authorization: Bearer KIOTVIET_TOKEN
-Retailer: shopqt
+Retailer: your-retailer-code
 Content-Type: application/json
 
 {"Webhook":{"Type":"stock.update","Url":"https://sync.example.com/api/kiotviet/webhooks","IsActive":true,"Description":"Shopify inventory synchronization","Secret":"BASE64_SECRET"}}
@@ -355,6 +355,34 @@ Trước update: backup DB và ghi lại commit hiện tại. Rollback code bằ
 ## Giới hạn KiotViet chính thức
 
 KiotViet hỗ trợ product/customer/order REST và webhook `stock.update`. Một số chuyển đổi refund, fulfillment và status không có phép ánh xạ một-một an toàn cho mọi cấu hình cửa hàng. Hệ thống giữ payload, tạo manual-review và notification thay vì tự đoán endpoint/payload hoặc bỏ qua sự kiện.
+
+## Portable store bootstrap
+
+Copy `.env.example` to `.env.local` and replace every placeholder. Store identity,
+credentials, public callback URL, retailer code, and runtime services are configured
+through environment variables; branch/location relationships and the default order
+branch remain database settings.
+
+Verify a new store without changing provider data:
+
+```bash
+npm ci
+npm run db:migrate
+npm run setup:store -- --mapping-dry-run
+npm run mappings:backfill
+```
+
+After reviewing missing webhooks, locations, branches, duplicate SKUs, and the dry-run
+mapping report, apply only the explicit setup operations:
+
+```bash
+npm run setup:store -- --apply-webhooks --mapping-dry-run
+npm run mappings:backfill -- --apply
+```
+
+Both mapping modes use exact normalized Shopify variant SKU = KiotViet product code.
+They never use product names or fuzzy matching. Existing valid mappings are preserved,
+and duplicate or conflicting records require manual resolution.
 
 ## Production checklist
 

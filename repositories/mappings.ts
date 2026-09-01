@@ -26,6 +26,11 @@ export const mappingsRepository = {
       [limit],
     );
   },
+  async listAll() {
+    return query<MappingRecord>(
+      "SELECT * FROM product_mappings ORDER BY updated_at DESC",
+    );
+  },
   async upsert(input: Omit<MappingRecord, "id" | "last_sync_hash">) {
     return transaction(async (client) => {
       const result = await client.query<MappingRecord>(

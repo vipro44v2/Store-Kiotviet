@@ -4,7 +4,9 @@ import { getKiotVietProduct } from "../lib/kiotviet/products";
 
 async function main() {
   const env = getEnv();
-  const productId = Number(process.argv[2] ?? 43043467);
+  const productId = Number(process.argv[2]);
+  if (!Number.isSafeInteger(productId) || productId <= 0)
+    throw new Error("Usage: tsx scripts/test-kiotviet-price-webhook.ts <kiotviet-product-id> [price]");
   const current = await getKiotVietProduct(productId);
   const price = process.argv[3] === undefined ? Number(current.basePrice ?? 0) : Number(process.argv[3]);
   const webhookId = `price-test-${randomUUID()}`;

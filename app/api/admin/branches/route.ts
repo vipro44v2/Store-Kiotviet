@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { requireAdmin } from "@/lib/auth/middleware";
+import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
 import { getKiotVietBranches } from "@/lib/kiotviet/branches";
 import { getShopifyLocations } from "@/lib/shopify/locations";
@@ -24,13 +24,7 @@ export async function GET() {
     ]);
     return Response.json({ success: true, branches, locations, mappings });
   } catch (error) {
-    return Response.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : "Unavailable",
-      },
-      { status: 502 },
-    );
+    return adminApiErrorResponse(error, "Unavailable", 502);
   }
 }
 export async function PUT(request: Request) {
@@ -51,12 +45,6 @@ export async function PUT(request: Request) {
     );
     return Response.json({ success: true });
   } catch (error) {
-    return Response.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : "Invalid mapping",
-      },
-      { status: 400 },
-    );
+    return adminApiErrorResponse(error, "Invalid mapping");
   }
 }

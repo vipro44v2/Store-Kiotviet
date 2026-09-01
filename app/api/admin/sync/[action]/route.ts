@@ -1,4 +1,4 @@
-import { requireAdmin } from "@/lib/auth/middleware";
+import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
 import { enqueueJob } from "@/lib/queue/queues";
 import type { JobType } from "@/lib/queue/jobs";
@@ -40,12 +40,6 @@ export async function POST(
     );
     return Response.json({ success: true, jobId: job.id }, { status: 202 });
   } catch (error) {
-    return Response.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : "Request failed",
-      },
-      { status: 400 },
-    );
+    return adminApiErrorResponse(error, "Request failed");
   }
 }

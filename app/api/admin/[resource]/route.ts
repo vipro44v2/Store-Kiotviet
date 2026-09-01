@@ -1,4 +1,4 @@
-import { requireAdmin } from "@/lib/auth/middleware";
+import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { query } from "@/lib/db/client";
 const queries: Record<string, string> = {
   products: "SELECT * FROM product_mappings ORDER BY updated_at DESC LIMIT 200",
@@ -30,10 +30,7 @@ export async function GET(
       success: true,
       data: await query<Record<string, unknown>>(sql),
     });
-  } catch {
-    return Response.json(
-      { success: false, error: "Unauthorized or unavailable" },
-      { status: 401 },
-    );
+  } catch (error) {
+    return adminApiErrorResponse(error, "Resource unavailable", 500);
   }
 }

@@ -18,6 +18,7 @@ import { syncInventoryNotification } from "./inventory-sync";
 import { query } from "@/lib/db/client";
 import { log } from "@/lib/logger";
 import type { KiotVietProduct } from "@/lib/kiotviet/types";
+import { ApiError, MappingError } from "@/lib/errors";
 
 function productState(product: KiotVietProduct) {
   return {
@@ -151,17 +152,32 @@ export async function syncDeletedKiotVietProducts(
     const productId = typeof reference === "number" ? reference : reference.id;
     const code = typeof reference === "number" ? undefined : reference.code;
     const normalizedCode = normalizeSku(code ?? "");
-    const deletedMappings = await query<{
+    type DeletedMapping = {
       shopify_product_id: string | null;
       kiotviet_product_id: string | null;
       sync_status: string;
-    }>(
-      `SELECT shopify_product_id,kiotviet_product_id,sync_status
-      FROM product_mappings
-      WHERE ($1::text IS NOT NULL AND kiotviet_product_id=$1)
-        OR ($2::text IS NOT NULL AND (kiotviet_code=$2 OR normalized_sku=$3))`,
-      [productId ? String(productId) : null, code ?? null, normalizedCode || null],
+    };
+    let deletedMappings: DeletedMapping[] = [];
+    if (productId)
+      deletedMappings = await query<DeletedMapping>(
+        `SELECT shopify_product_id,kiotviet_product_id::text AS kiotviet_product_id,sync_status
+        FROM product_mappings WHERE kiotviet_product_id::text=$1`,
+        [String(productId)],
+      );
+    if (!deletedMappings.length && normalizedCode)
+      deletedMappings = await query<DeletedMapping>(
+        `SELECT shopify_product_id,kiotviet_product_id::text AS kiotviet_product_id,sync_status
+        FROM product_mappings
+        WHERE normalized_sku=$1 OR upper(trim(kiotviet_code))=$1`,
+        [normalizedCode],
+      );
+    const matchedKiotVietIds = new Set(
+      deletedMappings.map((mapping) => mapping.kiotviet_product_id).filter(Boolean),
     );
+    if (!productId && matchedKiotVietIds.size > 1)
+      throw new MappingError(
+        `Deleted KiotViet code ${code} matches multiple mapped KiotViet products`,
+      );
     const productIds = [
       ...new Set(
         deletedMappings
@@ -170,7 +186,7 @@ export async function syncDeletedKiotVietProducts(
       ),
     ];
     if (productIds.length > 1)
-      throw new Error(
+      throw new MappingError(
         `Deleted KiotViet product ${productId ?? code} maps to multiple Shopify products`,
       );
     const shopifyProductId = productIds[0];
@@ -185,7 +201,7 @@ export async function syncDeletedKiotVietProducts(
       ),
     ];
     const familyMappings = await query<{ kiotviet_product_id: string | null }>(
-      "SELECT kiotviet_product_id FROM product_mappings WHERE shopify_product_id=$1 AND NOT (kiotviet_product_id=ANY($2::text[])) AND sync_status<>'archived'",
+      "SELECT kiotviet_product_id::text AS kiotviet_product_id FROM product_mappings WHERE shopify_product_id=$1 AND NOT (kiotviet_product_id::text=ANY($2::text[])) AND sync_status<>'archived'",
       [shopifyProductId, mappedKiotVietIds],
     );
     const remaining = (
@@ -193,11 +209,17 @@ export async function syncDeletedKiotVietProducts(
         familyMappings.map(async (mapping) => {
           if (!mapping.kiotviet_product_id) return undefined;
           return getKiotVietProduct(Number(mapping.kiotviet_product_id)).catch(
-            () => undefined,
+            (error: unknown) => {
+              if (error instanceof ApiError && error.status === 404) return undefined;
+              throw error;
+            },
           );
         }),
       )
-    ).filter((product): product is KiotVietProduct => Boolean(product));
+    ).filter(
+      (product): product is KiotVietProduct =>
+        Boolean(product) && product!.isActive !== false && product!.allowsSale !== false,
+    );
 
     if (!remaining.length) {
       await archiveShopifyProduct(shopifyProductId);
@@ -222,7 +244,7 @@ export async function syncDeletedKiotVietProducts(
         .map(productState)
         .sort((left, right) => left.code.localeCompare(right.code)),
     );
-    if (remaining.length === 1 && !remaining[0].attributes?.length) {
+    if (remaining.length === 1) {
       const saved = await collapseShopifyVariantGroup(
         remaining[0],
         shopifyProductId,
@@ -243,7 +265,7 @@ export async function syncDeletedKiotVietProducts(
       }
     }
     await query(
-      "UPDATE product_mappings SET sync_status='archived',updated_at=now() WHERE kiotviet_product_id=ANY($1::text[])",
+      "UPDATE product_mappings SET sync_status='archived',updated_at=now() WHERE kiotviet_product_id::text=ANY($1::text[])",
       [mappedKiotVietIds],
     );
   }

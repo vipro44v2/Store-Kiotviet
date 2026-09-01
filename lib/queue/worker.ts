@@ -36,6 +36,7 @@ import {
   syncKiotVietReturn,
 } from "@/lib/sync/return-sync";
 import { syncKiotVietCategoryToShopify } from "@/lib/sync/category-sync";
+import { normalizeSku } from "@/lib/sync/mappings";
 
 function recordPayload(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object")
@@ -58,45 +59,54 @@ function productIds(payload: KiotVietWebhookPayload): number[] {
   return [...ids];
 }
 
-function deletedProductReferences(
+function addDeleteIds(value: unknown, ids: Set<number>): void {
+  const values = Array.isArray(value) ? value : [value];
+  for (const candidate of values) {
+    const id =
+      typeof candidate === "number" || typeof candidate === "string"
+        ? Number(candidate)
+        : Number.NaN;
+    if (Number.isSafeInteger(id) && id > 0) ids.add(id);
+  }
+}
+
+export function deletedProductReferences(
   payload: KiotVietWebhookPayload,
 ): Array<{ id?: number; code?: string }> {
-  const ids = new Set<number>(
-    [...(payload.RemoveId ?? []), ...(payload.removeId ?? [])].map(Number),
-  );
+  const ids = new Set<number>();
+  const codes = new Map<string, string>();
+  addDeleteIds(payload.RemoveId, ids);
+  addDeleteIds(payload.removeId, ids);
   for (const notification of payload.Notifications ?? []) {
-    for (const id of [
-      ...(notification.RemoveId ?? []),
-      ...(notification.removeId ?? []),
-    ])
-      ids.add(Number(id));
+    addDeleteIds(notification.RemoveId, ids);
+    addDeleteIds(notification.removeId, ids);
     for (const value of notification.Data ?? []) {
-      const item = recordPayload(value);
+      if (typeof value === "number" || typeof value === "string") {
+        addDeleteIds(value, ids);
+        continue;
+      }
+      if (!value || typeof value !== "object") continue;
+      const item = value as Record<string, unknown>;
       const directId = Number(
         item.ProductId ?? item.productId ?? item.Id ?? item.id,
       );
       if (Number.isSafeInteger(directId) && directId > 0) ids.add(directId);
-      const values = item.RemoveId ?? item.removeId;
-      if (Array.isArray(values)) for (const id of values) ids.add(Number(id));
-    }
-  }
-  const valid = [...ids].filter((id) => Number.isSafeInteger(id) && id > 0);
-  const codes = new Set<string>();
-  for (const notification of payload.Notifications ?? [])
-    for (const value of notification.Data ?? []) {
-      const item = recordPayload(value);
+      addDeleteIds(item.RemoveId, ids);
+      addDeleteIds(item.removeId, ids);
       const code = String(
         item.ProductCode ?? item.productCode ?? item.Code ?? item.code ?? item.Sku ?? item.sku ?? "",
       ).trim();
-      if (code) codes.add(code);
+      const normalized = normalizeSku(code);
+      if (normalized && !codes.has(normalized)) codes.set(normalized, code);
     }
-  if (!valid.length && !codes.size)
+  }
+  if (!ids.size && !codes.size)
     throw new ValidationError(
       "KiotViet product delete webhook contains no product ID or code",
     );
   return [
-    ...valid.map((id) => ({ id })),
-    ...[...codes].map((code) => ({ code })),
+    ...[...ids].map((id) => ({ id })),
+    ...[...codes.values()].map((code) => ({ code })),
   ];
 }
 

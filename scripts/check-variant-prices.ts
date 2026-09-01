@@ -3,7 +3,9 @@ import { query } from "../lib/db/client";
 import { shopifyGraphql } from "../lib/shopify/graphql";
 
 async function main() {
-  const productId = Number(process.argv[2] ?? 43043447);
+  const productId = Number(process.argv[2]);
+  if (!Number.isSafeInteger(productId) || productId <= 0)
+    throw new Error("Usage: tsx scripts/check-variant-prices.ts <kiotviet-product-id>");
   const trigger = await getKiotVietProduct(productId);
   const family = await getKiotVietVariantFamily(trigger);
   const mappings = await query<{ kiotviet_product_id: string; sku: string; shopify_product_id: string; shopify_variant_id: string; last_sync_hash: string }>(

@@ -15,7 +15,6 @@ async function findExactKiotVietProducts(sku: string) {
   let total = 1;
   while (currentItem < total) {
     const page = await getKiotVietProducts({
-      searchTerm: sku,
       pageSize: 100,
       currentItem,
       includeInventory: false,

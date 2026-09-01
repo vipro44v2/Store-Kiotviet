@@ -1,5 +1,9 @@
 import { LoginForm } from "@/components/admin/login-form";
-export default function LoginPage() {
+import { redirect } from "next/navigation";
+import { isAuthenticated } from "@/lib/auth/session";
+
+export default async function LoginPage() {
+  if (await isAuthenticated()) redirect("/admin");
   return (
     <main className="login-page">
       <section>

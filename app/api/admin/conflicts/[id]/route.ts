@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { requireAdmin } from "@/lib/auth/middleware";
+import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
 import { query } from "@/lib/db/client";
 const schema = z.object({
@@ -21,12 +21,6 @@ export async function POST(
     );
     return Response.json({ success: true });
   } catch (error) {
-    return Response.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : "Action failed",
-      },
-      { status: 400 },
-    );
+    return adminApiErrorResponse(error, "Action failed");
   }
 }

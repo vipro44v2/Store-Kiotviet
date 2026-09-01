@@ -1,2 +1,15 @@
-import { getShopifyVariants } from "@/lib/shopify/products";import { getKiotVietProducts } from "@/lib/kiotviet/products";import { buildSkuMapping } from "./mappings";import { mappingsRepository } from "@/repositories/mappings";import { query } from "@/lib/db/client";
-export async function initializeProductMappings(){const shopify=[];let cursor: string|undefined;do{const page=await getShopifyVariants(cursor);shopify.push(...page.productVariants.nodes);cursor=page.productVariants.pageInfo.hasNextPage?page.productVariants.pageInfo.endCursor:undefined;}while(cursor);const kiotviet=[];let currentItem=0,total=1;while(currentItem<total){const page=await getKiotVietProducts({pageSize:100,currentItem,includeInventory:false});kiotviet.push(...page.data);total=page.total;currentItem+=page.pageSize;}const result=buildSkuMapping(shopify,kiotviet);for(const item of result.matched)await mappingsRepository.upsert({sku:item.kiotviet.code,normalized_sku:item.sku,shopify_product_id:item.shopify.product.id,shopify_variant_id:item.shopify.id,shopify_inventory_item_id:item.shopify.inventoryItem.id,kiotviet_product_id:String(item.kiotviet.id),kiotviet_code:item.kiotviet.code,sync_direction:"kiotviet_to_shopify"});for(const sku of result.duplicateShopify)await query("INSERT INTO sync_conflicts(entity_type,entity_key,conflict_type,shopify_value) VALUES('product',$1,'duplicate_shopify_sku',$2)",[sku,JSON.stringify({sku})]);for(const sku of result.duplicateKiotViet)await query("INSERT INTO sync_conflicts(entity_type,entity_key,conflict_type,kiotviet_value) VALUES('product',$1,'duplicate_kiotviet_sku',$2)",[sku,JSON.stringify({sku})]);return{shopifyVariants:shopify.length,kiotVietProducts:kiotviet.length,matched:result.matched.length,unmatchedShopify:result.unmatchedShopify.length,unmatchedKiotViet:result.unmatchedKiotViet.length,duplicateShopifySku:result.duplicateShopify.length,duplicateKiotVietSku:result.duplicateKiotViet.length};}
+import { runMappingBackfill } from "./mapping-backfill";
+
+export async function initializeProductMappings() {
+  const report = await runMappingBackfill({ apply: true });
+  return {
+    shopifyVariants: report.totalShopifySkus,
+    kiotVietProducts: report.totalKiotVietCodes,
+    matched: report.alreadyMapped + report.newMappings,
+    unmatchedShopify: report.missingKiotViet,
+    unmatchedKiotViet: report.missingShopify,
+    duplicateShopifySku: report.duplicateAmbiguous,
+    duplicateKiotVietSku: 0,
+    errors: report.errors,
+  };
+}

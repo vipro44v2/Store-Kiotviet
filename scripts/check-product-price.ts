@@ -3,7 +3,9 @@ import { query } from "../lib/db/client";
 import { shopifyGraphql } from "../lib/shopify/graphql";
 
 async function main() {
-  const productId = Number(process.argv[2] ?? 43043467);
+  const productId = Number(process.argv[2]);
+  if (!Number.isSafeInteger(productId) || productId <= 0)
+    throw new Error("Usage: tsx scripts/check-product-price.ts <kiotviet-product-id>");
   const kiotViet = await getKiotVietProduct(productId);
   const mappings = await query<{ shopify_variant_id: string; sku: string }>(
     "SELECT shopify_variant_id,sku FROM product_mappings WHERE kiotviet_product_id=$1",
