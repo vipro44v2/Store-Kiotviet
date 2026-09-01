@@ -2,6 +2,10 @@ import { getRedis, isRedisEnabled } from "@/lib/redis/client";
 
 const localWindows = new Map<string, { count: number; expiresAt: number }>();
 
+export function resetRateLimitsForTests(): void {
+  localWindows.clear();
+}
+
 export async function rateLimit(
   key: string,
   limit: number,

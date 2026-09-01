@@ -22,6 +22,7 @@ const schema = z.object({
   SESSION_SECRET: z.string().default(""),
   ADMIN_USERNAME: z.string().default(""),
   ADMIN_PASSWORD: z.string().default(""),
+  ADMIN_TOTP_SECRET: z.string().default(""),
   WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(50).default(3),
   JOB_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -41,7 +42,7 @@ export function assertProductionEnv(): AppEnv {
     "DATABASE_URL", "REDIS_URL", "SHOPIFY_SHOP", "SHOPIFY_CLIENT_ID",
     "SHOPIFY_CLIENT_SECRET", "KIOTVIET_CLIENT_ID", "KIOTVIET_CLIENT_SECRET",
     "KIOTVIET_RETAILER", "KIOTVIET_WEBHOOK_SECRET", "SESSION_SECRET",
-    "ADMIN_USERNAME", "ADMIN_PASSWORD",
+    "ADMIN_USERNAME", "ADMIN_PASSWORD", "ADMIN_TOTP_SECRET",
   ];
   const missing = required.filter((key) => !String(env[key] ?? "").trim());
   if (missing.length) throw new Error(`Missing required environment variables: ${missing.join(", ")}`);

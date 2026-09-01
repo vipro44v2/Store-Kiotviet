@@ -17,7 +17,8 @@
     "webhooks:test:kiotviet": "tsx --env-file=.env.local scripts/test-kiotviet-webhook.ts",
     "health:check": "tsx scripts/check-integrations.ts",
     "mappings:backfill": "tsx scripts/backfill-mappings.ts",
-    "setup:store": "tsx scripts/setup-store.ts"
+    "setup:store": "tsx scripts/setup-store.ts",
+    "auth:totp:generate": "node --no-warnings --experimental-strip-types scripts/generate-totp.ts"
   },
   "dependencies": {
     "bullmq": "latest",
