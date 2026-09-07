@@ -24,6 +24,46 @@ it("does nothing for an already active inventory level with stock", async () => 
   expect(mocks.graphql).toHaveBeenCalledTimes(1);
 });
 
+it("preserves existing available and on-hand stock when activating and is idempotent on retry", async () => {
+  mocks.graphql.mockResolvedValueOnce(level(7, false, 12))
+    .mockResolvedValueOnce(activation)
+    .mockResolvedValue(level(7, true, 12));
+
+  await expect(ensureShopifyInventoryActive("item-1", "location-1"))
+    .resolves.toEqual({ isActive: true, available: 7, onHand: 12 });
+  await ensureShopifyInventoryActive("item-1", "location-1");
+
+  const mutations = mocks.graphql.mock.calls.filter(([document]) => document.includes("mutation"));
+  expect(mutations).toHaveLength(1);
+  expect(mutations[0][0]).not.toMatch(/available:|onHand:/);
+  expect(mutations[0][1]).toEqual({ inventoryItemId: "item-1", locationId: "location-1", idempotencyKey: expect.any(String) });
+});
+
+it("activates even when the initial quantity matches expected and verifies without setting stock again", async () => {
+  mocks.graphql.mockResolvedValueOnce(level(9, false))
+    .mockResolvedValueOnce(level(9, false))
+    .mockResolvedValueOnce(activation)
+    .mockResolvedValue(level(9));
+
+  await syncInventoryNotification(notification);
+
+  expect(mocks.graphql.mock.calls.filter(([document]) => document.includes("inventoryActivate"))).toHaveLength(1);
+  expect(mocks.graphql.mock.calls.some(([document]) => document.includes("inventorySetQuantities"))).toBe(false);
+  expect(mocks.graphql).toHaveBeenCalledTimes(5);
+  expect(mocks.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO inventory_snapshots"), ["1146", 10, "location-1", 9, 9, 9, 0]);
+});
+
+it("fails on a read-back API error without recording a successful snapshot or completion log", async () => {
+  mocks.graphql.mockResolvedValueOnce(level(0)).mockResolvedValueOnce(level(0))
+    .mockResolvedValueOnce(setResult).mockRejectedValueOnce(new Error("Shopify read-back unavailable"));
+
+  await expect(syncInventoryNotification(notification, "job-1")).rejects.toThrow("Shopify read-back unavailable");
+
+  expect(mocks.query.mock.calls.some(([sql]) => sql.includes("INSERT INTO inventory_snapshots"))).toBe(false);
+  expect(mocks.log.mock.calls.some(([, message]) => message === "inventory_set_completed")).toBe(false);
+  expect(mocks.log).toHaveBeenCalledWith("error", expect.any(String), expect.objectContaining({ sku: "1146", inventoryItemId: "item-1", locationId: "location-1", before: 0, expected: 9, after: null, jobId: "job-1" }));
+});
+
 it.each([level(0, false, 9), { inventoryItem: { inventoryLevel: null } }])("activates an inactive or unstocked item, sets Available=9 and snapshots the read-back (%j)", async before => {
   mocks.graphql.mockResolvedValueOnce(before).mockResolvedValueOnce(before)
     .mockResolvedValueOnce(activation).mockResolvedValueOnce(level(4))
