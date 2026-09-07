@@ -116,8 +116,8 @@ describe("product-to-inventory sync", () => {
       mappings.set(String(mapping.normalized_sku), mapping);
     });
     await syncKiotVietProductToShopify(501);
-    expect(mocks.setInventory).toHaveBeenCalledWith("inventory-1", "location-10", 7, 0);
-    expect(mocks.setInventory).toHaveBeenCalledWith("inventory-2", "location-10", 7, 0);
+    expect(mocks.setInventory).toHaveBeenCalledWith("inventory-1", "location-10", 10, 0);
+    expect(mocks.setInventory).toHaveBeenCalledWith("inventory-2", "location-10", 10, 0);
     const hash = mocks.query.mock.calls.find(([sql]) => sql.includes("last_sync_hash=$3"))![1][2];
     for (const mapping of mappings.values()) mapping.last_sync_hash = hash;
     mocks.exists.mockResolvedValue(true);
@@ -127,17 +127,17 @@ describe("product-to-inventory sync", () => {
     expect(mocks.setInventory).toHaveBeenCalledTimes(2);
   });
 
-  it("creates a simple product and sets stock using reserved, safety stock and flooring", async () => {
+  it("creates a simple product and sets stock using OnHand, safety stock and flooring", async () => {
     await expect(syncKiotVietProductToShopify(501)).resolves.toMatchObject({ updated: true });
-    expect(mocks.setInventory).toHaveBeenCalledWith("inventory-1", "location-10", 7, 0);
+    expect(mocks.setInventory).toHaveBeenCalledWith("inventory-1", "location-10", 10, 0);
     expect(mocks.query).toHaveBeenCalledWith(expect.stringContaining("WHERE kiotviet_branch_id=$1"), [10]);
   });
 
   it.each([
-    { reserved: undefined, actualReserved: 4, expected: 6 },
+    { reserved: undefined, actualReserved: 4, expected: 10 },
     { reserved: 0, actualReserved: 4, expected: 10 },
-    { reserved: 20, actualReserved: 4, expected: 0 },
-  ])("preserves reservation precedence and clamping: %j", async ({ expected, ...reservations }) => {
+    { reserved: 20, actualReserved: 4, expected: 10 },
+  ])("ignores both reserved and actualReserved when calculating stock: %j", async ({ expected, ...reservations }) => {
     mocks.fetch.mockResolvedValue({ ...product, inventories: [{ ...inventory, ...reservations }] });
     mocks.getInventory.mockResolvedValue(99);
     await syncKiotVietProductToShopify(501);
@@ -148,7 +148,7 @@ describe("product-to-inventory sync", () => {
     mocks.findVariants.mockResolvedValue([saved]);
     await syncKiotVietProductToShopify(501);
     expect(mocks.update).toHaveBeenCalled();
-    expect(mocks.setInventory).toHaveBeenCalledWith("inventory-1", "location-10", 7, 0);
+    expect(mocks.setInventory).toHaveBeenCalledWith("inventory-1", "location-10", 10, 0);
   });
 
   it.each([undefined, []])("logs and rejects unavailable inventory instead of silently succeeding (%j)", async (inventories) => {
@@ -172,7 +172,7 @@ describe("product-to-inventory sync", () => {
     await expect(syncKiotVietProductToShopify(501)).resolves.toMatchObject({ reason: "unchanged" });
     expect(mocks.create).toHaveBeenCalledTimes(1);
     expect(mocks.update).not.toHaveBeenCalled();
-    expect(mocks.setInventory).toHaveBeenCalledWith("inventory-1", "location-10", 7, 0);
+    expect(mocks.setInventory).toHaveBeenCalledWith("inventory-1", "location-10", 10, 0);
   });
 
   it("does not hide missing inventory behind the unchanged-product shortcut", async () => {

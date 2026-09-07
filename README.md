@@ -208,7 +208,7 @@ Endpoint xác minh `X-Hub-Signature`. KiotViet yêu cầu phản hồi dưới 5
 Sau khi lấy KiotViet branches và Shopify locations, tạo mapping trong `branch_location_mappings`. Mỗi mapping có `enabled` và `safety_stock`. Công thức mặc định:
 
 ```text
-Shopify available = max(0, KiotViet onHand - reserved - safety_stock)
+Shopify available = max(0, floor(KiotViet onHand - safety_stock))
 ```
 
 Chạy `Initialize mappings` trong Admin, xử lý duplicate/missing SKU, cấu hình `orders.defaultBranchId`, sau đó mới reconciliation.

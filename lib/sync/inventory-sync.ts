@@ -12,11 +12,12 @@ import { log } from "@/lib/logger";
 import type { KiotVietStockNotification } from "@/lib/kiotviet/types";
 export function calculateInventory(
   onHand: number,
-  reserved = 0,
+  _reserved?: number,
   safetyStock = 0,
   allowsNegative = false,
 ) {
-  const value = Math.floor(onHand - reserved - safetyStock);
+  // Reserved is retained in the signature for existing callers, but does not reduce Shopify stock.
+  const value = Math.floor(onHand - safetyStock);
   return allowsNegative ? value : Math.max(0, value);
 }
 export async function syncInventoryNotification(

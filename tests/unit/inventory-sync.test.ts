@@ -61,7 +61,7 @@ describe("syncInventoryNotification", () => {
     expect(mocks.setInventory).toHaveBeenCalledWith(
       "gid://shopify/InventoryItem/1",
       "location-1",
-      7,
+      9,
       3,
     );
   });
@@ -90,7 +90,7 @@ describe("syncInventoryNotification", () => {
     expect(mocks.setInventory).toHaveBeenCalledWith(
       "gid://shopify/InventoryItem/1",
       "location-1",
-      8,
+      10,
       3,
     );
     expect(mocks.log).toHaveBeenCalledWith(
@@ -200,7 +200,7 @@ describe("syncInventoryNotification", () => {
     expect(mocks.setInventory).toHaveBeenCalledWith(
       "gid://shopify/InventoryItem/1",
       "location-1",
-      3,
+      5,
       9,
     );
     expect(mocks.query.mock.calls[1][0]).not.toContain("safety_stock=");
@@ -225,6 +225,38 @@ describe("syncInventoryNotification", () => {
       "location-1",
       0,
       4,
+    );
+  });
+
+  it("does not subtract Reserved even when it exceeds OnHand", async () => {
+    mocks.query.mockResolvedValueOnce([
+      { shopify_location_id: "location-1", safety_stock: "0" },
+    ]).mockResolvedValueOnce([]);
+
+    await syncInventoryNotification({ ...notification, OnHand: 1, Reserved: 100 });
+
+    expect(mocks.setInventory).toHaveBeenCalledWith(
+      "gid://shopify/InventoryItem/1", "location-1", 1, 3,
+    );
+    expect(mocks.query).toHaveBeenCalledWith(
+      expect.stringContaining("INSERT INTO inventory_snapshots"),
+      ["SKU-1", 10, "location-1", 1, 1, 1, 0],
+    );
+  });
+
+  it("skips setting an already matching quantity and still verifies and snapshots it", async () => {
+    mocks.query.mockResolvedValueOnce([
+      { shopify_location_id: "location-1", safety_stock: "1" },
+    ]).mockResolvedValueOnce([]);
+    mocks.getInventory.mockResolvedValue(9);
+
+    await syncInventoryNotification(notification);
+
+    expect(mocks.setInventory).not.toHaveBeenCalled();
+    expect(mocks.getInventory).toHaveBeenCalledTimes(3);
+    expect(mocks.query).toHaveBeenCalledWith(
+      expect.stringContaining("INSERT INTO inventory_snapshots"),
+      ["SKU-1", 10, "location-1", 10, 9, 9, 0],
     );
   });
 });
