@@ -1,9 +1,10 @@
-import { ConflictError, MappingError } from "@/lib/errors";
+import { ConflictError, MappingError, RetryableError } from "@/lib/errors";
 import { normalizeSku } from "./mappings";
 import { mappingsRepository } from "@/repositories/mappings";
 import { query } from "@/lib/db/client";
 import {
   getShopifyInventory,
+  ensureShopifyInventoryActive,
   setShopifyInventory,
 } from "@/lib/shopify/inventory";
 import { getActiveShopifyLocations } from "@/lib/shopify/locations";
@@ -109,44 +110,37 @@ export async function syncInventoryNotification(
       notification.Reserved,
       Number(location.safety_stock),
     );
-    const current = await getShopifyInventory(
-      mapping.shopify_inventory_item_id,
-      location.shopify_location_id,
-    );
-    if (current !== expected)
-      await setShopifyInventory(
-        mapping.shopify_inventory_item_id,
-        location.shopify_location_id,
-        expected,
-        current,
+    const inventoryItemId = mapping.shopify_inventory_item_id;
+    const locationId = location.shopify_location_id;
+    const context = { inventoryItemId, locationId, sku, expected, jobId,
+      provider: "shopify", entityType: "inventory", entityId: sku };
+    let before: number | null = null;
+    let after: number | null = null;
+    try {
+      const initial = await getShopifyInventory(inventoryItemId, locationId);
+      before = initial.available;
+      await log("info", "inventory_activation_started", { ...context, before, after, action: "inventory_activation_started" });
+      const active = await ensureShopifyInventoryActive(inventoryItemId, locationId);
+      await log("info", "inventory_activation_completed", { ...context, before, after, active, action: "inventory_activation_completed" });
+      if (!active.isActive || active.available === null)
+        throw new RetryableError("Inventory activation unverified for " + inventoryItemId + " at " + locationId);
+      if (active.available !== expected) {
+        await log("info", "inventory_set_started", { ...context, before, after, changeFromQuantity: active.available, action: "inventory_set_started" });
+        await setShopifyInventory(inventoryItemId, locationId, expected, active.available);
+      }
+      const verified = await getShopifyInventory(inventoryItemId, locationId);
+      after = verified.available;
+      await log("info", "inventory_readback", { ...context, before, after, isActive: verified.isActive, onHand: verified.onHand, action: "inventory_readback" });
+      await query(
+        "INSERT INTO inventory_snapshots(sku,branch_id,shopify_location_id,kiotviet_quantity,shopify_quantity,expected_shopify_quantity,difference) VALUES($1,$2,$3,$4,$5,$6,$7)",
+        [sku, notification.BranchId, locationId, notification.OnHand, after, expected, after === null ? null : after - expected],
       );
-    await query(
-      "INSERT INTO inventory_snapshots(sku,branch_id,shopify_location_id,kiotviet_quantity,shopify_quantity,expected_shopify_quantity,difference) VALUES($1,$2,$3,$4,$5,$6,$7)",
-      [
-        sku,
-        notification.BranchId,
-        location.shopify_location_id,
-        notification.OnHand,
-        current,
-        expected,
-        current - expected,
-      ],
-    );
-    await log(
-      "info",
-      current === expected
-        ? "Inventory already reconciled"
-        : "Shopify inventory updated",
-      {
-        action: "update_shopify_inventory",
-        provider: "shopify",
-        entityType: "inventory",
-        entityId: sku,
-        sku,
-        previous: current,
-        next: expected,
-        jobId,
-      },
-    );
+      if (!verified.isActive || after !== expected)
+        throw new RetryableError("Inventory verification failed: " + JSON.stringify({ ...context, before, after, active: verified.isActive }));
+      await log("info", "inventory_set_completed", { ...context, before, after, action: "inventory_set_completed" });
+    } catch (error) {
+      await log("error", "Shopify inventory sync failed", { ...context, before, after, action: "inventory_sync_failed", error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
   }
 }

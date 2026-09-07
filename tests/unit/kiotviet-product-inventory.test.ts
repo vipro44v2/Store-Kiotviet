@@ -21,7 +21,8 @@ vi.mock("@/lib/shopify/products", () => ({
   archiveShopifyProduct: vi.fn(), collapseShopifyVariantGroup: vi.fn(),
 }));
 vi.mock("@/lib/shopify/inventory", () => ({
-  getShopifyInventory: mocks.getInventory, setShopifyInventory: mocks.setInventory,
+  getShopifyInventory: async () => ({ isActive: true, available: await mocks.getInventory(), onHand: 0 }),
+  ensureShopifyInventoryActive: async () => ({ isActive: true, available: await mocks.getInventory(), onHand: 0 }), setShopifyInventory: mocks.setInventory,
 }));
 vi.mock("@/lib/shopify/locations", () => ({ getActiveShopifyLocations: vi.fn() }));
 
@@ -44,6 +45,7 @@ beforeEach(() => {
   mocks.create.mockResolvedValue(saved);
   mocks.update.mockResolvedValue(saved);
   mocks.getInventory.mockResolvedValue(0);
+  mocks.setInventory.mockImplementation(async (_item, _location, quantity) => { mocks.getInventory.mockResolvedValueOnce(quantity); return {}; });
   mocks.query.mockImplementation(async (sql: string) =>
     sql.includes("FROM branch_location_mappings")
       ? [{ shopify_location_id: "location-10", safety_stock: "2" }]

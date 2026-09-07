@@ -18,7 +18,8 @@ vi.mock("@/lib/shopify/locations", () => ({
   getActiveShopifyLocations: mocks.getActiveLocations,
 }));
 vi.mock("@/lib/shopify/inventory", () => ({
-  getShopifyInventory: mocks.getInventory,
+  getShopifyInventory: async () => ({ isActive: true, available: await mocks.getInventory(), onHand: 0 }),
+  ensureShopifyInventoryActive: async () => ({ isActive: true, available: await mocks.getInventory(), onHand: 0 }),
   setShopifyInventory: mocks.setInventory,
 }));
 vi.mock("@/lib/logger", () => ({ log: mocks.log }));
@@ -42,7 +43,7 @@ beforeEach(() => {
     { shopify_inventory_item_id: "gid://shopify/InventoryItem/1" },
   ]);
   mocks.getInventory.mockResolvedValue(3);
-  mocks.setInventory.mockResolvedValue({});
+  mocks.setInventory.mockImplementation(async (_item, _location, quantity) => { mocks.getInventory.mockResolvedValueOnce(quantity); return {}; });
   mocks.log.mockResolvedValue(undefined);
 });
 

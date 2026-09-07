@@ -22,7 +22,7 @@ async function main() {
   const kiotProduct = kiotPage.data.find((product) => product.code === "SP000001");
   const inventoryMapping = productMappings[0];
   const shopifyAvailable = inventoryMapping
-    ? await getShopifyInventory(inventoryMapping.shopify_inventory_item_id, inventoryMapping.shopify_location_id)
+    ? (await getShopifyInventory(inventoryMapping.shopify_inventory_item_id, inventoryMapping.shopify_location_id)).available
     : null;
 
   console.log(JSON.stringify({ mappings, jobs, kiotProduct, inventoryMapping, shopifyAvailable }, null, 2));
