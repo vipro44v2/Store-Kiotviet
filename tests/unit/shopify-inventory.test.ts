@@ -72,9 +72,12 @@ it.each([level(0, false, 9), { inventoryItem: { inventoryLevel: null } }])("acti
   const activateCall = mocks.graphql.mock.calls[2];
   expect(activateCall[0]).toContain("inventoryActivate");
   expect(activateCall[0]).toContain("@idempotent");
+  expect(activateCall[0]).toMatch(/userErrors\s*\{\s*field\s+message\s*\}/);
+  expect(activateCall[0]).not.toMatch(/userErrors\s*\{[^}]*\bcode\b/);
   expect(activateCall[1]).toEqual({ inventoryItemId: "item-1", locationId: "location-1", idempotencyKey: expect.any(String) });
   expect(activateCall[0]).not.toMatch(/available:|onHand:/);
   expect(mocks.graphql.mock.calls[4][1].input.quantities).toEqual([{ inventoryItemId: "item-1", locationId: "location-1", quantity: 9, changeFromQuantity: 4 }]);
+  expect(mocks.graphql.mock.calls[4][0]).toMatch(/userErrors\s*\{\s*field\s+message\s+code\s*\}/);
   expect(mocks.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO inventory_snapshots"), ["1146", 10, "location-1", 9, 9, 9, 0]);
 });
 
@@ -126,11 +129,11 @@ it("does not accept an inactive zero level as a verified zero stock update", asy
   await expect(syncInventoryNotification({ ...notification, OnHand: 0 })).rejects.toThrow("Inventory verification failed");
 });
 
-it.each(["activation", "set"])("propagates %s userErrors with code and field", async stage => {
-  const errors = [{ message: "Inventory denied", code: "INVALID", field: ["inventoryItemId"] }];
+it.each(["activation", "set"])("propagates %s userErrors using its actual response fields", async stage => {
+  const errors = [{ message: "Inventory denied", field: ["inventoryItemId"], ...(stage === "set" ? { code: "INVALID" } : {}) }];
   const before = level(0, stage !== "activation");
   mocks.graphql.mockResolvedValueOnce(before).mockResolvedValueOnce(before).mockResolvedValueOnce(stage === "activation" ? { inventoryActivate: { inventoryLevel: null, userErrors: errors } } : { inventorySetQuantities: { userErrors: errors } });
-  await expect(syncInventoryNotification(notification)).rejects.toThrow("INVALID");
+  await expect(syncInventoryNotification(notification)).rejects.toThrow(stage === "set" ? "INVALID" : "Inventory denied");
   expect(mocks.query.mock.calls.some(([sql]) => sql.includes("INSERT INTO inventory_snapshots"))).toBe(false);
 });
 

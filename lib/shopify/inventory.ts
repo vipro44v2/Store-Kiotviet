@@ -32,8 +32,9 @@ export async function getShopifyInventory(inventoryItemId: string, locationId: s
   return { isActive: level?.isActive === true, available, onHand };
 }
 
-type UserError = { field?: string[]; message: string; code?: string };
-function checkUserErrors(operation: string, errors: UserError[]) {
+type UserError = { field?: string[]; message: string };
+type InventorySetQuantitiesUserError = UserError & { code?: string };
+function checkUserErrors(operation: string, errors: InventorySetQuantitiesUserError[]) {
   if (errors.some(error => error.code === "CHANGE_FROM_QUANTITY_STALE"))
     throw new RetryableError(`${operation}: ${JSON.stringify(errors)}`);
   if (errors.length) throw new ApiError(`${operation}: ${JSON.stringify(errors)}; requires write_inventory and staff inventory permissions`);
@@ -47,7 +48,7 @@ export async function ensureShopifyInventoryActive(inventoryItemId: string, loca
   // Never send zero or deactivate other locations when activating this mapping.
   const data = await inventoryRequest<{
     inventoryActivate: { inventoryLevel: { id: string } | null; userErrors: UserError[] };
-  }>(`mutation ActivateInventory($inventoryItemId:ID!,$locationId:ID!,$idempotencyKey:String!){inventoryActivate(inventoryItemId:$inventoryItemId,locationId:$locationId) @idempotent(key:$idempotencyKey){inventoryLevel{id} userErrors{field message code}}}`, { inventoryItemId, locationId, idempotencyKey: randomUUID() });
+  }>(`mutation ActivateInventory($inventoryItemId:ID!,$locationId:ID!,$idempotencyKey:String!){inventoryActivate(inventoryItemId:$inventoryItemId,locationId:$locationId) @idempotent(key:$idempotencyKey){inventoryLevel{id} userErrors{field message}}}`, { inventoryItemId, locationId, idempotencyKey: randomUUID() });
   checkUserErrors("inventoryActivate", data.inventoryActivate.userErrors);
   const after = await getShopifyInventory(inventoryItemId, locationId);
   if (!after.isActive) throw new RetryableError(`Inventory activation unverified for ${inventoryItemId} at ${locationId}`);
@@ -57,7 +58,7 @@ export async function ensureShopifyInventoryActive(inventoryItemId: string, loca
 
 export async function setShopifyInventory(inventoryItemId: string, locationId: string, quantity: number, changeFromQuantity: number) {
   const data = await inventoryRequest<{
-    inventorySetQuantities: { inventoryAdjustmentGroup?: { createdAt: string } | null; userErrors: UserError[] };
+    inventorySetQuantities: { inventoryAdjustmentGroup?: { createdAt: string } | null; userErrors: InventorySetQuantitiesUserError[] };
   }>(`mutation SetInventory($input:InventorySetQuantitiesInput!,$idempotencyKey:String!){inventorySetQuantities(input:$input) @idempotent(key:$idempotencyKey){inventoryAdjustmentGroup{createdAt} userErrors{field message code}}}`, {
     input: { name: "available", reason: "correction", referenceDocumentUri: "gid://shopify/App/kiotviet-sync", quantities: [{ inventoryItemId, locationId, quantity, changeFromQuantity }] },
     idempotencyKey: randomUUID(),
