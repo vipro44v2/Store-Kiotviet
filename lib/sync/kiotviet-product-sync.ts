@@ -20,7 +20,7 @@ import { syncInventoryNotification } from "./inventory-sync";
 import { query } from "@/lib/db/client";
 import { log } from "@/lib/logger";
 import type { KiotVietProduct } from "@/lib/kiotviet/types";
-import { ApiError, MappingError } from "@/lib/errors";
+import { ApiError, MappingError, RetryableError } from "@/lib/errors";
 
 function productState(product: KiotVietProduct) {
   return {
@@ -95,6 +95,19 @@ async function archiveFamilyMappings(products: KiotVietProduct[]) {
 }
 
 async function syncInventory(product: KiotVietProduct, jobId?: string) {
+  if (!product.inventories?.length) {
+    const message = `KiotViet product ${product.id} (SKU ${product.code}) has no inventory rows; Shopify stock was not reconciled`;
+    await log("warn", message, {
+      action: "missing_kiotviet_inventory",
+      provider: "kiotviet",
+      entityType: "product",
+      entityId: String(product.id),
+      kiotVietProductId: product.id,
+      sku: product.code,
+      jobId,
+    });
+    throw new RetryableError(message);
+  }
   for (const inventory of product.inventories ?? []) {
     await syncInventoryNotification(
       {
@@ -166,8 +179,10 @@ async function syncVariantFamily(
   if (
     existingProductId &&
     shouldSkipUnchangedProduct(hash, triggerMappings, familyMappings)
-  )
+  ) {
+    for (const product of products) await syncInventory(product, jobId);
     return { sku: trigger.code, updated: false, reason: "unchanged" };
+  }
   if (products.length === 1) {
     const saved = existingProductId
       ? await collapseShopifyVariantGroup(products[0], existingProductId)
@@ -396,8 +411,10 @@ export async function syncKiotVietProductToShopify(
       ? await getShopifyVariant(mappings[0].shopify_variant_id)
       : undefined;
   if (variant && normalizeSku(variant.sku) !== sku) variant = undefined;
-  if (variant && shouldSkipUnchangedProduct(hash, mappings))
+  if (variant && shouldSkipUnchangedProduct(hash, mappings)) {
+    await syncInventory(product, jobId);
     return { sku, updated: false, reason: "unchanged" };
+  }
   if (!variant) {
     const matches = (await findShopifyVariantsBySku(product.code)).filter(
       (match) => normalizeSku(match.sku) === sku,

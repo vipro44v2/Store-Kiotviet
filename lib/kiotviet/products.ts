@@ -87,8 +87,32 @@ export async function getAllKiotVietProducts(
   return products;
 }
 
-export function getKiotVietProduct(id: number): Promise<KiotVietProduct> {
-  return kiotVietFetch<KiotVietProduct>(`/products/${id}`);
+export async function getKiotVietProduct(id: number): Promise<KiotVietProduct> {
+  const product = await kiotVietFetch<KiotVietProduct>(`/products/${id}`);
+  if (product.inventories?.length) return product;
+
+  // The retail API documents inventories in the detail response, but only
+  // documents includeInventory on the list endpoint. Use that supported route
+  // to hydrate missing rows, keeping detail fields and matching strictly by ID.
+  let currentItem = 0;
+  let total = 1;
+  while (currentItem < total) {
+    const page = await getKiotVietProducts({
+      searchTerm: product.code,
+      includeInventory: true,
+      currentItem,
+      pageSize: 100,
+    });
+    const match = page.data.find((item) => item.id === id);
+    if (match?.inventories?.length)
+      return { ...product, inventories: match.inventories };
+    if (match || !page.data.length) break;
+    total = page.total;
+    currentItem += page.pageSize || 100;
+  }
+  // Keep metadata available for archive handling and family enrichment.
+  // The inventory sync guard reports and rejects unavailable inventory.
+  return product;
 }
 
 export async function getKiotVietCategory(
@@ -126,6 +150,12 @@ export async function getKiotVietVariantFamily(
     total = page.total;
     currentItem += page.pageSize;
   }
-  family.set(product.id, product);
+  const fetchedProduct = family.get(product.id);
+  family.set(product.id, {
+    ...product,
+    inventories: product.inventories?.length
+      ? product.inventories
+      : fetchedProduct?.inventories ?? product.inventories,
+  });
   return [...family.values()];
 }

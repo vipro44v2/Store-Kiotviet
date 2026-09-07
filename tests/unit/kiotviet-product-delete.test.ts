@@ -103,7 +103,7 @@ describe("KiotViet product deletion", () => {
       id: 502,
       code: "NU012-BLUE",
       name: "Remaining variant",
-      inventories: [],
+      inventories: [{ branchId: 10, branchName: "Main", onHand: 5 }],
     });
     mocks.collapse.mockResolvedValue({
       id: "gid://shopify/ProductVariant/2",

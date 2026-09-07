@@ -48,7 +48,7 @@ import {
 describe("stale Shopify product mapping recovery", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    const product = { id: 501, code: "SKU-1", name: "Product", inventories: [] };
+    const product = { id: 501, code: "SKU-1", name: "Product", inventories: [{ branchId: 10, branchName: "Main", onHand: 5 }] };
     mocks.getProduct.mockResolvedValue(product);
     mocks.getFamily.mockResolvedValue([product]);
     mocks.findBySku.mockResolvedValue([{
@@ -110,7 +110,7 @@ describe("stale Shopify product mapping recovery", () => {
 
   it("rebuilds valid siblings without archiving the whole Shopify product", async () => {
     const inactive = { id: 501, code: "OLD", name: "Old", isActive: false, masterProductId: 500, inventories: [] };
-    const active = { id: 502, code: "LIVE", name: "Live", masterProductId: 500, attributes: [{ attributeName: "Color", attributeValue: "Blue" }], inventories: [] };
+    const active = { id: 502, code: "LIVE", name: "Live", masterProductId: 500, attributes: [{ attributeName: "Color", attributeValue: "Blue" }], inventories: [{ branchId: 10, branchName: "Main", onHand: 5 }] };
     mocks.getProduct.mockResolvedValue(inactive);
     mocks.getFamily.mockResolvedValue([inactive, active]);
     mocks.findBySku.mockResolvedValue([]);
