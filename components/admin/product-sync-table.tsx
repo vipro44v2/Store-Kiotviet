@@ -176,10 +176,10 @@ export function ProductSyncTable() {
         </select>
       </div>
       <div className="product-actions">
-        <button type="button" disabled={!selectedProductIds.length || bulkRunning} onClick={() => void queue(selectedProductIds)}>{selectedRunning ? "Queueing selected..." : "Sync selected"}</button>
-        <button type="button" disabled={!categoryId || bulkRunning} onClick={() => void syncCategory()}>{categoryRunning ? "Queueing category..." : "Sync this category"}</button>
-        <button type="button" disabled={bulkRunning} onClick={() => void syncAll()}>{allRunning ? "Queueing all products..." : "Sync all from KiotViet"}</button>
-        <button type="button" disabled={bulkRunning} onClick={() => void createAllMappings()}>{mappingRunning ? "Creating mappings..." : "Create all mappings"}</button>
+        <button className="button button-primary" type="button" disabled={!selectedProductIds.length || bulkRunning} onClick={() => void queue(selectedProductIds)}>{selectedRunning ? "Queueing selected..." : "Sync selected"}</button>
+        <button className="button button-secondary" type="button" disabled={!categoryId || bulkRunning} onClick={() => void syncCategory()}>{categoryRunning ? "Queueing category..." : "Sync this category"}</button>
+        <button className="button button-secondary" type="button" disabled={bulkRunning} onClick={() => void syncAll()}>{allRunning ? "Queueing all products..." : "Sync all from KiotViet"}</button>
+        <button className="button button-secondary" type="button" disabled={bulkRunning} onClick={() => void createAllMappings()}>{mappingRunning ? "Creating mappings..." : "Create all mappings"}</button>
       </div>
       {message && <p>{message}</p>}{categoryMessage && <p>{categoryMessage}</p>}{allMessage && <p>{allMessage}</p>}{mappingMessage && <p>{mappingMessage}</p>}
       {error && <div className="error-banner">{error}</div>}
@@ -196,7 +196,7 @@ export function ProductSyncTable() {
               <td>{product.image ? <img src={product.image} alt="" width="48" height="48" loading="lazy" /> : "—"}</td>
               <td>{product.name}{product.variant ? <small> Variant</small> : null}</td><td>{product.sku || "—"}</td><td>{product.category}</td>
               <td>{product.price.toLocaleString()}</td><td>{product.stock ?? "—"}</td><td>{product.syncStatus}</td><td>{product.shopifyMappingStatus}</td>
-              <td><button type="button" disabled={bulkRunning || rowRunning.has(product.id)} onClick={() => void queue([product.id], product.id)}>{rowRunning.has(product.id) ? "Queueing..." : "Sync now"}</button></td>
+              <td><button className="button button-secondary button-compact" type="button" disabled={bulkRunning || rowRunning.has(product.id)} onClick={() => void queue([product.id], product.id)}>{rowRunning.has(product.id) ? "Queueing..." : "Sync now"}</button></td>
             </tr>
           ))}</tbody>
         </table>
@@ -205,9 +205,9 @@ export function ProductSyncTable() {
       <div className="product-pagination">
         <p>Showing {first.toLocaleString()}–{last.toLocaleString()} of {catalog.total.toLocaleString()} products</p>
         <nav aria-label="Product pagination">
-          <button type="button" disabled={loading || catalog.page <= 1} onClick={() => updateQuery({ page: String(catalog.page - 1) })}>Previous</button>
-          {compactPageWindow(catalog.page, catalog.totalPages).map((item, index) => item === "ellipsis" ? <span key={`ellipsis-${index}`}>…</span> : <button type="button" key={item} aria-current={item === catalog.page ? "page" : undefined} disabled={loading || item === catalog.page} onClick={() => updateQuery({ page: String(item) })}>{item}</button>)}
-          <button type="button" disabled={loading || catalog.page >= catalog.totalPages || catalog.total === 0} onClick={() => updateQuery({ page: String(catalog.page + 1) })}>Next</button>
+          <button className="button button-secondary" type="button" disabled={loading || catalog.page <= 1} onClick={() => updateQuery({ page: String(catalog.page - 1) })}>Previous</button>
+          {compactPageWindow(catalog.page, catalog.totalPages).map((item, index) => item === "ellipsis" ? <span key={`ellipsis-${index}`}>…</span> : <button className="button button-secondary" type="button" key={item} aria-current={item === catalog.page ? "page" : undefined} disabled={loading || item === catalog.page} onClick={() => updateQuery({ page: String(item) })}>{item}</button>)}
+          <button className="button button-secondary" type="button" disabled={loading || catalog.page >= catalog.totalPages || catalog.total === 0} onClick={() => updateQuery({ page: String(catalog.page + 1) })}>Next</button>
         </nav>
         <p>Page {catalog.page} of {catalog.totalPages}</p>
       </div>
