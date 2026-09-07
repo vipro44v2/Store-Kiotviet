@@ -2,10 +2,12 @@
 import { syncInventoryNotification } from "./inventory-sync";
 import { enqueueJob } from "@/lib/queue/queues";
 import { query } from "@/lib/db/client";
+import { ConflictError, MappingError, PermanentError, RetryableError, ValidationError } from "@/lib/errors";
 
 export async function reconcileInventoryPage(currentItem = 0, jobId?: string) {
   const page = await getKiotVietInventory(currentItem, 100);
   const errors: string[] = [];
+  let hasRetryableFailure = false;
   for (const product of page.data) {
     for (const inventory of product.inventories) {
       try {
@@ -15,6 +17,8 @@ export async function reconcileInventoryPage(currentItem = 0, jobId?: string) {
           Cost: 0, OnHand: inventory.onHand, Reserved: inventory.reserved,
         }, jobId);
       } catch (error) {
+        if (!(error instanceof MappingError || error instanceof ConflictError || error instanceof PermanentError || error instanceof ValidationError))
+          hasRetryableFailure = true;
         const message = error instanceof Error ? error.message : String(error);
         errors.push(`${product.code} (branch ${inventory.branchId}): ${message}`);
         await query(
@@ -28,7 +32,10 @@ export async function reconcileInventoryPage(currentItem = 0, jobId?: string) {
   if (next < page.total)
     await enqueueJob("reconciliation", "inventory_reconciliation", { currentItem: next }, "low", `inventory-reconciliation-${next}`);
   // Keep processing other products/pages, but let the worker fail this audit job.
-  if (errors.length) throw new Error(`Inventory reconciliation failed: ${errors.join("; ")}`);
+  if (errors.length) {
+    const message = `Inventory reconciliation failed: ${errors.join("; ")}`;
+    throw hasRetryableFailure ? new RetryableError(message) : new MappingError(message);
+  }
   return { processed: page.data.length, next: next < page.total ? next : null, total: page.total };
 }
 

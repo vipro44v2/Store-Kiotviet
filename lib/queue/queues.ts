@@ -1,7 +1,7 @@
 import { Queue } from "bullmq";
 import { getRedis, isRedisEnabled } from "@/lib/redis/client";
 import type { JobPriority, JobType, SyncJobPayload } from "./jobs";
-import { priorityNumber } from "./jobs";
+import { priorityNumber, retryDelay } from "./jobs";
 import { getEnv } from "@/lib/env";
 import { jobsRepository } from "@/repositories/jobs";
 
@@ -26,16 +26,22 @@ export async function enqueueJob(
   const auditId = await jobsRepository.create(type, payload, priority, getEnv().JOB_MAX_ATTEMPTS);
   if (!isRedisEnabled()) {
     await jobsRepository.attachQueueJob(auditId, `local-${auditId}`);
-    await jobsRepository.start(auditId, 1);
-    try {
-      const { processSyncJob } = await import("./worker");
-      await processSyncJob({ name: type, data: { ...payload, auditJobId: auditId } } as never);
-      await jobsRepository.complete(auditId);
-    } catch (error) {
-      const failure = error instanceof Error ? error : new Error(String(error));
-      const { isManualReview } = await import("./worker");
-      await jobsRepository.fail(auditId, failure, isManualReview(failure));
-      throw failure;
+    const inventoryJob = ["kiotviet_inventory_to_shopify", "inventory_reconciliation", "full_inventory_sync"].includes(type);
+    const maxAttempts = inventoryJob ? getEnv().JOB_MAX_ATTEMPTS : 1;
+    const { processSyncJob, isManualReview } = await import("./worker");
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await jobsRepository.start(auditId, attempt);
+      try {
+        await processSyncJob({ name: type, data: { ...payload, auditJobId: auditId } } as never);
+        await jobsRepository.complete(auditId);
+        break;
+      } catch (error) {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        const manual = isManualReview(failure);
+        await jobsRepository.fail(auditId, failure, manual);
+        if (manual || attempt === maxAttempts) throw failure;
+        await new Promise(resolve => setTimeout(resolve, retryDelay(attempt)));
+      }
     }
     return { id: `local-${auditId}`, deduplicated: false };
   }

@@ -5,6 +5,7 @@ vi.mock("@/lib/sync/inventory-sync", () => ({ syncInventoryNotification: mocks.s
 vi.mock("@/lib/db/client", () => ({ query: mocks.query }));
 vi.mock("@/lib/queue/queues", () => ({ enqueueJob: mocks.enqueue }));
 import { reconcileInventoryPage } from "@/lib/sync/reconciliation";
+import { ConflictError, MappingError, RetryableError } from "@/lib/errors";
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.inventory.mockResolvedValue({ data: [
@@ -23,4 +24,15 @@ it("completes when all inventory notifications are verified", async () => {
   mocks.sync.mockResolvedValue(undefined);
   await expect(reconcileInventoryPage()).resolves.toEqual({ processed: 2, next: 2, total: 4 });
   expect(mocks.query).not.toHaveBeenCalled();
+});
+
+it("preserves manual review for mapping-only failures", async () => {
+  mocks.sync.mockRejectedValue(new ConflictError("Multiple enabled mappings"));
+  await expect(reconcileInventoryPage()).rejects.toBeInstanceOf(MappingError);
+});
+
+it("retries a page with transient failures even when another SKU needs manual mapping", async () => {
+  mocks.sync.mockRejectedValueOnce(new MappingError("No SKU mapping"))
+    .mockRejectedValueOnce(new RetryableError("Readback mismatch"));
+  await expect(reconcileInventoryPage()).rejects.toBeInstanceOf(RetryableError);
 });

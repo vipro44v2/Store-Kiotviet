@@ -1,6 +1,7 @@
 ﻿import { randomUUID } from "node:crypto";
 import { shopifyGraphql } from "./graphql";
-import { ApiError, AuthenticationError } from "@/lib/errors";
+import { ApiError, AuthenticationError, RetryableError } from "@/lib/errors";
+import { log } from "@/lib/logger";
 
 export interface ShopifyInventory {
   isActive: boolean;
@@ -33,12 +34,15 @@ export async function getShopifyInventory(inventoryItemId: string, locationId: s
 
 type UserError = { field?: string[]; message: string; code?: string };
 function checkUserErrors(operation: string, errors: UserError[]) {
+  if (errors.some(error => error.code === "CHANGE_FROM_QUANTITY_STALE"))
+    throw new RetryableError(`${operation}: ${JSON.stringify(errors)}`);
   if (errors.length) throw new ApiError(`${operation}: ${JSON.stringify(errors)}; requires write_inventory and staff inventory permissions`);
 }
 
-export async function ensureShopifyInventoryActive(inventoryItemId: string, locationId: string): Promise<ShopifyInventory> {
+export async function ensureShopifyInventoryActive(inventoryItemId: string, locationId: string, context: Record<string, unknown> = {}): Promise<ShopifyInventory> {
   const before = await getShopifyInventory(inventoryItemId, locationId);
   if (before.isActive) return before;
+  await log("info", "inventory_activation_started", { ...context, inventoryItemId, locationId, action: "inventory_activation_started" });
   // API 2026-07: omitting both quantities preserves stock on an inactive level.
   // Never send zero or deactivate other locations when activating this mapping.
   const data = await inventoryRequest<{
@@ -46,7 +50,8 @@ export async function ensureShopifyInventoryActive(inventoryItemId: string, loca
   }>(`mutation ActivateInventory($inventoryItemId:ID!,$locationId:ID!,$idempotencyKey:String!){inventoryActivate(inventoryItemId:$inventoryItemId,locationId:$locationId) @idempotent(key:$idempotencyKey){inventoryLevel{id} userErrors{field message code}}}`, { inventoryItemId, locationId, idempotencyKey: randomUUID() });
   checkUserErrors("inventoryActivate", data.inventoryActivate.userErrors);
   const after = await getShopifyInventory(inventoryItemId, locationId);
-  if (!after.isActive) throw new ApiError(`Inventory activation unverified for ${inventoryItemId} at ${locationId}`);
+  if (!after.isActive) throw new RetryableError(`Inventory activation unverified for ${inventoryItemId} at ${locationId}`);
+  await log("info", "inventory_activation_completed", { ...context, inventoryItemId, locationId, active: after, action: "inventory_activation_completed" });
   return after;
 }
 

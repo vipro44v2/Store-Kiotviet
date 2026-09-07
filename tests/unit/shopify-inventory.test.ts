@@ -6,7 +6,7 @@ vi.mock("@/lib/logger", () => ({ log: mocks.log }));
 vi.mock("@/repositories/mappings", () => ({ mappingsRepository: { findBySku: mocks.findBySku } }));
 import { ensureShopifyInventoryActive, getShopifyInventory } from "@/lib/shopify/inventory";
 import { syncInventoryNotification } from "@/lib/sync/inventory-sync";
-import { AuthenticationError } from "@/lib/errors";
+import { AuthenticationError, ConflictError, RetryableError } from "@/lib/errors";
 
 const notification = { ProductId: 1, ProductCode: "1146", ProductName: "Test", BranchId: 10, BranchName: "Main", Cost: 0, OnHand: 9, Reserved: 0 };
 const level = (available: number, isActive = true, onHand = available) => ({ inventoryItem: { inventoryLevel: { isActive, quantities: [{ name: "available", quantity: available }, { name: "on_hand", quantity: onHand }] } } });
@@ -81,9 +81,44 @@ it.each([level(0, false, 9), { inventoryItem: { inventoryLevel: null } }])("acti
 it("records actual mismatched stock and rejects the job even when the mutation returned success", async () => {
   mocks.graphql.mockResolvedValueOnce(level(0)).mockResolvedValueOnce(level(0))
     .mockResolvedValueOnce(setResult).mockResolvedValueOnce(level(2));
-  await expect(syncInventoryNotification(notification, "job-1")).rejects.toThrow("Inventory verification failed");
+  await expect(syncInventoryNotification(notification, "job-1")).rejects.toBeInstanceOf(RetryableError);
   expect(mocks.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO inventory_snapshots"), ["1146", 10, "location-1", 9, 2, 9, -7]);
   expect(mocks.log).toHaveBeenCalledWith("error", expect.any(String), expect.objectContaining({ inventoryItemId: "item-1", locationId: "location-1", before: 0, expected: 9, after: 2, jobId: "job-1" }));
+});
+
+it("rejects multiple enabled branch mappings before any Shopify request", async () => {
+  mocks.query.mockResolvedValue([
+    { shopify_location_id: "location-1", safety_stock: "0" },
+    { shopify_location_id: "location-2", safety_stock: "0" },
+  ]);
+  await expect(syncInventoryNotification(notification)).rejects.toBeInstanceOf(ConflictError);
+  expect(mocks.graphql).not.toHaveBeenCalled();
+});
+
+it("does not log activation when the inventory level is already active", async () => {
+  mocks.graphql.mockResolvedValueOnce(level(0)).mockResolvedValueOnce(level(0))
+    .mockResolvedValueOnce(setResult).mockResolvedValueOnce(level(9));
+  await syncInventoryNotification(notification);
+  expect(mocks.graphql.mock.calls.some(([document]) => document.includes("inventoryActivate"))).toBe(false);
+  expect(mocks.log.mock.calls.some(([, message]) => message.startsWith("inventory_activation_"))).toBe(false);
+});
+
+it("logs activation only around an actual mutation", async () => {
+  mocks.graphql.mockResolvedValueOnce(level(0, false)).mockResolvedValueOnce(level(0, false))
+    .mockResolvedValueOnce(activation).mockResolvedValueOnce(level(4))
+    .mockResolvedValueOnce(setResult).mockResolvedValueOnce(level(9));
+  await syncInventoryNotification(notification, "job-1");
+  for (const action of ["inventory_activation_started", "inventory_activation_completed"])
+    expect(mocks.log).toHaveBeenCalledWith("info", action, expect.objectContaining({ sku: "1146", inventoryItemId: "item-1", locationId: "location-1", before: 0, expected: 9, after: null, jobId: "job-1" }));
+});
+
+it("makes a stale compare-and-set retryable without a blind overwrite", async () => {
+  mocks.graphql.mockResolvedValueOnce(level(0)).mockResolvedValueOnce(level(4))
+    .mockResolvedValueOnce({ inventorySetQuantities: { userErrors: [{ code: "CHANGE_FROM_QUANTITY_STALE", field: ["quantities", "0", "changeFromQuantity"], message: "Quantity changed concurrently" }] } });
+  await expect(syncInventoryNotification(notification)).rejects.toBeInstanceOf(RetryableError);
+  expect(mocks.graphql.mock.calls[2][1].input.quantities[0]).toMatchObject({ quantity: 9, changeFromQuantity: 4 });
+  expect(mocks.graphql).toHaveBeenCalledTimes(3);
+  expect(mocks.log.mock.calls.some(([, message]) => message === "inventory_set_completed")).toBe(false);
 });
 
 it("does not accept an inactive zero level as a verified zero stock update", async () => {
