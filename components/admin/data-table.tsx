@@ -18,16 +18,16 @@ export function DataTable({
         <thead>
           <tr>
             {columns.map((c) => (
-              <th key={c}>{c.replaceAll("_", " ")}</th>
+              <th key={c} scope="col">{c.replaceAll("_", " ")}</th>
             ))}
-            {actionable && <th>Actions</th>}
+            {actionable && <th scope="col">Actions</th>}
           </tr>
         </thead>
         <tbody>
           {rows.map((row, index) => (
             <tr key={String(row.id ?? index)}>
               {columns.map((c) => (
-                <td key={c}>{format(row[c])}</td>
+                <td key={c} className={c === "id" || c.endsWith("_id") || c === "sku" ? "technical-cell" : undefined}>{format(row[c])}</td>
               ))}
               {actionable && (
                 <td>

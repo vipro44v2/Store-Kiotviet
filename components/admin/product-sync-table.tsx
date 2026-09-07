@@ -187,6 +187,7 @@ export function ProductSyncTable() {
       {!loading && !catalog.products.length ? (
         <div className="admin-empty">{filtered ? "No products match your filters." : "No products found in this KiotViet store."}</div>
       ) : (
+        <div className="product-table-scroll">
         <table className="admin-table" aria-busy={loading}>
           <thead><tr><th><input aria-label="Select all products" type="checkbox" checked={allSelected} onChange={() => setSelected(allSelected ? new Set() : new Set(catalog.products.map((product) => product.id)))} /></th><th>Image</th><th>Product</th><th>SKU</th><th>Category</th><th>Price</th><th>Stock</th><th>Sync status</th><th>Shopify</th><th>Action</th></tr></thead>
           <tbody>{catalog.products.map((product) => (
@@ -199,6 +200,7 @@ export function ProductSyncTable() {
             </tr>
           ))}</tbody>
         </table>
+        </div>
       )}
       <div className="product-pagination">
         <p>Showing {first.toLocaleString()}–{last.toLocaleString()} of {catalog.total.toLocaleString()} products</p>
