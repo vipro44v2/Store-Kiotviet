@@ -119,6 +119,7 @@ describe("KiotViet product deletion", () => {
     expect(mocks.collapse).toHaveBeenCalledWith(
       expect.objectContaining({ id: 502 }),
       "gid://shopify/Product/1",
+      expect.any(Function),
     );
     expect(mocks.query.mock.calls.some(([sql]) =>
       String(sql).includes("kiotviet_product_id::text=ANY") &&

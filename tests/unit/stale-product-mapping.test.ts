@@ -80,7 +80,7 @@ describe("stale Shopify product mapping recovery", () => {
       shopify_product_id: "gid://shopify/Product/new",
       shopify_variant_id: "gid://shopify/ProductVariant/new",
       sync_direction: "kiotviet_to_shopify",
-    }));
+    }), { resetSyncHash: false });
     expect(mocks.query).toHaveBeenCalledWith(
       expect.stringContaining("kiotviet_product_id::text=$2"),
       expect.arrayContaining(["SKU-1", "501", expect.any(String), "gid://shopify/ProductVariant/new"]),
@@ -113,7 +113,7 @@ describe("stale Shopify product mapping recovery", () => {
       mocks.getProduct.mockResolvedValue({ ...original, images });
       mocks.query.mockClear();
       await expect(syncKiotVietProductToShopify(501)).resolves.toMatchObject({ updated: true });
-      expect(mocks.updateProduct).toHaveBeenLastCalledWith(expect.objectContaining({ images }), saved);
+      expect(mocks.updateProduct).toHaveBeenLastCalledWith(expect.objectContaining({ images }), saved, true, expect.any(Function));
       hashes.push(mocks.query.mock.calls.find(([sql]) => sql.includes("SET last_sync_hash"))![1][2]);
     }
     expect(new Set(hashes).size).toBe(4);

@@ -52,7 +52,10 @@ export const mappingsRepository = {
       return result.rows[0];
     });
   },
-  async upsertExact(input: Omit<MappingRecord, "id" | "last_sync_hash">) {
+  async upsertExact(
+    input: Omit<MappingRecord, "id" | "last_sync_hash">,
+    options: { resetSyncHash?: boolean } = {},
+  ) {
     return transaction(async (client) => {
       const locked = await client.query<MappingRecord>(
         "SELECT * FROM product_mappings WHERE normalized_sku=$1 FOR UPDATE",
@@ -77,7 +80,8 @@ export const mappingsRepository = {
           `UPDATE product_mappings SET sku=$2,normalized_sku=$3,
             shopify_product_id=$4,shopify_variant_id=$5,
             shopify_inventory_item_id=$6,kiotviet_product_id=$7,
-            kiotviet_code=$8,sync_direction=$9,sync_status='mapped',updated_at=now()
+            kiotviet_code=$8,sync_direction=$9,sync_status='mapped',
+            last_sync_hash=CASE WHEN $10::boolean THEN NULL ELSE last_sync_hash END,updated_at=now()
            WHERE id=$1 RETURNING *`,
           [
             target.id,
@@ -89,6 +93,7 @@ export const mappingsRepository = {
             input.kiotviet_product_id,
             input.kiotviet_code,
             input.sync_direction,
+            options.resetSyncHash === true,
           ],
         );
         return updated.rows[0];

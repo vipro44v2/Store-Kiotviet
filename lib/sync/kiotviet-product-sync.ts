@@ -55,7 +55,7 @@ export function shouldSkipUnchangedProduct(
   return (
     mappings.length === 1 &&
     mappings[0].last_sync_hash === hash &&
-    !relatedMappings.some((mapping) => mapping.sync_status === "archived")
+    !relatedMappings.some((mapping) => mapping.sync_status === "archived" || mapping.sync_status === "mapped")
   );
 }
 
@@ -74,16 +74,31 @@ async function saveMapping(
     kiotviet_product_id: String(product.id),
     kiotviet_code: product.code,
     sync_direction: "kiotviet_to_shopify",
-  });
+  }, { resetSyncHash: hash === null });
+  if (hash === null) return;
   await query(
     `UPDATE product_mappings
      SET last_sync_hash=$3,last_source='kiotviet',
-       last_kiotviet_sync_at=CASE WHEN $3::text IS NULL THEN last_kiotviet_sync_at ELSE now() END,
-       sync_status=CASE WHEN $3::text IS NULL THEN 'mapped' ELSE 'synced' END,updated_at=now()
+       last_kiotviet_sync_at=now(),sync_status='synced',updated_at=now()
      WHERE normalized_sku=$1 AND kiotviet_product_id::text=$2
        AND shopify_variant_id=$4`,
     [sku, String(product.id), hash, saved.id],
   );
+}
+
+async function checkpointFamily(
+  products: KiotVietProduct[],
+  saved: { productId: string; variants: Array<{ id: string; sku: string; product: { id: string }; inventoryItem: { id: string } }> },
+) {
+  // Persist each identity before media. A partially written family is still
+  // recoverable through any committed sibling's common Shopify product ID.
+  const bySku = new Map(saved.variants.map((variant) => [normalizeSku(variant.sku), variant]));
+  for (const product of products) {
+    const variant = bySku.get(normalizeSku(product.code));
+    if (!variant || variant.product.id !== saved.productId)
+      throw new Error(`Shopify did not return variant ${product.code} in product ${saved.productId}`);
+    await saveMapping(product, variant, null);
+  }
 }
 
 async function archiveFamilyMappings(products: KiotVietProduct[]) {
@@ -186,13 +201,16 @@ async function syncVariantFamily(
   }
   if (products.length === 1) {
     const saved = existingProductId
-      ? await collapseShopifyVariantGroup(products[0], existingProductId)
+      ? await collapseShopifyVariantGroup(products[0], existingProductId, (variant) => saveMapping(products[0], variant, null))
       : await createShopifyProduct(products[0], (variant) => saveMapping(products[0], variant, null));
     await saveMapping(products[0], saved, hash);
     await syncInventory(products[0], jobId);
     return { sku: trigger.code, updated: true, variants: 1 };
   }
-  const saved = await setShopifyVariantGroup(products, existingProductId);
+  const saved = await setShopifyVariantGroup(products, existingProductId, {
+    checkpoint: (group) => checkpointFamily(products, group),
+    resumeFields: familyMappings.some((mapping) => mapping.sync_status === "mapped" && mapping.last_sync_hash === null),
+  });
   const savedBySku = new Map(
     saved.variants.map((variant) => [normalizeSku(variant.sku), variant]),
   );
@@ -333,11 +351,14 @@ export async function syncDeletedKiotVietProducts(
       const saved = await collapseShopifyVariantGroup(
         remaining[0],
         shopifyProductId,
+        (variant) => saveMapping(remaining[0], variant, null),
       );
       await saveMapping(remaining[0], saved, hash);
       await syncInventory(remaining[0], jobId);
     } else {
-      const saved = await setShopifyVariantGroup(remaining, shopifyProductId);
+      const saved = await setShopifyVariantGroup(remaining, shopifyProductId, {
+        checkpoint: (group) => checkpointFamily(remaining, group),
+      });
       const savedBySku = new Map(
         saved.variants.map((variant) => [normalizeSku(variant.sku), variant]),
       );
@@ -432,8 +453,8 @@ export async function syncKiotVietProductToShopify(
   }
   const saved = variant
     ? (await shopifyProductHasCustomOptions(variant.product.id))
-      ? await collapseShopifyVariantGroup(product, variant.product.id)
-      : await updateShopifyProduct(product, variant)
+      ? await collapseShopifyVariantGroup(product, variant.product.id, (saved) => saveMapping(product, saved, null))
+      : await updateShopifyProduct(product, variant, true, (saved) => saveMapping(product, saved, null))
     : await createShopifyProduct(product, (created) => saveMapping(product, created, null));
   await saveMapping(product, saved, hash);
   await syncInventory(product, jobId);

@@ -33,6 +33,10 @@ let failedUpload: boolean;
 let pendingUpload: boolean;
 let persisted: MappingRecord[];
 let storedVariant: typeof variant | undefined;
+let familyVariants: Array<typeof variant>;
+let fieldsHash: string | null;
+let updatedTitle: string;
+let updatedPrice: string;
 const calls = (name: string) => graphql.mock.calls.filter(([query]) => query.includes(`mutation ${name}(`));
 
 beforeEach(() => {
@@ -40,16 +44,23 @@ beforeEach(() => {
   Object.values(syncMocks).forEach((mock) => mock.mockReset());
   persisted = [];
   storedVariant = undefined;
+  familyVariants = [variant];
+  fieldsHash = null;
+  updatedTitle = "Old title";
+  updatedPrice = "0";
   const source = { ...product, inventories: [{ branchId: 1, branchName: "Main", onHand: 5 }] };
   syncMocks.getProduct.mockResolvedValue(source);
   syncMocks.getFamily.mockResolvedValue([source]);
-  syncMocks.findBySku.mockImplementation(async () => structuredClone(persisted));
-  syncMocks.upsert.mockImplementation(async (input) => {
-    persisted = [{ ...input, id: "mapping", sync_status: "mapped", last_sync_hash: persisted[0]?.last_sync_hash ?? null }];
+  syncMocks.findBySku.mockImplementation(async (sku) => structuredClone(persisted.filter((item) => item.normalized_sku === sku)));
+  syncMocks.upsert.mockImplementation(async (input, options) => {
+    const previous = persisted.find((item) => item.normalized_sku === input.normalized_sku);
+    persisted = persisted.filter((item) => item.normalized_sku !== input.normalized_sku);
+    persisted.push({ ...input, id: `mapping-${input.normalized_sku}`, sync_status: "mapped", last_sync_hash: options?.resetSyncHash ? null : previous?.last_sync_hash ?? null });
   });
   syncMocks.query.mockImplementation(async (_sql, values) => {
-    persisted[0].last_sync_hash = values[2];
-    persisted[0].sync_status = values[2] === null ? "mapped" : "synced";
+    const mapping = persisted.find((item) => item.normalized_sku === values[0])!;
+    mapping.last_sync_hash = values[2];
+    mapping.sync_status = values[2] === null ? "mapped" : "synced";
     return [];
   });
   media = [];
@@ -58,7 +69,8 @@ beforeEach(() => {
   deleteError = createError = failedUpload = pendingUpload = false;
   graphql.mockImplementation(async (query: string, variables: {
     mediaIds: string[];
-    product: { metafields: Array<{ value: string }> };
+    product: { title: string; metafields: Array<{ value: string }> };
+    variants: Array<{ price: string }>;
   }) => {
     if (query.includes("query ProductMedia(")) return { product: {
       metafield: checkpoint ? { value: checkpoint } : null,
@@ -78,9 +90,13 @@ beforeEach(() => {
       checkpoint = variables.product.metafields[0].value;
       return { productUpdate: { product: { id: "p1" }, userErrors: [] } };
     }
-    if (query.includes("mutation UpdateProduct(")) return { productUpdate: { product: { id: "p1" }, userErrors: [] } };
+    if (query.includes("mutation UpdateProduct(")) {
+      updatedTitle = variables.product.title;
+      return { productUpdate: { product: { id: "p1" }, userErrors: [] } };
+    }
     if (query.includes("mutation UpdateVariant(")) {
       storedVariant = variant;
+      updatedPrice = variables.variants[0].price;
       return { productVariantsBulkUpdate: { productVariants: [variant], userErrors: [] } };
     }
     if (query.includes("mutation CreateProduct(")) {
@@ -89,14 +105,19 @@ beforeEach(() => {
     }
     if (query.includes("query BySku(")) return { productVariants: { nodes: storedVariant?.sku ? [storedVariant] : [] } };
     if (query.includes("query ProductVariant(")) return { productVariant: storedVariant ?? null };
+    if (query.includes("query ProductExists(")) return { product: { id: "p1" } };
     if (query.includes("query ProductShape(")) return { product: { hasOnlyDefaultVariant: true } };
     if (query.includes("mutation Cleanup(")) {
       storedVariant = undefined;
       return { productDelete: { deletedProductId: "p1", userErrors: [] } };
     }
-    if (query.includes("query ExistingProductVariants(")) return { product: { variants: { nodes: [variant] } } };
+    if (query.includes("query ExistingProductVariants(")) return { product: { metafield: fieldsHash ? { value: fieldsHash } : null, variants: { nodes: familyVariants } } };
+    if (query.includes("mutation CheckpointVariantFields(")) {
+      fieldsHash = variables.product.metafields[0].value;
+      return { productUpdate: { product: { id: "p1" }, userErrors: [] } };
+    }
     if (query.includes("mutation SetVariantProduct(") || query.includes("mutation CollapseVariantProduct("))
-      return { productSet: { product: { id: "p1", variants: { nodes: [variant] } }, userErrors: [] } };
+      return { productSet: { product: { id: "p1", variants: { nodes: familyVariants } }, userErrors: [] } };
     throw new Error(`Unexpected query: ${query}`);
   });
 });
@@ -105,7 +126,117 @@ function existing(urls: string[]) {
   media = urls.map((url, index) => ({ id: `old${index}`, mediaContentType: "IMAGE", status: "READY", image: { url } }));
 }
 
+function variantFamily() {
+  const family = [
+    { ...product, hasVariants: true, attributes: [{ attributeName: "Size", attributeValue: "S" }] },
+    { ...product, id: 2, code: "B", masterProductId: 1, attributes: [{ attributeName: "Size", attributeValue: "L" }] },
+  ].map((item) => ({ ...item, inventories: [{ branchId: 1, branchName: "Main", onHand: 5 }] }));
+  familyVariants = [variant, { ...variant, id: "v2", sku: "B", inventoryItem: { id: "i2", tracked: true } }];
+  syncMocks.getProduct.mockResolvedValue(family[0]);
+  syncMocks.getFamily.mockResolvedValue(family);
+  return family;
+}
+
 describe("product media reconciliation", () => {
+  it("creates a family once, checkpoints all identities before media, and resumes READY media", async () => {
+    variantFamily();
+    vi.useFakeTimers();
+    try {
+      pendingUpload = true;
+      const failed = expect(syncKiotVietProductToShopify(1)).rejects.toBeInstanceOf(RetryableError);
+      await vi.runAllTimersAsync();
+      await failed;
+      expect(persisted).toHaveLength(2);
+      expect(persisted.map((item) => item.shopify_variant_id)).toEqual(["v1", "v2"]);
+      for (const mapping of persisted)
+        expect(mapping).toMatchObject({ shopify_product_id: "p1", last_sync_hash: null, sync_status: "mapped" });
+      expect(syncMocks.query).not.toHaveBeenCalled();
+      const firstMedia = graphql.mock.calls.findIndex(([query]) => query.includes("mutation CreateProductMedia("));
+      expect(syncMocks.upsert.mock.invocationCallOrder[1]).toBeLessThan(graphql.mock.invocationCallOrder[firstMedia]);
+      expect(calls("SetVariantProduct")).toHaveLength(1);
+      expect(calls("Cleanup")).toHaveLength(0);
+      media.forEach((item) => { item.status = "READY"; });
+      await expect(syncKiotVietProductToShopify(2)).resolves.toMatchObject({ updated: true, variants: 2 });
+      expect(calls("SetVariantProduct")).toHaveLength(1);
+      expect(calls("CreateProductMedia")).toHaveLength(2);
+      expect(calls("Cleanup")).toHaveLength(0);
+      expect(new Set(persisted.map((item) => item.shopify_product_id))).toEqual(new Set(["p1"]));
+      expect(new Set(persisted.map((item) => item.last_sync_hash)).size).toBe(1);
+      for (const mapping of persisted)
+        expect(mapping).toMatchObject({ sync_status: "synced", last_sync_hash: expect.any(String) });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("applies changed family fields on retry to the checkpointed product", async () => {
+    const family = variantFamily();
+    vi.useFakeTimers();
+    try {
+      pendingUpload = true;
+      const failed = expect(syncKiotVietProductToShopify(1)).rejects.toThrow("still processing");
+      await vi.runAllTimersAsync();
+      await failed;
+      media.forEach((item) => { item.status = "READY"; });
+      syncMocks.getFamily.mockResolvedValue(family.map((item) => ({ ...item, name: "Changed", basePrice: 999 })));
+      await syncKiotVietProductToShopify(1);
+      expect(calls("SetVariantProduct")).toHaveLength(2);
+      expect(calls("SetVariantProduct")[1][1]).toMatchObject({ identifier: { id: "p1" }, input: { title: "Changed" } });
+      expect(calls("SetVariantProduct").filter(([, args]) => args.identifier === null)).toHaveLength(1);
+      expect(calls("CreateProductMedia")).toHaveLength(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps family identities when the post-checkpoint field marker fails", async () => {
+    variantFamily();
+    const implementation = graphql.getMockImplementation()!;
+    graphql.mockImplementation(async (...args) => {
+      if (args[0].includes("mutation CheckpointVariantFields(")) throw new RetryableError("marker unavailable");
+      return implementation(...args);
+    });
+    await expect(syncKiotVietProductToShopify(1)).rejects.toThrow("marker unavailable");
+    expect(persisted).toHaveLength(2);
+    expect(calls("Cleanup")).toHaveLength(0);
+    expect(calls("CreateProductMedia")).toHaveLength(0);
+    graphql.mockImplementation(implementation);
+    await syncKiotVietProductToShopify(1);
+    expect(calls("SetVariantProduct")[1][1].identifier).toEqual({ id: "p1" });
+  });
+
+  it("cleans up a new family if its identity checkpoint cannot be written", async () => {
+    variantFamily();
+    syncMocks.upsert.mockRejectedValueOnce(new Error("checkpoint database unavailable"));
+    await expect(syncKiotVietProductToShopify(1)).rejects.toThrow("checkpoint database unavailable");
+    expect(calls("Cleanup")).toHaveLength(1);
+    expect(calls("CreateProductMedia")).toHaveLength(0);
+  });
+
+  it("updates existing title and price before media timeout and clears the old successful hash", async () => {
+    await syncKiotVietProductToShopify(1);
+    const changed = { ...product, name: "New title", basePrice: 456, images: [c], inventories: [{ branchId: 1, branchName: "Main", onHand: 5 }] };
+    syncMocks.getProduct.mockResolvedValue(changed);
+    syncMocks.getFamily.mockResolvedValue([changed]);
+    graphql.mockClear();
+    syncMocks.query.mockClear();
+    vi.useFakeTimers();
+    try {
+      pendingUpload = true;
+      const failed = expect(syncKiotVietProductToShopify(1)).rejects.toBeInstanceOf(RetryableError);
+      await vi.runAllTimersAsync();
+      await failed;
+      expect(updatedTitle).toBe("New title");
+      expect(updatedPrice).toBe("456");
+      expect(persisted[0]).toMatchObject({ sync_status: "mapped", last_sync_hash: null });
+      expect(syncMocks.query).not.toHaveBeenCalled();
+      const operations = graphql.mock.calls.map(([query]) => query);
+      expect(operations.findIndex((query) => query.includes("mutation UpdateVariant(")))
+        .toBeLessThan(operations.findIndex((query) => query.includes("query ProductMedia(")));
+      media.forEach((item) => { item.status = "READY"; });
+      await syncKiotVietProductToShopify(1);
+      expect(calls("CreateProduct")).toHaveLength(0);
+      expect(calls("CreateProductMedia")).toHaveLength(1);
+      expect(persisted[0]).toMatchObject({ sync_status: "synced", last_sync_hash: expect.any(String) });
+    } finally { vi.useRealTimers(); }
+  });
+
   it("checkpoints a new product before media timeout and reuses it when READY without deletion or duplication", async () => {
     vi.useFakeTimers();
     try {
@@ -117,8 +248,8 @@ describe("product media reconciliation", () => {
       expect(checkpoint).not.toBeNull();
       expect(calls("Cleanup")).toHaveLength(0);
       expect(storedVariant?.sku).toBe("A");
-      expect(syncMocks.query).toHaveBeenCalledTimes(1);
-      expect(syncMocks.query.mock.invocationCallOrder[0]).toBeLessThan(
+      expect(syncMocks.query).not.toHaveBeenCalled();
+      expect(syncMocks.upsert.mock.invocationCallOrder[0]).toBeLessThan(
         graphql.mock.invocationCallOrder[graphql.mock.calls.findIndex(([query]) => query.includes("mutation CreateProductMedia("))],
       );
       media.forEach((item) => { item.status = "READY"; });

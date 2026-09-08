@@ -40,4 +40,15 @@ describe("exact product mapping updates", () => {
     expect(mocks.clientQuery.mock.calls[1][0]).toContain("WHERE id=$1");
     expect(mocks.clientQuery.mock.calls[1][1][0]).toBe("mapping-501");
   });
+
+  it("clears an old sync hash atomically with the pending identity update", async () => {
+    mocks.clientQuery
+      .mockResolvedValueOnce({ rows: [{ id: "mapping-501", kiotviet_product_id: "501", last_sync_hash: "old" }] })
+      .mockResolvedValueOnce({ rows: [{ id: "mapping-501", ...input, last_sync_hash: null }] });
+    await mappingsRepository.upsertExact(input, { resetSyncHash: true });
+    expect(mocks.clientQuery).toHaveBeenCalledTimes(2);
+    expect(mocks.clientQuery.mock.calls[1][0]).toContain("last_sync_hash=CASE WHEN $10::boolean THEN NULL ELSE last_sync_hash END");
+    expect(mocks.clientQuery.mock.calls[1][0]).toContain("sync_status='mapped'");
+    expect(mocks.clientQuery.mock.calls[1][1][9]).toBe(true);
+  });
 });

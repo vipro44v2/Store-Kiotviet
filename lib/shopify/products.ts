@@ -1,4 +1,5 @@
 import { syncShopifyProductMedia } from "./product-media";
+import { syncHash } from "@/lib/sync/hashes";
 import { shopifyGraphql } from "./graphql";
 import type { ShopifyVariant } from "@/types/shopify";
 import type { KiotVietProduct } from "@/lib/kiotviet/types";
@@ -43,6 +44,21 @@ export async function shopifyProductExists(id: string): Promise<boolean> {
 }
 
 type ManagedVariant = ShopifyVariant & { price?: string };
+async function cleanupUncheckpointedProduct(productId: string, error: unknown): Promise<never> {
+  try {
+    const cleanup = await shopifyGraphql<{
+      productDelete: { deletedProductId: string | null; userErrors: Array<{ message: string }> };
+    }>(
+      `mutation Cleanup($input:ProductDeleteInput!){productDelete(input:$input){deletedProductId userErrors{message}}}`,
+      { input: { id: productId } },
+    );
+    if (cleanup.productDelete.userErrors.length || cleanup.productDelete.deletedProductId !== productId)
+      throw new Error(cleanup.productDelete.userErrors.map((item) => item.message).join("; ") || "Shopify did not delete the uncheckpointed product");
+  } catch (cleanupError) {
+    throw new AggregateError([error, cleanupError], `Shopify product ${productId} could not be checkpointed or cleaned up`);
+  }
+  throw error;
+}
 function productInput(product: KiotVietProduct) {
   return {
     title: product.name,
@@ -94,19 +110,7 @@ export async function createShopifyProduct(
   } catch (error) {
     // Without a usable durable identity this blank-SKU product cannot be
     // safely rediscovered. Never roll back after the checkpoint succeeds.
-    try {
-      const cleanup = await shopifyGraphql<{
-        productDelete: { deletedProductId: string | null; userErrors: Array<{ message: string }> };
-      }>(
-        `mutation Cleanup($input:ProductDeleteInput!){productDelete(input:$input){deletedProductId userErrors{message}}}`,
-        { input: { id: shopifyProduct.id } },
-      );
-      if (cleanup.productDelete.userErrors.length || cleanup.productDelete.deletedProductId !== shopifyProduct.id)
-        throw new Error(cleanup.productDelete.userErrors.map((item) => item.message).join("; ") || "Shopify did not delete the uncheckpointed product");
-    } catch (cleanupError) {
-      throw new AggregateError([error, cleanupError], `Shopify product ${shopifyProduct.id} could not be checkpointed or cleaned up`);
-    }
-    throw error;
+    return cleanupUncheckpointedProduct(shopifyProduct.id, error);
   }
   const saved = await updateShopifyProduct(product, variant, false);
   await syncShopifyProductMedia(shopifyProduct.id, product);
@@ -117,8 +121,8 @@ export async function updateShopifyProduct(
   product: KiotVietProduct,
   variant: ShopifyVariant,
   syncMedia = true,
+  checkpoint?: (variant: ManagedVariant) => Promise<void>,
 ): Promise<ManagedVariant> {
-  if (syncMedia) await syncShopifyProductMedia(variant.product.id, product);
   const updated = await shopifyGraphql<{
     productUpdate: {
       product?: { id: string };
@@ -160,7 +164,10 @@ export async function updateShopifyProduct(
         .map((e) => e.message)
         .join("; ") || "Shopify did not update the variant",
     );
-  return result.productVariantsBulkUpdate.productVariants[0];
+  const saved = result.productVariantsBulkUpdate.productVariants[0];
+  await checkpoint?.(saved);
+  if (syncMedia) await syncShopifyProductMedia(variant.product.id, product);
+  return saved;
 }
 
 type ManagedVariantGroup = { productId: string; variants: ManagedVariant[] };
@@ -233,18 +240,25 @@ export function variantGroupInput(
 export async function setShopifyVariantGroup(
   products: KiotVietProduct[],
   existingProductId?: string,
+  options: {
+    checkpoint?: (group: ManagedVariantGroup) => Promise<void>;
+    resumeFields?: boolean;
+  } = {},
 ): Promise<ManagedVariantGroup> {
   if (!products.length)
     throw new Error("Cannot synchronize an empty variant group");
+  if (!existingProductId && !options.checkpoint)
+    throw new Error("Creating a variant family requires an identity checkpoint");
   const primary =
     products.find((product) => !product.masterProductId) ?? products[0];
   const existing = existingProductId
     ? await shopifyGraphql<{
         product: {
-          variants: { nodes: Array<{ id: string; sku: string }> };
+          metafield: { value: string } | null;
+          variants: { nodes: ManagedVariant[] };
         } | null;
       }>(
-        `query ExistingProductVariants($id:ID!){product(id:$id){variants(first:250){nodes{id sku}}}}`,
+        `query ExistingProductVariants($id:ID!){product(id:$id){metafield(namespace:"kiotviet_sync",key:"variant_fields_hash"){value} variants(first:250){nodes{id sku barcode price product{id title} inventoryItem{id tracked}}}}}`,
         { id: existingProductId },
       )
     : undefined;
@@ -255,6 +269,15 @@ export async function setShopifyVariantGroup(
     ]),
   );
   const group = variantGroupInput(products, existingBySku);
+  const fieldsHash = syncHash({ ...productInput(primary), ...variantGroupInput(products) });
+  if (options.resumeFields && existingProductId && existing?.product?.metafield?.value === fieldsHash &&
+    existing.product.variants.nodes.length === products.length &&
+    products.every((product) => existingBySku.has(product.code.trim().toUpperCase()))) {
+    const saved = { productId: existingProductId, variants: existing.product.variants.nodes };
+    await options.checkpoint?.(saved);
+    await syncShopifyProductMedia(existingProductId, primary);
+    return saved;
+  }
   const result = await shopifyGraphql<{
     productSet: {
       product?: {
@@ -282,8 +305,27 @@ export async function setShopifyVariantGroup(
         "Shopify did not set the variant product",
     );
   const saved = result.productSet.product;
+  const identities = { productId: saved.id, variants: saved.variants.nodes };
+  // Identity must be durable before the field marker or asynchronous media work.
+  try {
+    await options.checkpoint?.(identities);
+  } catch (error) {
+    if (!existingProductId) return cleanupUncheckpointedProduct(saved.id, error);
+    throw error;
+  }
+  if (options.checkpoint) {
+    // Use productUpdate: productSet's metafields list can replace other metadata.
+    const marked = await shopifyGraphql<{
+      productUpdate: { product: { id: string } | null; userErrors: Array<{ message: string }> };
+    }>(
+      `mutation CheckpointVariantFields($product:ProductUpdateInput!){productUpdate(product:$product){product{id} userErrors{message}}}`,
+      { product: { id: saved.id, metafields: [{ namespace: "kiotviet_sync", key: "variant_fields_hash", type: "single_line_text_field", value: fieldsHash }] } },
+    );
+    if (marked.productUpdate.userErrors.length || !marked.productUpdate.product)
+      throw new Error(marked.productUpdate.userErrors.map((error) => error.message).join("; ") || "Shopify did not checkpoint variant fields");
+  }
   await syncShopifyProductMedia(saved.id, primary);
-  return { productId: saved.id, variants: saved.variants.nodes };
+  return identities;
 }
 
 export async function shopifyProductHasCustomOptions(productId: string) {
@@ -298,6 +340,7 @@ export async function shopifyProductHasCustomOptions(productId: string) {
 export async function collapseShopifyVariantGroup(
   product: KiotVietProduct,
   productId: string,
+  checkpoint?: (variant: ManagedVariant) => Promise<void>,
 ): Promise<ManagedVariant> {
   const result = await shopifyGraphql<{
     productSet: {
@@ -322,7 +365,7 @@ export async function collapseShopifyVariantGroup(
       errors.map((error) => error.message).join("; ") ||
         "Shopify did not collapse the variant product",
     );
-  return updateShopifyProduct(product, defaultVariant);
+  return updateShopifyProduct(product, defaultVariant, true, checkpoint);
 }
 
 export async function archiveShopifyProduct(productId: string) {
