@@ -87,6 +87,51 @@ describe("stale Shopify product mapping recovery", () => {
     );
   });
 
+  it("changes the persisted hash for image changes and order, but skips identical images", async () => {
+    const original = {
+      id: 501, code: "SKU-1", name: "Product",
+      images: ["https://example.com/a.jpg", "https://example.com/b.jpg"],
+      inventories: [{ branchId: 10, branchName: "Main", onHand: 5 }],
+    };
+    mocks.getProduct.mockResolvedValue(original);
+    mocks.getFamily.mockResolvedValue([original]);
+    await syncKiotVietProductToShopify(501);
+    const firstHash = mocks.query.mock.calls.find(([sql]) => sql.includes("SET last_sync_hash"))![1][2];
+    const saved = await mocks.createProduct.mock.results[0].value;
+    mocks.getVariant.mockResolvedValue(saved);
+    mocks.updateProduct.mockResolvedValue(saved);
+    mocks.customOptions.mockResolvedValue(false);
+    mocks.findBySku.mockResolvedValue([{
+      shopify_variant_id: saved.id, kiotviet_product_id: "501",
+      last_sync_hash: firstHash, sync_status: "synced",
+    }]);
+    await expect(syncKiotVietProductToShopify(501)).resolves.toMatchObject({ reason: "unchanged" });
+    expect(mocks.updateProduct).not.toHaveBeenCalled();
+
+    const hashes = [firstHash];
+    for (const images of [original.images.toReversed(), ["https://example.com/c.jpg"], []]) {
+      mocks.getProduct.mockResolvedValue({ ...original, images });
+      mocks.query.mockClear();
+      await expect(syncKiotVietProductToShopify(501)).resolves.toMatchObject({ updated: true });
+      expect(mocks.updateProduct).toHaveBeenLastCalledWith(expect.objectContaining({ images }), saved);
+      hashes.push(mocks.query.mock.calls.find(([sql]) => sql.includes("SET last_sync_hash"))![1][2]);
+    }
+    expect(new Set(hashes).size).toBe(4);
+  });
+
+  it("does not persist a successful hash if media synchronization throws", async () => {
+    const saved = {
+      id: "variant", sku: "SKU-1", product: { id: "product", title: "Product" },
+      inventoryItem: { id: "inventory", tracked: true },
+    };
+    mocks.getVariant.mockResolvedValue(saved);
+    mocks.customOptions.mockResolvedValue(false);
+    mocks.updateProduct.mockRejectedValueOnce(new Error("media creation failed"));
+    await expect(syncKiotVietProductToShopify(501)).rejects.toThrow("media creation failed");
+    expect(mocks.upsert).not.toHaveBeenCalled();
+    expect(mocks.query).not.toHaveBeenCalled();
+  });
+
   it("does not create or normally update an inactive simple product", async () => {
     const inactive = { id: 501, code: "SKU-1", name: "Inactive", isActive: false, inventories: [] };
     mocks.getProduct.mockResolvedValue(inactive);

@@ -1,3 +1,4 @@
+import { syncShopifyProductMedia } from "./product-media";
 import { shopifyGraphql } from "./graphql";
 import type { ShopifyVariant } from "@/types/shopify";
 import type { KiotVietProduct } from "@/lib/kiotviet/types";
@@ -64,32 +65,6 @@ export function inventoryItemInput(product: KiotVietProduct) {
       : {}),
   };
 }
-function productMedia(product: KiotVietProduct) {
-  return (product.images ?? [])
-    .filter((url) => {
-      try {
-        return new URL(url).protocol === "https:";
-      } catch {
-        return false;
-      }
-    })
-    .slice(0, 20)
-    .map((originalSource) => ({
-      originalSource,
-      alt: product.name,
-      mediaContentType: "IMAGE" as const,
-    }));
-}
-async function productHasMedia(productId: string) {
-  const data = await shopifyGraphql<{
-    product: { media: { nodes: Array<{ id: string }> } } | null;
-  }>(
-    `query ProductMedia($id:ID!){product(id:$id){media(first:1){nodes{id}}}}`,
-    { id: productId },
-  );
-  return Boolean(data.product?.media.nodes.length);
-}
-
 export async function createShopifyProduct(
   product: KiotVietProduct,
 ): Promise<ManagedVariant> {
@@ -100,7 +75,7 @@ export async function createShopifyProduct(
     };
   }>(
     `mutation CreateProduct($product:ProductCreateInput!,$media:[CreateMediaInput!]){productCreate(product:$product,media:$media){product{id variants(first:1){nodes{id}}} userErrors{message}}}`,
-    { product: productInput(product), media: productMedia(product) },
+    { product: productInput(product), media: [] },
   );
   if (created.productCreate.userErrors.length || !created.productCreate.product)
     throw new Error(
@@ -119,7 +94,6 @@ export async function createShopifyProduct(
         product: { id: shopifyProduct.id, title: product.name },
         inventoryItem: { id: "", tracked: true },
       },
-      false,
     );
   } catch (error) {
     await shopifyGraphql(
@@ -133,12 +107,9 @@ export async function createShopifyProduct(
 export async function updateShopifyProduct(
   product: KiotVietProduct,
   variant: ShopifyVariant,
-  addMissingMedia = true,
+  syncMedia = true,
 ): Promise<ManagedVariant> {
-  const media =
-    addMissingMedia && !(await productHasMedia(variant.product.id))
-      ? productMedia(product)
-      : [];
+  if (syncMedia) await syncShopifyProductMedia(variant.product.id, product);
   const updated = await shopifyGraphql<{
     productUpdate: {
       product?: { id: string };
@@ -146,7 +117,7 @@ export async function updateShopifyProduct(
     };
   }>(
     `mutation UpdateProduct($product:ProductUpdateInput!,$media:[CreateMediaInput!]){productUpdate(product:$product,media:$media){product{id} userErrors{message}}}`,
-    { product: { id: variant.product.id, ...productInput(product) }, media },
+    { product: { id: variant.product.id, ...productInput(product) }, media: [] },
   );
   if (updated.productUpdate.userErrors.length)
     throw new Error(
@@ -302,20 +273,7 @@ export async function setShopifyVariantGroup(
         "Shopify did not set the variant product",
     );
   const saved = result.productSet.product;
-  if (productMedia(primary).length && !(await productHasMedia(saved.id))) {
-    const mediaResult = await shopifyGraphql<{
-      productUpdate: { userErrors: Array<{ message: string }> };
-    }>(
-      `mutation AddVariantProductMedia($product:ProductUpdateInput!,$media:[CreateMediaInput!]){productUpdate(product:$product,media:$media){userErrors{message}}}`,
-      { product: { id: saved.id }, media: productMedia(primary) },
-    );
-    if (mediaResult.productUpdate.userErrors.length)
-      throw new Error(
-        mediaResult.productUpdate.userErrors
-          .map((error) => error.message)
-          .join("; "),
-      );
-  }
+  await syncShopifyProductMedia(saved.id, primary);
   return { productId: saved.id, variants: saved.variants.nodes };
 }
 
@@ -355,7 +313,7 @@ export async function collapseShopifyVariantGroup(
       errors.map((error) => error.message).join("; ") ||
         "Shopify did not collapse the variant product",
     );
-  return updateShopifyProduct(product, defaultVariant, false);
+  return updateShopifyProduct(product, defaultVariant);
 }
 
 export async function archiveShopifyProduct(productId: string) {
