@@ -62,7 +62,7 @@ export function shouldSkipUnchangedProduct(
 async function saveMapping(
   product: KiotVietProduct,
   saved: { id: string; product: { id: string }; inventoryItem: { id: string } },
-  hash: string,
+  hash: string | null,
 ) {
   const sku = normalizeSku(product.code);
   await mappingsRepository.upsertExact({
@@ -77,8 +77,9 @@ async function saveMapping(
   });
   await query(
     `UPDATE product_mappings
-     SET last_sync_hash=$3,last_source='kiotviet',last_kiotviet_sync_at=now(),
-       sync_status='synced',updated_at=now()
+     SET last_sync_hash=$3,last_source='kiotviet',
+       last_kiotviet_sync_at=CASE WHEN $3::text IS NULL THEN last_kiotviet_sync_at ELSE now() END,
+       sync_status=CASE WHEN $3::text IS NULL THEN 'mapped' ELSE 'synced' END,updated_at=now()
      WHERE normalized_sku=$1 AND kiotviet_product_id::text=$2
        AND shopify_variant_id=$4`,
     [sku, String(product.id), hash, saved.id],
@@ -186,7 +187,7 @@ async function syncVariantFamily(
   if (products.length === 1) {
     const saved = existingProductId
       ? await collapseShopifyVariantGroup(products[0], existingProductId)
-      : await createShopifyProduct(products[0]);
+      : await createShopifyProduct(products[0], (variant) => saveMapping(products[0], variant, null));
     await saveMapping(products[0], saved, hash);
     await syncInventory(products[0], jobId);
     return { sku: trigger.code, updated: true, variants: 1 };
@@ -410,7 +411,13 @@ export async function syncKiotVietProductToShopify(
     mappings.length === 1 && mappings[0].shopify_variant_id
       ? await getShopifyVariant(mappings[0].shopify_variant_id)
       : undefined;
-  if (variant && normalizeSku(variant.sku) !== sku) variant = undefined;
+  // A new product is checkpointed before its default variant receives its SKU.
+  // Only resume an empty SKU when this exact product/source mapping is pending.
+  const pendingCreation = variant && !normalizeSku(variant.sku) &&
+    mappings[0]?.sync_status === "mapped" && mappings[0].last_sync_hash === null &&
+    mappings[0].kiotviet_product_id === String(product.id) &&
+    mappings[0].shopify_product_id === variant.product.id;
+  if (variant && normalizeSku(variant.sku) !== sku && !pendingCreation) variant = undefined;
   if (variant && shouldSkipUnchangedProduct(hash, mappings)) {
     await syncInventory(product, jobId);
     return { sku, updated: false, reason: "unchanged" };
@@ -427,7 +434,7 @@ export async function syncKiotVietProductToShopify(
     ? (await shopifyProductHasCustomOptions(variant.product.id))
       ? await collapseShopifyVariantGroup(product, variant.product.id)
       : await updateShopifyProduct(product, variant)
-    : await createShopifyProduct(product);
+    : await createShopifyProduct(product, (created) => saveMapping(product, created, null));
   await saveMapping(product, saved, hash);
   await syncInventory(product, jobId);
   await log("info", "KiotViet product synchronized to Shopify", {

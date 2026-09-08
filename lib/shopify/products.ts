@@ -67,14 +67,15 @@ export function inventoryItemInput(product: KiotVietProduct) {
 }
 export async function createShopifyProduct(
   product: KiotVietProduct,
+  checkpoint: (variant: ManagedVariant) => Promise<void>,
 ): Promise<ManagedVariant> {
   const created = await shopifyGraphql<{
     productCreate: {
-      product?: { id: string; variants: { nodes: Array<{ id: string }> } };
+      product?: { id: string; variants: { nodes: ManagedVariant[] } };
       userErrors: Array<{ message: string }>;
     };
   }>(
-    `mutation CreateProduct($product:ProductCreateInput!,$media:[CreateMediaInput!]){productCreate(product:$product,media:$media){product{id variants(first:1){nodes{id}}} userErrors{message}}}`,
+    `mutation CreateProduct($product:ProductCreateInput!,$media:[CreateMediaInput!]){productCreate(product:$product,media:$media){product{id variants(first:1){nodes{id sku barcode product{id title} inventoryItem{id tracked}}}} userErrors{message}}}`,
     { product: productInput(product), media: [] },
   );
   if (created.productCreate.userErrors.length || !created.productCreate.product)
@@ -82,26 +83,34 @@ export async function createShopifyProduct(
       created.productCreate.userErrors.map((e) => e.message).join("; ") ||
         "Shopify did not create the product",
     );
-  const shopifyProduct = created.productCreate.product,
-    variantId = shopifyProduct.variants.nodes[0]?.id;
-  if (!variantId) throw new Error("Shopify product has no default variant");
+  const shopifyProduct = created.productCreate.product;
+  const variant = shopifyProduct.variants.nodes[0];
   try {
-    return await updateShopifyProduct(
-      product,
-      {
-        id: variantId,
-        sku: product.code,
-        product: { id: shopifyProduct.id, title: product.name },
-        inventoryItem: { id: "", tracked: true },
-      },
-    );
+    if (!variant?.id || !variant.inventoryItem?.id)
+      throw new Error("Shopify product has no usable default variant");
+    // Persist identity before any update can fail. This is not a successful
+    // sync/hash: the default variant may still have an empty SKU.
+    await checkpoint(variant);
   } catch (error) {
-    await shopifyGraphql(
-      `mutation Cleanup($input:ProductDeleteInput!){productDelete(input:$input){deletedProductId}}`,
-      { input: { id: shopifyProduct.id } },
-    ).catch(() => undefined);
+    // Without a usable durable identity this blank-SKU product cannot be
+    // safely rediscovered. Never roll back after the checkpoint succeeds.
+    try {
+      const cleanup = await shopifyGraphql<{
+        productDelete: { deletedProductId: string | null; userErrors: Array<{ message: string }> };
+      }>(
+        `mutation Cleanup($input:ProductDeleteInput!){productDelete(input:$input){deletedProductId userErrors{message}}}`,
+        { input: { id: shopifyProduct.id } },
+      );
+      if (cleanup.productDelete.userErrors.length || cleanup.productDelete.deletedProductId !== shopifyProduct.id)
+        throw new Error(cleanup.productDelete.userErrors.map((item) => item.message).join("; ") || "Shopify did not delete the uncheckpointed product");
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], `Shopify product ${shopifyProduct.id} could not be checkpointed or cleaned up`);
+    }
     throw error;
   }
+  const saved = await updateShopifyProduct(product, variant, false);
+  await syncShopifyProductMedia(shopifyProduct.id, product);
+  return saved;
 }
 
 export async function updateShopifyProduct(
