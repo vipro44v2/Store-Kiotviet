@@ -4,6 +4,8 @@ import type { JobPriority, JobType, SyncJobPayload } from "./jobs";
 import { priorityNumber, retryDelay } from "./jobs";
 import { getEnv } from "@/lib/env";
 import { jobsRepository } from "@/repositories/jobs";
+import { admitInventoryReconciliation, isInventoryReconciliation } from "@/repositories/inventory-reconciliation";
+import { log } from "@/lib/logger";
 
 export const QUEUE_NAMES = ["sync", "webhooks", "reconciliation", "maintenance"] as const;
 export type QueueName = (typeof QUEUE_NAMES)[number];
@@ -23,7 +25,18 @@ export async function enqueueJob(
   jobId?: string,
   transientDeduplicationId?: string,
 ) {
-  const auditId = await jobsRepository.create(type, payload, priority, getEnv().JOB_MAX_ATTEMPTS);
+  if (isInventoryReconciliation(type) && payload.eventId) {
+    await log("info", "Webhook reconciliation enqueue ignored", {
+      action: "inventory_webhook_ignored", reason: "scheduled_reconciliation_only", eventId: payload.eventId,
+    });
+    return { id: payload.eventId, deduplicated: true };
+  }
+  const admission = isInventoryReconciliation(type)
+    ? await admitInventoryReconciliation(type, payload, priority, getEnv().JOB_MAX_ATTEMPTS)
+    : undefined;
+  if (admission?.deduplicated) return { id: admission.id, deduplicated: true };
+  payload = admission?.payload ?? payload;
+  const auditId = admission?.id ?? await jobsRepository.create(type, payload, priority, getEnv().JOB_MAX_ATTEMPTS);
   if (!isRedisEnabled()) {
     await jobsRepository.attachQueueJob(auditId, `local-${auditId}`);
     const inventoryJob = ["kiotviet_inventory_to_shopify", "inventory_reconciliation", "full_inventory_sync"].includes(type);
@@ -55,10 +68,13 @@ export async function enqueueJob(
     deduplication: transientDeduplicationId
       ? { id: transientDeduplicationId }
       : undefined,
+  }).catch(async (error: unknown) => {
+    if (admission) await jobsRepository.fail(auditId, error instanceof Error ? error : new Error(String(error)), true);
+    throw error;
   });
   const deduplicated = job.data.auditJobId !== auditId;
   if (deduplicated) await jobsRepository.complete(auditId);
-  await jobsRepository.attachQueueJob(auditId, String(job.id));
+  if (!deduplicated) await jobsRepository.attachQueueJob(auditId, String(job.id));
   return Object.assign(job, { deduplicated });
 }
 

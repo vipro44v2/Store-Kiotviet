@@ -15,10 +15,30 @@ beforeEach(() => {
 });
 it("fails reconciliation on read-back errors while continuing other products and pages", async () => {
   mocks.sync.mockRejectedValueOnce(new Error("Inventory verification failed")).mockResolvedValueOnce(undefined);
-  await expect(reconcileInventoryPage(0, "job-1")).rejects.toThrow("1146 (branch 10): Inventory verification failed");
+  await expect(reconcileInventoryPage(0, "job-1", "chain-1")).rejects.toThrow("1146 (branch 10): Inventory verification failed");
   expect(mocks.sync).toHaveBeenCalledTimes(2);
   expect(mocks.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO sync_conflicts"), ["1146", expect.stringContaining("Inventory verification failed")]);
-  expect(mocks.enqueue).toHaveBeenCalledWith("reconciliation", "inventory_reconciliation", { currentItem: 2 }, "low", "inventory-reconciliation-2");
+  expect(mocks.enqueue).toHaveBeenCalledWith("reconciliation", "inventory_reconciliation", { currentItem: 2, reconciliationChainId: "chain-1" }, "low", "inventory-reconciliation-chain-1-2");
+});
+
+it("uses distinct page IDs for successive scans and stable IDs for retries", async () => {
+  await reconcileInventoryPage(0, "job-1", "chain-1");
+  await reconcileInventoryPage(0, "job-1", "chain-1");
+  await reconcileInventoryPage(0, "job-2", "chain-2");
+  expect(mocks.enqueue.mock.calls.map(call => call[4])).toEqual([
+    "inventory-reconciliation-chain-1-2", "inventory-reconciliation-chain-1-2", "inventory-reconciliation-chain-2-2",
+  ]);
+});
+
+it("finishes the last page without enqueueing", async () => {
+  await reconcileInventoryPage(2, "job-1", "chain-1");
+  expect(mocks.enqueue).not.toHaveBeenCalled();
+});
+
+it("rejects non-progressing pagination", async () => {
+  mocks.inventory.mockResolvedValue({ data: [], pageSize: 0, total: 4 });
+  await expect(reconcileInventoryPage()).rejects.toBeInstanceOf(RetryableError);
+  expect(mocks.enqueue).not.toHaveBeenCalled();
 });
 it("completes when all inventory notifications are verified", async () => {
   mocks.sync.mockResolvedValue(undefined);

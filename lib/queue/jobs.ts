@@ -27,6 +27,7 @@ export interface SyncJobPayload {
   eventId?: string;
   entityId?: string;
   sku?: string;
+  reconciliationChainId?: string;
   [key: string]: unknown;
 }
 

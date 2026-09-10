@@ -48,6 +48,13 @@ beforeEach(() => {
 });
 
 describe("syncInventoryNotification", () => {
+  it("does not mutate inventory when available already equals expected, and retains readback", async () => {
+    mocks.query.mockResolvedValueOnce([{ shopify_location_id: "location-1", safety_stock: "1" }]).mockResolvedValueOnce([]);
+    mocks.getInventory.mockResolvedValue(9);
+    await syncInventoryNotification(notification);
+    expect(mocks.setInventory).not.toHaveBeenCalled();
+    expect(mocks.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO inventory_snapshots"), ["SKU-1", 10, "location-1", 10, 9, 9, 0]);
+  });
   it("uses an existing mapping", async () => {
     mocks.query
       .mockResolvedValueOnce([

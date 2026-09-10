@@ -1,8 +1,9 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHmac } from "node:crypto";
 const store = vi.fn(),
-  enqueue = vi.fn();
-vi.mock("@/repositories/webhooks", () => ({ webhooksRepository: { store } }));
+  enqueue = vi.fn(), markProcessed = vi.fn(), log = vi.fn();
+vi.mock("@/repositories/webhooks", () => ({ webhooksRepository: { store, markProcessed } }));
+vi.mock("@/lib/logger", () => ({ log }));
 vi.mock("@/lib/queue/queues", () => ({ enqueueJob: enqueue }));
 beforeAll(() => {
   process.env.SHOPIFY_CLIENT_SECRET = "shopify-secret";
@@ -14,6 +15,23 @@ beforeEach(() => {
   enqueue.mockReset();
 });
 describe("webhook ingress", () => {
+  it.each([true, false])("stores inventory webhooks without jobs (inserted=%s), including route fallback", async (inserted) => {
+    store.mockResolvedValueOnce({ id: "inventory-event", inserted });
+    const body = JSON.stringify({ inventory_item_id: 123, available: 10 });
+    const { receiveShopifyWebhook, SHOPIFY_TOPICS } = await import("@/lib/shopify/webhooks");
+    const result = await receiveShopifyWebhook(new Request("https://sync.example.com", {
+      method: "POST", body,
+      headers: {
+        "x-shopify-hmac-sha256": createHmac("sha256", "shopify-secret").update(body).digest("base64"),
+        "x-shopify-webhook-id": "inventory-delivery",
+      },
+    }), "inventory_levels_update");
+    expect(result).toEqual({ status: 200, body: { success: true, duplicate: !inserted } });
+    expect(SHOPIFY_TOPICS).toContain("inventory_levels/update");
+    expect(store).toHaveBeenCalledWith("shopify", "inventory-delivery", "inventory_levels/update", JSON.parse(body), expect.any(Object), "");
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith("info", expect.any(String), expect.objectContaining({ action: "inventory_webhook_ignored", reason: "scheduled_reconciliation_only" }));
+  });
   it("persists and queues a verified Shopify event", async () => {
     store.mockResolvedValueOnce({
       id: "event-1",

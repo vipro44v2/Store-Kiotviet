@@ -3,9 +3,16 @@ import { syncInventoryNotification } from "./inventory-sync";
 import { enqueueJob } from "@/lib/queue/queues";
 import { query } from "@/lib/db/client";
 import { ConflictError, MappingError, PermanentError, RetryableError, ValidationError } from "@/lib/errors";
+import { randomUUID } from "node:crypto";
 
-export async function reconcileInventoryPage(currentItem = 0, jobId?: string) {
+export async function reconcileInventoryPage(currentItem = 0, jobId?: string, reconciliationChainId: string = randomUUID()) {
+  if (!Number.isSafeInteger(currentItem) || currentItem < 0)
+    throw new ValidationError("Invalid inventory reconciliation offset");
   const page = await getKiotVietInventory(currentItem, 100);
+  if (!Number.isSafeInteger(page.pageSize) || page.pageSize <= 0 ||
+      !Number.isSafeInteger(page.total) || page.total < 0 ||
+      (currentItem < page.total && page.data.length === 0))
+    throw new RetryableError("Inventory reconciliation pagination made no progress");
   const errors: string[] = [];
   let hasRetryableFailure = false;
   for (const product of page.data) {
@@ -30,7 +37,7 @@ export async function reconcileInventoryPage(currentItem = 0, jobId?: string) {
   }
   const next = currentItem + page.pageSize;
   if (next < page.total)
-    await enqueueJob("reconciliation", "inventory_reconciliation", { currentItem: next }, "low", `inventory-reconciliation-${next}`);
+    await enqueueJob("reconciliation", "inventory_reconciliation", { currentItem: next, reconciliationChainId }, "low", `inventory-reconciliation-${reconciliationChainId}-${next}`);
   // Keep processing other products/pages, but let the worker fail this audit job.
   if (errors.length) {
     const message = `Inventory reconciliation failed: ${errors.join("; ")}`;

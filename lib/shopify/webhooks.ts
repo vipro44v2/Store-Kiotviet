@@ -4,7 +4,8 @@ import { sanitizeForLog } from "@/lib/security/sanitize";
 import { webhooksRepository } from "@/repositories/webhooks";
 import { enqueueJob } from "@/lib/queue/queues";
 import type { JobType } from "@/lib/queue/jobs";
-const topicJobs: Record<string, JobType> = {
+import { log } from "@/lib/logger";
+const topicJobs: Record<string, JobType | null> = {
   "orders/create": "shopify_order_create",
   "orders/updated": "shopify_order_update",
   "orders/cancelled": "shopify_order_cancel",
@@ -14,7 +15,7 @@ const topicJobs: Record<string, JobType> = {
   "products/create": "shopify_product_to_kiotviet",
   "products/update": "shopify_product_to_kiotviet",
   "products/delete": "shopify_product_to_kiotviet",
-  "inventory_levels/update": "inventory_reconciliation",
+  "inventory_levels/update": null,
   "customers/create": "shopify_customer_to_kiotviet",
   "customers/update": "shopify_customer_to_kiotviet",
   "app/uninstalled": "webhook_recovery",
@@ -45,7 +46,9 @@ export async function receiveShopifyWebhook(
     };
   }
   const topic =
-    request.headers.get("x-shopify-topic") || routeTopic.replaceAll("_", "/");
+    request.headers.get("x-shopify-topic") ||
+    Object.keys(topicJobs).find((value) => value.replaceAll("/", "_") === routeTopic) ||
+    routeTopic.replaceAll("_", "/");
   const webhookId = request.headers.get("x-shopify-webhook-id");
   if (!webhookId)
     return {
@@ -64,6 +67,14 @@ export async function receiveShopifyWebhook(
     String((payload as Record<string, unknown>).id ?? ""),
   );
   const jobType = topicJobs[topic];
+  if (topic === "inventory_levels/update") {
+    await log("info", "Shopify inventory webhook stored without reconciliation", {
+      action: "inventory_webhook_ignored",
+      reason: "scheduled_reconciliation_only",
+      webhookId, eventId: stored.id, duplicate: !stored.inserted,
+    });
+    await webhooksRepository.markProcessed(stored.id);
+  }
   if (stored.inserted && jobType)
     await enqueueJob(
       "webhooks",

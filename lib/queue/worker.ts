@@ -37,6 +37,9 @@ import {
 } from "@/lib/sync/return-sync";
 import { syncKiotVietCategoryToShopify } from "@/lib/sync/category-sync";
 import { normalizeSku } from "@/lib/sync/mappings";
+import { admitInventoryReconciliation } from "@/repositories/inventory-reconciliation";
+import { getEnv } from "@/lib/env";
+import { log } from "@/lib/logger";
 
 function recordPayload(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object")
@@ -261,12 +264,33 @@ export async function processSyncJob(job: Job<SyncJobPayload>) {
       await syncKiotVietReturn(Number(job.data.returnId));
       break;
     case "inventory_reconciliation":
-    case "full_inventory_sync":
+    case "full_inventory_sync": {
+      // Drain jobs created by the old webhook mapping without starting a scan.
+      if (job.data.eventId) {
+        await log("info", "Webhook reconciliation job ignored", {
+          action: "inventory_webhook_ignored", reason: "scheduled_reconciliation_only",
+          eventId: job.data.eventId,
+        });
+        break;
+      }
+      const admission = await admitInventoryReconciliation(
+        job.name, job.data, "low", getEnv().JOB_MAX_ATTEMPTS,
+        typeof job.data.auditJobId === "string" ? job.data.auditJobId : undefined,
+      );
+      if (admission.deduplicated) {
+        await log("info", "Inventory reconciliation already pending or processing", {
+          action: "inventory_reconciliation_ignored", reason: "chain_already_active",
+          jobId: job.data.auditJobId,
+        });
+        break;
+      }
       await reconcileInventoryPage(
         Number(job.data.currentItem ?? 0),
         String(job.data.auditJobId),
+        admission.payload.reconciliationChainId,
       );
       break;
+    }
     case "cleanup_old_data":
       await cleanupOldData();
       break;

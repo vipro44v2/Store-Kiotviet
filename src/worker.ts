@@ -30,6 +30,9 @@ const workers = QUEUE_NAMES.map(
           }
           await job.updateData({...job.data,auditJobId:auditId});
         }
+        // Scheduler jobs may have fewer attempts than the enqueueJob default.
+        if (job.name === "inventory_reconciliation" || job.name === "full_inventory_sync")
+          await query("UPDATE sync_jobs SET max_attempts=$2 WHERE id=$1", [auditId, job.opts.attempts ?? 1]);
         await jobsRepository.start(auditId, job.attemptsMade + 1);
         try {
           const result = await processSyncJob(job);
