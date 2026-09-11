@@ -1,6 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { DraftCategorySetting } from "./draft-category-setting";
 export function SettingsEditor({
   settings,
 }: {
@@ -9,7 +10,8 @@ export function SettingsEditor({
   const router = useRouter();
   return (
     <div className="settings-grid">
-      {settings.map((setting) => (
+      <DraftCategorySetting initial={(settings.find((setting) => setting.key === "draft_product_categories")?.value.categoryIds as number[]) ?? []} />
+      {settings.filter((setting) => setting.key !== "draft_product_categories").map((setting) => (
         <Setting
           key={setting.key}
           name={setting.key}

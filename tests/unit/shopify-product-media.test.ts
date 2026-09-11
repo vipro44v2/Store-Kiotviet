@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+vi.mock("@/repositories/settings", () => ({ settingsRepository: { get: vi.fn().mockResolvedValue(undefined) } }));
 
 const graphql = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/shopify/graphql", () => ({ shopifyGraphql: graphql }));
@@ -17,6 +18,7 @@ import type { KiotVietProduct } from "@/lib/kiotviet/types";
 import type { MappingRecord } from "@/repositories/mappings";
 import { syncKiotVietProductToShopify } from "@/lib/sync/kiotviet-product-sync";
 import { RetryableError } from "@/lib/errors";
+import { settingsRepository } from "@/repositories/settings";
 
 const a = "https://kiotviet.example/a.jpg";
 const b = "https://kiotviet.example/b.jpg";
@@ -40,6 +42,7 @@ let updatedPrice: string;
 const calls = (name: string) => graphql.mock.calls.filter(([query]) => query.includes(`mutation ${name}(`));
 
 beforeEach(() => {
+  vi.mocked(settingsRepository.get).mockResolvedValue(undefined);
   graphql.mockReset();
   Object.values(syncMocks).forEach((mock) => mock.mockReset());
   persisted = [];
@@ -138,6 +141,50 @@ function variantFamily() {
 }
 
 describe("product media reconciliation", () => {
+  it("creates DRAFT products and updates status when categories or rules change", async () => {
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: [10] });
+    const source = { ...product, categoryId: 10, categoryName: "Testing", inventories: [{ branchId: 1, branchName: "Main", onHand: 5 }] };
+    syncMocks.getProduct.mockResolvedValue(source);
+    syncMocks.getFamily.mockImplementation(async () => [source]);
+    await syncKiotVietProductToShopify(1);
+    expect(calls("CreateProduct")[0][1].product.status).toBe("DRAFT");
+    expect(calls("UpdateProduct").at(-1)![1].product.status).toBe("DRAFT");
+    source.categoryId = 20;
+    await expect(syncKiotVietProductToShopify(1)).resolves.toMatchObject({ updated: true });
+    expect(calls("UpdateProduct").at(-1)![1].product.status).toBe("ACTIVE");
+    source.categoryId = 10;
+    await expect(syncKiotVietProductToShopify(1)).resolves.toMatchObject({ updated: true });
+    expect(calls("UpdateProduct").at(-1)![1].product.status).toBe("DRAFT");
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: [] });
+    await expect(syncKiotVietProductToShopify(1)).resolves.toMatchObject({ updated: true });
+    expect(calls("UpdateProduct").at(-1)![1].product.status).toBe("ACTIVE");
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: [10] });
+    await syncKiotVietProductToShopify(1);
+    expect(calls("UpdateProduct").at(-1)![1].product.status).toBe("DRAFT");
+    await expect(syncKiotVietProductToShopify(1)).resolves.toMatchObject({ reason: "unchanged" });
+    expect(updatedTitle).toBe(source.name);
+  });
+
+  it("uses a matching sibling for new and existing variant families", async () => {
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: [10] });
+    const family = variantFamily();
+    Object.assign(family[1], { categoryId: 10 });
+    await syncKiotVietProductToShopify(1);
+    expect(calls("SetVariantProduct").at(-1)![1].input.status).toBe("DRAFT");
+    Object.assign(family[1], { categoryId: 20 });
+    await syncKiotVietProductToShopify(1);
+    expect(calls("SetVariantProduct").at(-1)![1].input.status).toBe("ACTIVE");
+    Object.assign(family[1], { categoryId: 10 });
+    await syncKiotVietProductToShopify(1);
+    expect(calls("SetVariantProduct").at(-1)![1].input.status).toBe("DRAFT");
+  });
+
+  it("applies the rule when collapsing a family", async () => {
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: [10] });
+    await collapseShopifyVariantGroup({ ...product, categoryId: 10 }, "p1");
+    expect(calls("CollapseVariantProduct")[0][1].input.status).toBe("DRAFT");
+    expect(calls("UpdateProduct")[0][1].product.status).toBe("DRAFT");
+  });
   it("creates a family once, checkpoints all identities before media, and resumes READY media", async () => {
     variantFamily();
     vi.useFakeTimers();

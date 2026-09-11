@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { settingsRepository } from "@/repositories/settings";
+vi.mock("@/repositories/settings", () => ({ settingsRepository: { get: vi.fn().mockResolvedValue(undefined) } }));
 
 const mocks = vi.hoisted(() => ({
   query: vi.fn(),
@@ -42,6 +44,7 @@ beforeEach(() => {
 
 describe("KiotViet product deletion", () => {
   it("archives a normal mapped Shopify product", async () => {
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: [10] });
     mocks.query
       .mockResolvedValueOnce([
         {

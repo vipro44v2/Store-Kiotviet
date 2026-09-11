@@ -21,6 +21,7 @@ import { query } from "@/lib/db/client";
 import { log } from "@/lib/logger";
 import type { KiotVietProduct } from "@/lib/kiotviet/types";
 import { ApiError, MappingError, RetryableError } from "@/lib/errors";
+import { getDraftCategoryIds } from "./product-status";
 
 function productState(product: KiotVietProduct) {
   return {
@@ -28,6 +29,7 @@ function productState(product: KiotVietProduct) {
     code: product.code,
     name: product.name,
     description: product.description ?? "",
+    categoryId: product.categoryId ?? null,
     categoryName: product.categoryName ?? "",
     basePrice: product.basePrice ?? 0,
     barCode: product.barCode ?? "",
@@ -159,11 +161,7 @@ async function syncVariantFamily(
     throw new MappingError(
       `Multiple KiotViet products in the variant family use SKU ${duplicateSku}`,
     );
-  const hash = syncHash(
-    products
-      .map(productState)
-      .sort((left, right) => left.code.localeCompare(right.code)),
-  );
+  const hash = await productSyncHash(products);
   const mappingsByProduct = await Promise.all(
     mappingProducts.map(async (product) => ({
       product,
@@ -342,11 +340,7 @@ export async function syncDeletedKiotVietProducts(
       continue;
     }
 
-    const hash = syncHash(
-      remaining
-        .map(productState)
-        .sort((left, right) => left.code.localeCompare(right.code)),
-    );
+    const hash = await productSyncHash(remaining);
     if (remaining.length === 1) {
       const saved = await collapseShopifyVariantGroup(
         remaining[0],
@@ -418,7 +412,7 @@ export async function syncKiotVietProductToShopify(
     return result;
   }
 
-  const hash = syncHash(productState(product));
+  const hash = await productSyncHash([product]);
   const mappings = await mappingsRepository.findBySku(sku);
   if (
     mappings.some(
@@ -466,4 +460,11 @@ export async function syncKiotVietProductToShopify(
     jobId,
   });
   return { sku, updated: true };
+}
+
+export async function productSyncHash(products: KiotVietProduct[]) {
+  return syncHash({
+    products: products.map(productState).sort((a, b) => a.code.localeCompare(b.code)),
+    draftCategoryIds: await getDraftCategoryIds(),
+  });
 }

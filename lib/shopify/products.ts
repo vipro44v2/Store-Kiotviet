@@ -1,4 +1,5 @@
 import { syncShopifyProductMedia } from "./product-media";
+import { resolveProductStatus } from "@/lib/sync/product-status";
 import { syncHash } from "@/lib/sync/hashes";
 import { shopifyGraphql } from "./graphql";
 import type { ShopifyVariant } from "@/types/shopify";
@@ -59,16 +60,13 @@ async function cleanupUncheckpointedProduct(productId: string, error: unknown): 
   }
   throw error;
 }
-function productInput(product: KiotVietProduct) {
+async function productInput(product: KiotVietProduct, family = [product]) {
   return {
     title: product.name,
     descriptionHtml: product.description ?? "",
     productType: product.categoryName ?? "",
     vendor: "KiotViet",
-    status:
-      product.isActive === false || product.allowsSale === false
-        ? "DRAFT"
-        : "ACTIVE",
+    status: await resolveProductStatus(family),
   };
 }
 export function inventoryItemInput(product: KiotVietProduct) {
@@ -92,7 +90,7 @@ export async function createShopifyProduct(
     };
   }>(
     `mutation CreateProduct($product:ProductCreateInput!,$media:[CreateMediaInput!]){productCreate(product:$product,media:$media){product{id variants(first:1){nodes{id sku barcode product{id title} inventoryItem{id tracked}}}} userErrors{message}}}`,
-    { product: productInput(product), media: [] },
+    { product: await productInput(product), media: [] },
   );
   if (created.productCreate.userErrors.length || !created.productCreate.product)
     throw new Error(
@@ -130,7 +128,7 @@ export async function updateShopifyProduct(
     };
   }>(
     `mutation UpdateProduct($product:ProductUpdateInput!,$media:[CreateMediaInput!]){productUpdate(product:$product,media:$media){product{id} userErrors{message}}}`,
-    { product: { id: variant.product.id, ...productInput(product) }, media: [] },
+    { product: { id: variant.product.id, ...await productInput(product) }, media: [] },
   );
   if (updated.productUpdate.userErrors.length)
     throw new Error(
@@ -269,7 +267,8 @@ export async function setShopifyVariantGroup(
     ]),
   );
   const group = variantGroupInput(products, existingBySku);
-  const fieldsHash = syncHash({ ...productInput(primary), ...variantGroupInput(products) });
+  const input = await productInput(primary, products);
+  const fieldsHash = syncHash({ ...input, ...variantGroupInput(products) });
   if (options.resumeFields && existingProductId && existing?.product?.metafield?.value === fieldsHash &&
     existing.product.variants.nodes.length === products.length &&
     products.every((product) => existingBySku.has(product.code.trim().toUpperCase()))) {
@@ -292,7 +291,7 @@ export async function setShopifyVariantGroup(
     {
       identifier: existingProductId ? { id: existingProductId } : null,
       input: {
-        ...productInput(primary),
+        ...input,
         productOptions: group.productOptions,
         variants: group.variants,
       },
@@ -355,7 +354,7 @@ export async function collapseShopifyVariantGroup(
     `mutation CollapseVariantProduct($identifier:ProductSetIdentifiers!,$input:ProductSetInput!){productSet(identifier:$identifier,input:$input,synchronous:true){product{id title variants(first:1){nodes{id sku barcode price product{id title} inventoryItem{id tracked}}}} userErrors{message}}}`,
     {
       identifier: { id: productId },
-      input: { ...productInput(product), productOptions: [], variants: [] },
+      input: { ...await productInput(product), productOptions: [], variants: [] },
     },
   );
   const errors = result.productSet.userErrors;

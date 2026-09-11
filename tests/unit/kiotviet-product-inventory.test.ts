@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+vi.mock("@/repositories/settings", () => ({ settingsRepository: { get: vi.fn().mockResolvedValue(undefined) } }));
 import type { KiotVietProduct } from "@/lib/kiotviet/types";
 
 const mocks = vi.hoisted(() => ({

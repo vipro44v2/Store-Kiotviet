@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { settingsRepository } from "@/repositories/settings";
+vi.mock("@/repositories/settings", () => ({ settingsRepository: { get: vi.fn().mockResolvedValue(undefined) } }));
 
 const mocks = vi.hoisted(() => ({
   getProduct: vi.fn(),
@@ -48,6 +50,7 @@ import {
 describe("stale Shopify product mapping recovery", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(settingsRepository.get).mockResolvedValue(undefined);
     const product = { id: 501, code: "SKU-1", name: "Product", inventories: [{ branchId: 10, branchName: "Main", onHand: 5 }] };
     mocks.getProduct.mockResolvedValue(product);
     mocks.getFamily.mockResolvedValue([product]);
@@ -133,14 +136,18 @@ describe("stale Shopify product mapping recovery", () => {
   });
 
   it("does not create or normally update an inactive simple product", async () => {
-    const inactive = { id: 501, code: "SKU-1", name: "Inactive", isActive: false, inventories: [] };
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: [10] });
+    const inactive = { id: 501, code: "SKU-1", name: "Inactive", categoryId: 10, isActive: false, inventories: [] };
     mocks.getProduct.mockResolvedValue(inactive);
     mocks.getFamily.mockResolvedValue([inactive]);
-    mocks.query.mockResolvedValue([]);
+    mocks.query.mockResolvedValue([]).mockResolvedValueOnce([{
+      shopify_product_id: "p1", kiotviet_product_id: "501", sync_status: "synced",
+    }]);
     await expect(syncKiotVietProductToShopify(501)).resolves.toMatchObject({ reason: "inactive" });
     expect(mocks.createProduct).not.toHaveBeenCalled();
     expect(mocks.updateProduct).not.toHaveBeenCalled();
     expect(mocks.setGroup).not.toHaveBeenCalled();
+    expect(mocks.archiveProduct).toHaveBeenCalledWith("p1");
   });
 
   it("does not create or normally update an unsaleable simple product", async () => {
