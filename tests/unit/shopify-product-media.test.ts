@@ -16,7 +16,8 @@ import { getShopifyProductMedia, normalizeKiotVietMedia, syncShopifyProductMedia
 import { collapseShopifyVariantGroup, createShopifyProduct, setShopifyVariantGroup, updateShopifyProduct } from "@/lib/shopify/products";
 import type { KiotVietProduct } from "@/lib/kiotviet/types";
 import type { MappingRecord } from "@/repositories/mappings";
-import { syncKiotVietProductToShopify } from "@/lib/sync/kiotviet-product-sync";
+import { productSyncHash, syncKiotVietProductToShopify } from "@/lib/sync/kiotviet-product-sync";
+import { log } from "@/lib/logger";
 import { RetryableError } from "@/lib/errors";
 import { settingsRepository } from "@/repositories/settings";
 
@@ -141,6 +142,48 @@ function variantFamily() {
 }
 
 describe("product media reconciliation", () => {
+  it.each([false, true])("skips unrelated rule changes for a product (draft=%s)", async (draft) => {
+    const source = { ...product, categoryId: 10, inventories: [{ branchId: 1, branchName: "Main", onHand: 5 }] };
+    syncMocks.getProduct.mockResolvedValue(source);
+    syncMocks.getFamily.mockResolvedValue([source]);
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: draft ? [10] : [] });
+    const before = await productSyncHash([source]);
+    vi.mocked(settingsRepository.get).mockClear();
+    vi.mocked(log).mockClear();
+    await syncKiotVietProductToShopify(1);
+    expect(settingsRepository.get).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(log).mock.calls.filter((call) => call[2]?.action === "shopify_product_status_resolved")).toHaveLength(1);
+    const updates = calls("UpdateProduct").length;
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: draft ? [10, 20] : [20] });
+    expect(await productSyncHash([source])).toBe(before);
+    await expect(syncKiotVietProductToShopify(1)).resolves.toMatchObject({ reason: "unchanged" });
+    expect(calls("UpdateProduct")).toHaveLength(updates);
+  });
+
+  it.each([false, true])("keeps family hashes stable for unrelated rules (draft=%s)", async (draft) => {
+    const family = variantFamily();
+    Object.assign(family[1], { categoryId: 10 });
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: draft ? [10] : [] });
+    const before = await productSyncHash(family);
+    vi.mocked(settingsRepository.get).mockClear();
+    vi.mocked(log).mockClear();
+    await syncKiotVietProductToShopify(1);
+    expect(settingsRepository.get).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(log).mock.calls.filter((call) => call[2]?.action === "shopify_product_status_resolved")).toHaveLength(1);
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: draft ? [10, 20] : [20] });
+    expect(await productSyncHash(family)).toBe(before);
+    await expect(syncKiotVietProductToShopify(1)).resolves.toMatchObject({ reason: "unchanged" });
+    expect(calls("SetVariantProduct")).toHaveLength(1);
+  });
+
+  it("changes the hash for category moves using the same status as Shopify", async () => {
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: [10] });
+    const normal = await productSyncHash([{ ...product, categoryId: 20 }]);
+    const draft = await productSyncHash([{ ...product, categoryId: 10 }]);
+    expect(draft).not.toBe(normal);
+    expect(await productSyncHash([{ ...product, categoryId: 20 }])).toBe(normal);
+  });
+
   it("creates DRAFT products and updates status when categories or rules change", async () => {
     vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: [10] });
     const source = { ...product, categoryId: 10, categoryName: "Testing", inventories: [{ branchId: 1, branchName: "Main", onHand: 5 }] };

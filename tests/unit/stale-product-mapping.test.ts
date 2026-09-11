@@ -77,7 +77,7 @@ describe("stale Shopify product mapping recovery", () => {
 
   it("recreates a deleted Shopify product and updates the existing mapping", async () => {
     await expect(syncKiotVietProductToShopify(501)).resolves.toMatchObject({ updated: true });
-    expect(mocks.createProduct).toHaveBeenCalledWith(expect.objectContaining({ id: 501 }), expect.any(Function));
+    expect(mocks.createProduct).toHaveBeenCalledWith(expect.objectContaining({ id: 501 }), expect.any(Function), "ACTIVE");
     expect(mocks.upsert).toHaveBeenCalledWith(expect.objectContaining({
       kiotviet_product_id: "501",
       shopify_product_id: "gid://shopify/Product/new",
@@ -116,7 +116,7 @@ describe("stale Shopify product mapping recovery", () => {
       mocks.getProduct.mockResolvedValue({ ...original, images });
       mocks.query.mockClear();
       await expect(syncKiotVietProductToShopify(501)).resolves.toMatchObject({ updated: true });
-      expect(mocks.updateProduct).toHaveBeenLastCalledWith(expect.objectContaining({ images }), saved, true, expect.any(Function));
+      expect(mocks.updateProduct).toHaveBeenLastCalledWith(expect.objectContaining({ images }), saved, true, expect.any(Function), "ACTIVE");
       hashes.push(mocks.query.mock.calls.find(([sql]) => sql.includes("SET last_sync_hash"))![1][2]);
     }
     expect(new Set(hashes).size).toBe(4);
@@ -172,7 +172,7 @@ describe("stale Shopify product mapping recovery", () => {
       inventoryItem: { id: "inventory-live", tracked: true },
     });
     await expect(syncKiotVietProductToShopify(501)).resolves.toMatchObject({ updated: true });
-    expect(mocks.createProduct).toHaveBeenCalledWith(active, expect.any(Function));
+    expect(mocks.createProduct).toHaveBeenCalledWith(active, expect.any(Function), "ACTIVE");
     expect(mocks.archiveProduct).not.toHaveBeenCalled();
     expect(mocks.query).toHaveBeenCalledWith(
       expect.stringContaining("sync_status='archived'"),

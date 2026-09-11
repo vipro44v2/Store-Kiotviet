@@ -21,7 +21,7 @@ import { query } from "@/lib/db/client";
 import { log } from "@/lib/logger";
 import type { KiotVietProduct } from "@/lib/kiotviet/types";
 import { ApiError, MappingError, RetryableError } from "@/lib/errors";
-import { getDraftCategoryIds } from "./product-status";
+import { resolveProductStatus, type ProductStatus } from "./product-status";
 
 function productState(product: KiotVietProduct) {
   return {
@@ -161,7 +161,8 @@ async function syncVariantFamily(
     throw new MappingError(
       `Multiple KiotViet products in the variant family use SKU ${duplicateSku}`,
     );
-  const hash = await productSyncHash(products);
+  const status = await resolveProductStatus(products);
+  const hash = await productSyncHash(products, status);
   const mappingsByProduct = await Promise.all(
     mappingProducts.map(async (product) => ({
       product,
@@ -199,13 +200,14 @@ async function syncVariantFamily(
   }
   if (products.length === 1) {
     const saved = existingProductId
-      ? await collapseShopifyVariantGroup(products[0], existingProductId, (variant) => saveMapping(products[0], variant, null))
-      : await createShopifyProduct(products[0], (variant) => saveMapping(products[0], variant, null));
+      ? await collapseShopifyVariantGroup(products[0], existingProductId, (variant) => saveMapping(products[0], variant, null), status)
+      : await createShopifyProduct(products[0], (variant) => saveMapping(products[0], variant, null), status);
     await saveMapping(products[0], saved, hash);
     await syncInventory(products[0], jobId);
     return { sku: trigger.code, updated: true, variants: 1 };
   }
   const saved = await setShopifyVariantGroup(products, existingProductId, {
+    status,
     checkpoint: (group) => checkpointFamily(products, group),
     resumeFields: familyMappings.some((mapping) => mapping.sync_status === "mapped" && mapping.last_sync_hash === null),
   });
@@ -340,17 +342,20 @@ export async function syncDeletedKiotVietProducts(
       continue;
     }
 
-    const hash = await productSyncHash(remaining);
+    const status = await resolveProductStatus(remaining);
+    const hash = await productSyncHash(remaining, status);
     if (remaining.length === 1) {
       const saved = await collapseShopifyVariantGroup(
         remaining[0],
         shopifyProductId,
         (variant) => saveMapping(remaining[0], variant, null),
+        status,
       );
       await saveMapping(remaining[0], saved, hash);
       await syncInventory(remaining[0], jobId);
     } else {
       const saved = await setShopifyVariantGroup(remaining, shopifyProductId, {
+        status,
         checkpoint: (group) => checkpointFamily(remaining, group),
       });
       const savedBySku = new Map(
@@ -412,7 +417,8 @@ export async function syncKiotVietProductToShopify(
     return result;
   }
 
-  const hash = await productSyncHash([product]);
+  const status = await resolveProductStatus([product]);
+  const hash = await productSyncHash([product], status);
   const mappings = await mappingsRepository.findBySku(sku);
   if (
     mappings.some(
@@ -447,9 +453,9 @@ export async function syncKiotVietProductToShopify(
   }
   const saved = variant
     ? (await shopifyProductHasCustomOptions(variant.product.id))
-      ? await collapseShopifyVariantGroup(product, variant.product.id, (saved) => saveMapping(product, saved, null))
-      : await updateShopifyProduct(product, variant, true, (saved) => saveMapping(product, saved, null))
-    : await createShopifyProduct(product, (created) => saveMapping(product, created, null));
+      ? await collapseShopifyVariantGroup(product, variant.product.id, (saved) => saveMapping(product, saved, null), status)
+      : await updateShopifyProduct(product, variant, true, (saved) => saveMapping(product, saved, null), status)
+    : await createShopifyProduct(product, (created) => saveMapping(product, created, null), status);
   await saveMapping(product, saved, hash);
   await syncInventory(product, jobId);
   await log("info", "KiotViet product synchronized to Shopify", {
@@ -462,9 +468,9 @@ export async function syncKiotVietProductToShopify(
   return { sku, updated: true };
 }
 
-export async function productSyncHash(products: KiotVietProduct[]) {
+export async function productSyncHash(products: KiotVietProduct[], status?: ProductStatus) {
   return syncHash({
     products: products.map(productState).sort((a, b) => a.code.localeCompare(b.code)),
-    draftCategoryIds: await getDraftCategoryIds(),
+    resolvedStatus: status ?? await resolveProductStatus(products),
   });
 }

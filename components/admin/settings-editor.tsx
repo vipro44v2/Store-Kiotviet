@@ -2,15 +2,16 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { DraftCategorySetting } from "./draft-category-setting";
+import { parseDraftCategoryIds } from "@/lib/settings/draft-categories";
 export function SettingsEditor({
   settings,
 }: {
-  settings: Array<{ key: string; value: Record<string, unknown> }>;
+  settings: Array<{ key: string; value: unknown }>;
 }) {
   const router = useRouter();
   return (
     <div className="settings-grid">
-      <DraftCategorySetting initial={(settings.find((setting) => setting.key === "draft_product_categories")?.value.categoryIds as number[]) ?? []} />
+      <DraftCategorySetting initial={parseDraftCategoryIds(settings.find((setting) => setting.key === "draft_product_categories")?.value)} />
       {settings.filter((setting) => setting.key !== "draft_product_categories").map((setting) => (
         <Setting
           key={setting.key}
@@ -28,10 +29,10 @@ function Setting({
   onSaved,
 }: {
   name: string;
-  initial: Record<string, unknown>;
+  initial: unknown;
   onSaved: () => void;
 }) {
-  const [value, setValue] = useState(JSON.stringify(initial, null, 2)),
+  const [value, setValue] = useState(JSON.stringify(initial, null, 2) ?? "null"),
     [message, setMessage] = useState("");
   async function save() {
     let parsed: unknown;

@@ -123,6 +123,7 @@ describe("KiotViet product deletion", () => {
       expect.objectContaining({ id: 502 }),
       "gid://shopify/Product/1",
       expect.any(Function),
+      "ACTIVE",
     );
     expect(mocks.query.mock.calls.some(([sql]) =>
       String(sql).includes("kiotviet_product_id::text=ANY") &&

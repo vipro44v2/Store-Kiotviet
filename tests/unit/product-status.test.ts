@@ -23,3 +23,10 @@ it("uses normal status for missing categories and an empty configuration", async
   mocks.get.mockResolvedValue({ categoryIds: [10] });
   expect(await resolveProductStatus([{ ...product, categoryId: undefined }])).toBe("ACTIVE");
 });
+
+it("safely reads malformed and legacy stored settings during sync", async () => {
+  mocks.get.mockResolvedValue({ categoryIds: "10" });
+  expect(await resolveProductStatus([product])).toBe("ACTIVE");
+  mocks.get.mockResolvedValue({ categoryIds: [10, 10, -1, "20", null] });
+  expect(await resolveProductStatus([product])).toBe("DRAFT");
+});

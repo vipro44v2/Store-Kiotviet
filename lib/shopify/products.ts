@@ -1,5 +1,5 @@
 import { syncShopifyProductMedia } from "./product-media";
-import { resolveProductStatus } from "@/lib/sync/product-status";
+import { resolveProductStatus, type ProductStatus } from "@/lib/sync/product-status";
 import { syncHash } from "@/lib/sync/hashes";
 import { shopifyGraphql } from "./graphql";
 import type { ShopifyVariant } from "@/types/shopify";
@@ -60,13 +60,13 @@ async function cleanupUncheckpointedProduct(productId: string, error: unknown): 
   }
   throw error;
 }
-async function productInput(product: KiotVietProduct, family = [product]) {
+function productInput(product: KiotVietProduct, status: ProductStatus) {
   return {
     title: product.name,
     descriptionHtml: product.description ?? "",
     productType: product.categoryName ?? "",
     vendor: "KiotViet",
-    status: await resolveProductStatus(family),
+    status,
   };
 }
 export function inventoryItemInput(product: KiotVietProduct) {
@@ -82,7 +82,9 @@ export function inventoryItemInput(product: KiotVietProduct) {
 export async function createShopifyProduct(
   product: KiotVietProduct,
   checkpoint: (variant: ManagedVariant) => Promise<void>,
+  status?: ProductStatus,
 ): Promise<ManagedVariant> {
+  status ??= await resolveProductStatus([product]);
   const created = await shopifyGraphql<{
     productCreate: {
       product?: { id: string; variants: { nodes: ManagedVariant[] } };
@@ -90,7 +92,7 @@ export async function createShopifyProduct(
     };
   }>(
     `mutation CreateProduct($product:ProductCreateInput!,$media:[CreateMediaInput!]){productCreate(product:$product,media:$media){product{id variants(first:1){nodes{id sku barcode product{id title} inventoryItem{id tracked}}}} userErrors{message}}}`,
-    { product: await productInput(product), media: [] },
+    { product: productInput(product, status), media: [] },
   );
   if (created.productCreate.userErrors.length || !created.productCreate.product)
     throw new Error(
@@ -110,7 +112,7 @@ export async function createShopifyProduct(
     // safely rediscovered. Never roll back after the checkpoint succeeds.
     return cleanupUncheckpointedProduct(shopifyProduct.id, error);
   }
-  const saved = await updateShopifyProduct(product, variant, false);
+  const saved = await updateShopifyProduct(product, variant, false, undefined, status);
   await syncShopifyProductMedia(shopifyProduct.id, product);
   return saved;
 }
@@ -120,7 +122,9 @@ export async function updateShopifyProduct(
   variant: ShopifyVariant,
   syncMedia = true,
   checkpoint?: (variant: ManagedVariant) => Promise<void>,
+  status?: ProductStatus,
 ): Promise<ManagedVariant> {
+  status ??= await resolveProductStatus([product]);
   const updated = await shopifyGraphql<{
     productUpdate: {
       product?: { id: string };
@@ -128,7 +132,7 @@ export async function updateShopifyProduct(
     };
   }>(
     `mutation UpdateProduct($product:ProductUpdateInput!,$media:[CreateMediaInput!]){productUpdate(product:$product,media:$media){product{id} userErrors{message}}}`,
-    { product: { id: variant.product.id, ...await productInput(product) }, media: [] },
+    { product: { id: variant.product.id, ...productInput(product, status) }, media: [] },
   );
   if (updated.productUpdate.userErrors.length)
     throw new Error(
@@ -241,6 +245,7 @@ export async function setShopifyVariantGroup(
   options: {
     checkpoint?: (group: ManagedVariantGroup) => Promise<void>;
     resumeFields?: boolean;
+    status?: ProductStatus;
   } = {},
 ): Promise<ManagedVariantGroup> {
   if (!products.length)
@@ -267,7 +272,7 @@ export async function setShopifyVariantGroup(
     ]),
   );
   const group = variantGroupInput(products, existingBySku);
-  const input = await productInput(primary, products);
+  const input = productInput(primary, options.status ?? await resolveProductStatus(products));
   const fieldsHash = syncHash({ ...input, ...variantGroupInput(products) });
   if (options.resumeFields && existingProductId && existing?.product?.metafield?.value === fieldsHash &&
     existing.product.variants.nodes.length === products.length &&
@@ -340,7 +345,9 @@ export async function collapseShopifyVariantGroup(
   product: KiotVietProduct,
   productId: string,
   checkpoint?: (variant: ManagedVariant) => Promise<void>,
+  status?: ProductStatus,
 ): Promise<ManagedVariant> {
+  status ??= await resolveProductStatus([product]);
   const result = await shopifyGraphql<{
     productSet: {
       product?: {
@@ -354,7 +361,7 @@ export async function collapseShopifyVariantGroup(
     `mutation CollapseVariantProduct($identifier:ProductSetIdentifiers!,$input:ProductSetInput!){productSet(identifier:$identifier,input:$input,synchronous:true){product{id title variants(first:1){nodes{id sku barcode price product{id title} inventoryItem{id tracked}}}} userErrors{message}}}`,
     {
       identifier: { id: productId },
-      input: { ...await productInput(product), productOptions: [], variants: [] },
+      input: { ...productInput(product, status), productOptions: [], variants: [] },
     },
   );
   const errors = result.productSet.userErrors;
@@ -364,7 +371,7 @@ export async function collapseShopifyVariantGroup(
       errors.map((error) => error.message).join("; ") ||
         "Shopify did not collapse the variant product",
     );
-  return updateShopifyProduct(product, defaultVariant, true, checkpoint);
+  return updateShopifyProduct(product, defaultVariant, true, checkpoint, status);
 }
 
 export async function archiveShopifyProduct(productId: string) {
