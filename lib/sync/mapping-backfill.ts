@@ -53,6 +53,7 @@ export async function runMappingBackfill(options: { apply?: boolean } = {}): Pro
   const candidates = buildSkuMapping(shopify, kiotviet);
   const bySku = new Map<string, MappingRecord[]>();
   for (const mapping of existing) {
+    if (mapping.sync_status === "archived") continue;
     const key = normalizeSku(mapping.normalized_sku || mapping.sku);
     bySku.set(key, [...(bySku.get(key) ?? []), mapping]);
   }

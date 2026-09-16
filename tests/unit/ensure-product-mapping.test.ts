@@ -50,6 +50,20 @@ beforeEach(() => {
 });
 
 describe("ensureProductMapping", () => {
+  it("returns B's active order mapping even when A's history remains", async () => {
+    mocks.findBySku.mockResolvedValue([{ ...mapping, id: "history", kiotviet_product_id: "400", sync_status: "archived" }, mapping]);
+    await expect(ensureProductMapping("NU012")).resolves.toBe(mapping);
+    expect(mocks.getKiotViet).not.toHaveBeenCalled();
+  });
+
+  it("auto-maps a reused SKU without reconciling against archived rows", async () => {
+    const history = { ...mapping, id: "history", kiotviet_product_id: "400", sync_status: "archived" };
+    mocks.findBySku.mockResolvedValueOnce([history]).mockResolvedValueOnce([history, mapping]);
+    mocks.findShopify.mockResolvedValue([shopifyVariant("v1", "NU012")]);
+    mocks.getKiotViet.mockResolvedValue({ data: [{ id: 501, code: "NU012", name: "B" }], total: 1, pageSize: 100 });
+    await expect(ensureProductMapping("NU012")).resolves.toBe(mapping);
+    expect(mocks.upsert).toHaveBeenCalledWith(expect.objectContaining({ kiotviet_product_id: "501" }));
+  });
   it("returns a valid existing mapping without API lookup", async () => {
     mocks.findBySku.mockResolvedValue([mapping]);
 

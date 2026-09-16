@@ -35,7 +35,7 @@ export async function ensureProductMapping(
   const sku = normalizeSku(skuValue);
   if (!sku) throw new MappingError("Order line has an empty SKU");
 
-  const existing = await mappingsRepository.findBySku(sku);
+  const existing = (await mappingsRepository.findBySku(sku)).filter((mapping) => mapping.sync_status !== "archived");
   if (existing.length > 1)
     throw new MappingError(`Multiple product mappings exist for SKU ${sku}`);
   if (existing.length === 1) {
@@ -68,7 +68,7 @@ export async function ensureProductMapping(
     sync_direction: "kiotviet_to_shopify",
     sync_status: "mapped",
   });
-  const reconciled = await mappingsRepository.findBySku(sku);
+  const reconciled = (await mappingsRepository.findBySku(sku)).filter((mapping) => mapping.sync_status !== "archived");
   if (reconciled.length !== 1 || !reconciled[0].kiotviet_product_id)
     throw new MappingError(
       `Product mapping for SKU ${sku} could not be reconciled after concurrent auto-map`,

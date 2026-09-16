@@ -17,13 +17,19 @@ export function getShopifyVariants(after?: string) {
   );
 }
 export async function findShopifyVariantsBySku(sku: string) {
-  const data = await shopifyGraphql<{
-    productVariants: { nodes: ShopifyVariant[] };
-  }>(
-    `query BySku($query:String!){productVariants(first:10,query:$query){nodes{id sku barcode product{id title} inventoryItem{id tracked}}}}`,
-    { query: `sku:${sku}` },
-  );
-  return data.productVariants.nodes;
+  const variants: ShopifyVariant[] = [];
+  let after: string | undefined;
+  do {
+    const data = await shopifyGraphql<{
+      productVariants: { nodes: ShopifyVariant[]; pageInfo: { hasNextPage: boolean; endCursor?: string } };
+    }>(
+      `query BySku($query:String!,$after:String){productVariants(first:100,query:$query,after:$after){nodes{id sku barcode product{id title} inventoryItem{id tracked}} pageInfo{hasNextPage endCursor}}}`,
+      { query: `sku:${JSON.stringify(sku)}`, after: after ?? null },
+    );
+    variants.push(...data.productVariants.nodes);
+    after = data.productVariants.pageInfo?.hasNextPage ? data.productVariants.pageInfo.endCursor : undefined;
+  } while (after);
+  return variants;
 }
 
 export async function getShopifyVariant(
@@ -70,7 +76,7 @@ function productInput(product: KiotVietProduct, status: ProductStatus) {
   };
 }
 export function inventoryItemInput(product: KiotVietProduct) {
-  const weight = Number(product.weight);
+  const weight = Number(product.weight ?? 0);
   return {
     sku: product.code,
     tracked: true,

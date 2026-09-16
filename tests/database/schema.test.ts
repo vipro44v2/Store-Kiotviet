@@ -10,6 +10,13 @@ const categoryMigration = readFileSync(
   "utf8",
 );
 describe("database safety constraints", () => {
+  it("retains history and enforces one active SKU owner without deleting existing rows", () => {
+    const sql = readFileSync(path.join(process.cwd(), "database/migrations/005_active_sku_ownership.sql"), "utf8");
+    expect(sql).toMatch(/DROP INDEX product_mapping_unique_complete/);
+    expect(sql).toMatch(/CREATE UNIQUE INDEX product_mapping_unique_active\s+ON product_mappings\(normalized_sku\) WHERE sync_status <> 'archived'/);
+    expect(sql).toContain("RAISE EXCEPTION");
+    expect(sql).not.toMatch(/DELETE FROM|UPDATE product_mappings|DROP TABLE/i);
+  });
   it("deduplicates provider webhook IDs", () =>
     expect(migration).toMatch(/UNIQUE\(provider, webhook_id\)/));
   it("prevents duplicate Shopify orders", () =>

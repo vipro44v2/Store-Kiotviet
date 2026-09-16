@@ -13,10 +13,11 @@ vi.mock("@/lib/logger", () => ({ log: vi.fn() }));
 vi.mock("@/lib/sync/inventory-sync", () => ({ syncInventoryNotification: vi.fn() }));
 
 import { getShopifyProductMedia, normalizeKiotVietMedia, syncShopifyProductMedia } from "@/lib/shopify/product-media";
-import { collapseShopifyVariantGroup, createShopifyProduct, setShopifyVariantGroup, updateShopifyProduct } from "@/lib/shopify/products";
+import { collapseShopifyVariantGroup, createShopifyProduct, findShopifyVariantsBySku, setShopifyVariantGroup, updateShopifyProduct } from "@/lib/shopify/products";
 import type { KiotVietProduct } from "@/lib/kiotviet/types";
 import type { MappingRecord } from "@/repositories/mappings";
-import { productSyncHash, syncKiotVietProductToShopify } from "@/lib/sync/kiotviet-product-sync";
+import { productSyncHash, syncDeletedKiotVietProducts, syncKiotVietProductToShopify } from "@/lib/sync/kiotviet-product-sync";
+import { syncInventoryNotification } from "@/lib/sync/inventory-sync";
 import { log } from "@/lib/logger";
 import { RetryableError } from "@/lib/errors";
 import { settingsRepository } from "@/repositories/settings";
@@ -57,12 +58,19 @@ beforeEach(() => {
   syncMocks.getFamily.mockResolvedValue([source]);
   syncMocks.findBySku.mockImplementation(async (sku) => structuredClone(persisted.filter((item) => item.normalized_sku === sku)));
   syncMocks.upsert.mockImplementation(async (input, options) => {
-    const previous = persisted.find((item) => item.normalized_sku === input.normalized_sku);
-    persisted = persisted.filter((item) => item.normalized_sku !== input.normalized_sku);
-    persisted.push({ ...input, id: `mapping-${input.normalized_sku}`, sync_status: "mapped", last_sync_hash: options?.resetSyncHash ? null : previous?.last_sync_hash ?? null });
+    const previous = persisted.find((item) => item.normalized_sku === input.normalized_sku && item.sync_status !== "archived");
+    persisted = persisted.filter((item) => item.normalized_sku !== input.normalized_sku || item.sync_status === "archived");
+    persisted.push({ ...input, id: `mapping-${input.normalized_sku}-${input.kiotviet_product_id}`, sync_status: "mapped", last_sync_hash: options?.resetSyncHash ? null : previous?.last_sync_hash ?? null });
   });
   syncMocks.query.mockImplementation(async (_sql, values) => {
-    const mapping = persisted.find((item) => item.normalized_sku === values[0])!;
+    if (_sql.includes("FROM product_mappings WHERE kiotviet_product_id::text=$1"))
+      return structuredClone(persisted.filter((item) => item.kiotviet_product_id === values[0]));
+    if (_sql.includes("SET sync_status='archived'") && _sql.includes("WHERE shopify_product_id=$1")) {
+      persisted.filter((item) => item.shopify_product_id === values[0]).forEach((item) => { item.sync_status = "archived"; });
+      return [];
+    }
+    if (!_sql.includes("SET last_sync_hash")) return [];
+    const mapping = persisted.find((item) => item.normalized_sku === values[0] && item.sync_status !== "archived")!;
     mapping.last_sync_hash = values[2];
     mapping.sync_status = values[2] === null ? "mapped" : "synced";
     return [];
@@ -98,6 +106,8 @@ beforeEach(() => {
       updatedTitle = variables.product.title;
       return { productUpdate: { product: { id: "p1" }, userErrors: [] } };
     }
+    if (query.includes("mutation ArchiveSyncedProduct("))
+      return { productUpdate: { product: { id: "p1", status: "ARCHIVED" }, userErrors: [] } };
     if (query.includes("mutation UpdateVariant(")) {
       storedVariant = variant;
       updatedPrice = variables.variants[0].price;
@@ -142,6 +152,50 @@ function variantFamily() {
 }
 
 describe("product media reconciliation", () => {
+  it("includes duplicate SKU matches from later Shopify search pages", async () => {
+    graphql.mockResolvedValueOnce({ productVariants: { nodes: [variant], pageInfo: { hasNextPage: true, endCursor: "next" } } })
+      .mockResolvedValueOnce({ productVariants: { nodes: [{ ...variant, id: "duplicate" }], pageInfo: { hasNextPage: false } } });
+    await expect(findShopifyVariantsBySku("A")).resolves.toHaveLength(2);
+    expect(graphql.mock.calls[1][1]).toEqual({ query: 'sku:"A"', after: "next" });
+  });
+
+  it.each([false, true])("syncs A, archives it, and fully replaces its data with B while preserving history (draft=%s)", async (draft) => {
+    await syncKiotVietProductToShopify(1);
+    await syncDeletedKiotVietProducts([{ id: 1, code: "A" }]);
+    expect(calls("ArchiveSyncedProduct")).toHaveLength(1);
+    const history = structuredClone(persisted[0]);
+    expect(history.sync_status).toBe("archived");
+    // A historical inventory identity must never be used for B.
+    persisted[0].shopify_inventory_item_id = "stale-inventory";
+    history.shopify_inventory_item_id = "stale-inventory";
+    const next = { ...product, id: 2, name: "New B", description: "New description",
+      categoryId: 10, categoryName: "New category", basePrice: 250, barCode: "new-barcode",
+      images: draft ? [] : [c], inventories: [{ branchId: 1, branchName: "Main", onHand: 17 }] };
+    syncMocks.getProduct.mockResolvedValue(next);
+    syncMocks.getFamily.mockResolvedValue([next]);
+    vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: draft ? [10] : [] });
+    await expect(syncKiotVietProductToShopify(2)).resolves.toMatchObject({ updated: true });
+    expect(calls("CreateProduct")).toHaveLength(1);
+    expect(calls("UpdateProduct").at(-1)?.[1].product).toMatchObject({
+      id: "p1", title: "New B", descriptionHtml: "New description", productType: "New category",
+      status: draft ? "DRAFT" : "ACTIVE",
+    });
+    expect(calls("UpdateVariant").at(-1)?.[1].variants[0]).toMatchObject({ id: "v1", price: "250", barcode: "new-barcode",
+      inventoryItem: { measurement: { weight: { value: 0, unit: "GRAMS" } } },
+    });
+    expect(media).toHaveLength(draft ? 0 : 1);
+    if (!draft) expect(calls("CreateProductMedia").at(-1)?.[1].media[0].originalSource).toBe(c);
+    expect(persisted.find((item) => item.kiotviet_product_id === "1")).toEqual(history);
+    expect(persisted.find((item) => item.kiotviet_product_id === "2")).toMatchObject({
+      normalized_sku: "A", kiotviet_code: "A", sync_status: "synced", last_sync_hash: await productSyncHash([next]),
+      shopify_product_id: "p1", shopify_variant_id: "v1", shopify_inventory_item_id: "i1",
+    });
+    expect(syncInventoryNotification).toHaveBeenLastCalledWith(expect.objectContaining({ ProductId: 2, OnHand: 17 }), undefined);
+    await syncDeletedKiotVietProducts([{ id: 1, code: "A" }]);
+    expect(calls("ArchiveSyncedProduct")).toHaveLength(1);
+    expect(persisted.find((item) => item.kiotviet_product_id === "2")?.sync_status).toBe("synced");
+  });
+
   it.each([false, true])("skips unrelated rule changes for a product (draft=%s)", async (draft) => {
     const source = { ...product, categoryId: 10, inventories: [{ branchId: 1, branchName: "Main", onHand: 5 }] };
     syncMocks.getProduct.mockResolvedValue(source);

@@ -48,6 +48,24 @@ beforeEach(() => {
 });
 
 describe("syncInventoryNotification", () => {
+  it("uses the new owner's current inventory identity alongside archived history", async () => {
+    mocks.findBySku.mockResolvedValue([
+      { kiotviet_product_id: "99", sync_status: "archived", shopify_inventory_item_id: "stale" },
+      { kiotviet_product_id: "1", sync_status: "synced", shopify_inventory_item_id: "current" },
+    ]);
+    mocks.query.mockResolvedValueOnce([{ shopify_location_id: "location-1", safety_stock: "0" }]).mockResolvedValueOnce([]);
+    await syncInventoryNotification(notification);
+    expect(mocks.setInventory).toHaveBeenCalledWith("current", "location-1", 10, 3);
+  });
+
+  it("blocks delayed inventory from the old owner after a SKU is reclaimed", async () => {
+    mocks.findBySku.mockResolvedValue([
+      { kiotviet_product_id: "1", sync_status: "archived", shopify_inventory_item_id: "stale" },
+      { kiotviet_product_id: "2", sync_status: "synced", shopify_inventory_item_id: "current" },
+    ]);
+    await expect(syncInventoryNotification(notification)).rejects.toThrow("does not own SKU");
+    expect(mocks.setInventory).not.toHaveBeenCalled();
+  });
   it("does not mutate inventory when available already equals expected, and retains readback", async () => {
     mocks.query.mockResolvedValueOnce([{ shopify_location_id: "location-1", safety_stock: "1" }]).mockResolvedValueOnce([]);
     mocks.getInventory.mockResolvedValue(9);

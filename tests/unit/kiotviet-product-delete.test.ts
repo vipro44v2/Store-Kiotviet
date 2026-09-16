@@ -43,6 +43,30 @@ beforeEach(() => {
 });
 
 describe("KiotViet product deletion", () => {
+  it("never falls back to a reused SKU when a deleted ID has no mapping", async () => {
+    mocks.query.mockResolvedValue([]);
+    await syncDeletedKiotVietProducts([{ id: 999, code: "REUSED" }]);
+    expect(mocks.query).toHaveBeenCalledTimes(1);
+    expect(mocks.archive).not.toHaveBeenCalled();
+  });
+
+  it("requires an ID for code-only deletion when a SKU has been reused", async () => {
+    mocks.query.mockResolvedValue([
+      { shopify_product_id: "p1", kiotviet_product_id: "1", sync_status: "archived" },
+      { shopify_product_id: "p1", kiotviet_product_id: "2", sync_status: "synced" },
+    ]);
+    await expect(syncDeletedKiotVietProducts([{ code: "REUSED" }])).rejects.toThrow("product ID required");
+    expect(mocks.archive).not.toHaveBeenCalled();
+  });
+
+  it("ignores code-only deletion if all matching owners are already archived", async () => {
+    mocks.query.mockResolvedValue([
+      { shopify_product_id: "p1", kiotviet_product_id: "1", sync_status: "archived" },
+      { shopify_product_id: "p1", kiotviet_product_id: "2", sync_status: "archived" },
+    ]);
+    await syncDeletedKiotVietProducts([{ code: "REUSED" }]);
+    expect(mocks.archive).not.toHaveBeenCalled();
+  });
   it("archives a normal mapped Shopify product", async () => {
     vi.mocked(settingsRepository.get).mockResolvedValue({ categoryIds: [10] });
     mocks.query

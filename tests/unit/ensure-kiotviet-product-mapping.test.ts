@@ -36,6 +36,12 @@ beforeEach(() => {
 });
 
 describe("ensure KiotViet product mapping", () => {
+  it("ignores historical owners during creation and reconciliation", async () => {
+    const history = { ...mapping, id: "old", kiotviet_product_id: "400", sync_status: "archived" };
+    mocks.findBySku.mockReset().mockResolvedValueOnce([history]).mockResolvedValueOnce([history, mapping]);
+    mocks.findShopify.mockResolvedValue([variant("v1", "NU010")]);
+    await expect(ensureKiotVietProductMapping("501")).resolves.toMatchObject({ status: "mapped", mapping });
+  });
   it("creates an exact normalized SKU mapping", async () => {
     mocks.findShopify.mockResolvedValue([variant("fuzzy", "NU010-X"), variant("v1", "nu010")]);
     await expect(ensureKiotVietProductMapping("501")).resolves.toMatchObject({ status: "mapped", sku: "NU010" });

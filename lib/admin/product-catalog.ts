@@ -71,8 +71,8 @@ export async function getAdminProductCatalogPage(input: {
   const products: AdminProductDto[] = response.data.map((product) => {
     const candidates = mappingsBySku.get(normalizeSku(product.code)) ?? [];
     const exact = candidates.find(
-      (mapping) => mapping.kiotviet_product_id === String(product.id),
-    );
+      (mapping) => mapping.kiotviet_product_id === String(product.id) && mapping.sync_status !== "archived",
+    ) ?? candidates.find((mapping) => mapping.kiotviet_product_id === String(product.id));
     const mapping = exact ?? (candidates.length === 1 ? candidates[0] : undefined);
     const status = candidates.length > 1 && !exact
       ? "Stale mapping"

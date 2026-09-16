@@ -18,6 +18,11 @@ beforeEach(() => {
 });
 
 describe("mapping backfill", () => {
+  it("does not count archived SKU ownership as a backfill conflict", async () => {
+    mocks.listAll.mockResolvedValue([{ id: "old", sku: "NU010", normalized_sku: "NU010", shopify_product_id: "p1", shopify_variant_id: "v1", kiotviet_product_id: "400", sync_status: "archived" }]);
+    await expect(runMappingBackfill({ apply: true })).resolves.toMatchObject({ newMappings: 1, duplicateAmbiguous: 0, errors: [] });
+    expect(mocks.upsert).toHaveBeenCalledWith(expect.objectContaining({ kiotviet_product_id: "501" }));
+  });
   it("is a dry-run by default", async () => {
     await expect(runMappingBackfill()).resolves.toMatchObject({ dryRun: true, newMappings: 1 });
     expect(mocks.upsert).not.toHaveBeenCalled();

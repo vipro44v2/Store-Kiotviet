@@ -13,7 +13,7 @@ import {
   shopifyProductHasCustomOptions,
   updateShopifyProduct,
 } from "@/lib/shopify/products";
-import { mappingsRepository } from "@/repositories/mappings";
+import { mappingsRepository, type MappingRecord } from "@/repositories/mappings";
 import { normalizeSku } from "./mappings";
 import { syncHash } from "./hashes";
 import { syncInventoryNotification } from "./inventory-sync";
@@ -47,6 +47,65 @@ function isActiveSaleProduct(product: KiotVietProduct) {
     product.allowsSale !== false &&
     Boolean(normalizeSku(product.code))
   );
+}
+
+async function readProductMappings(product: KiotVietProduct, jobId?: string) {
+  const sku = normalizeSku(product.code);
+  const mappings = await mappingsRepository.findBySku(sku);
+  // An excluded family member is not claiming its SKU. Keep only its own active
+  // identity for family cleanup, since that SKU may already belong to a successor.
+  const activeMappings = mappings.filter((mapping) => mapping.sync_status !== "archived" &&
+    (isActiveSaleProduct(product) || mapping.kiotviet_product_id === String(product.id)));
+  const archivedMappings = mappings.filter((mapping) => mapping.sync_status === "archived");
+  if (activeMappings.some((mapping) => mapping.kiotviet_product_id &&
+    mapping.kiotviet_product_id !== String(product.id)))
+    throw new MappingError(`SKU ${sku} is mapped to another KiotViet product`);
+  if (activeMappings.length > 1)
+    throw new MappingError(`Multiple active product mappings exist for SKU ${sku}`);
+  // Once the new owner is checkpointed, normal retries do not repeat reuse logs.
+  const reclaiming = isActiveSaleProduct(product) && archivedMappings.length > 0 && !activeMappings.some(
+    (mapping) => mapping.kiotviet_product_id === String(product.id),
+  );
+  if (reclaiming)
+    await log("info", "Archived SKU mappings ignored for active ownership", {
+      action: "archived_sku_mapping_ignored", sku, newKiotVietProductId: String(product.id),
+      oldKiotVietProductIds: archivedMappings.map((mapping) => mapping.kiotviet_product_id), jobId,
+    });
+  return { product, activeMappings, archivedMappings, reclaiming };
+}
+
+async function findUniqueShopifyVariant(sku: string) {
+  const matches = (await findShopifyVariantsBySku(sku)).filter(
+    (match) => normalizeSku(match.sku) === normalizeSku(sku),
+  );
+  if (matches.length > 1)
+    throw new MappingError(`Multiple Shopify variants found for SKU ${normalizeSku(sku)}; manual review required`);
+  return matches[0];
+}
+
+async function logSkuReclaimed(
+  product: KiotVietProduct,
+  archivedMappings: MappingRecord[],
+  saved: { id: string; product: { id: string } },
+  jobId?: string,
+) {
+  for (const oldId of new Set(archivedMappings.map((mapping) => mapping.kiotviet_product_id)))
+    await log("info", "SKU reclaimed from an archived mapping", {
+      action: "sku_reclaimed", sku: normalizeSku(product.code),
+      oldKiotVietProductId: oldId, newKiotVietProductId: String(product.id),
+      shopifyProductId: saved.product.id, shopifyVariantId: saved.id, jobId,
+    });
+}
+
+async function assertReclaimableShopifyProduct(productId: string, products: KiotVietProduct[]) {
+  const otherOwners = await query<{ kiotviet_product_id: string | null }>(
+    `SELECT kiotviet_product_id FROM product_mappings
+     WHERE shopify_product_id=$1 AND sync_status<>'archived'
+       AND (kiotviet_product_id IS NULL OR NOT (kiotviet_product_id::text=ANY($2::text[])))`,
+    [productId, products.map((product) => String(product.id))],
+  );
+  if (otherOwners.length)
+    throw new MappingError(`Shopify product ${productId} has active mappings outside this KiotViet family; manual review required`);
 }
 
 export function shouldSkipUnchangedProduct(
@@ -83,7 +142,7 @@ async function saveMapping(
      SET last_sync_hash=$3,last_source='kiotviet',
        last_kiotviet_sync_at=now(),sync_status='synced',updated_at=now()
      WHERE normalized_sku=$1 AND kiotviet_product_id::text=$2
-       AND shopify_variant_id=$4`,
+       AND shopify_variant_id=$4 AND sync_status<>'archived'`,
     [sku, String(product.id), hash, saved.id],
   );
 }
@@ -164,35 +223,29 @@ async function syncVariantFamily(
   const status = await resolveProductStatus(products);
   const hash = await productSyncHash(products, status);
   const mappingsByProduct = await Promise.all(
-    mappingProducts.map(async (product) => ({
-      product,
-      mappings: await mappingsRepository.findBySku(normalizeSku(product.code)),
-    })),
+    mappingProducts.map((product) => readProductMappings(product, jobId)),
   );
-  for (const { product, mappings } of mappingsByProduct) {
-    const conflict = mappings.find(
-      (mapping) =>
-        mapping.kiotviet_product_id &&
-        mapping.kiotviet_product_id !== String(product.id),
-    );
-    if (conflict)
-      throw new MappingError(
-        `SKU ${normalizeSku(product.code)} is mapped to another KiotViet product`,
-      );
-  }
   const triggerMappings =
-    mappingsByProduct.find(({ product }) => product.id === trigger.id)?.mappings ?? [];
-  const familyMappings = mappingsByProduct.flatMap(({ mappings }) => mappings);
+    mappingsByProduct.find(({ product }) => product.id === trigger.id)?.activeMappings.filter(
+      (mapping) => mapping.kiotviet_product_id === String(trigger.id),
+    ) ?? [];
+  const familyMappings = mappingsByProduct.flatMap(({ activeMappings }) => activeMappings);
+  const skuMatches = await Promise.all(products.map((product) => findUniqueShopifyVariant(product.code)));
   const productIds = [
-    ...new Set(
-      familyMappings
+    ...new Set([
+      ...familyMappings
         .map((mapping) => mapping.shopify_product_id)
         .filter((id): id is string => Boolean(id)),
-    ),
+      ...skuMatches.flatMap((variant) => variant ? [variant.product.id] : []),
+    ]),
   ];
   const existingProductId = await resolveExistingFamilyShopifyProduct(productIds);
+  const reclaiming = mappingsByProduct.some((entry) => entry.reclaiming);
+  if (existingProductId && reclaiming)
+    await assertReclaimableShopifyProduct(existingProductId, mappingProducts);
   if (
     existingProductId &&
+    products.every((product) => familyMappings.some((mapping) => mapping.kiotviet_product_id === String(product.id))) &&
     shouldSkipUnchangedProduct(hash, triggerMappings, familyMappings)
   ) {
     for (const product of products) await syncInventory(product, jobId);
@@ -203,13 +256,15 @@ async function syncVariantFamily(
       ? await collapseShopifyVariantGroup(products[0], existingProductId, (variant) => saveMapping(products[0], variant, null), status)
       : await createShopifyProduct(products[0], (variant) => saveMapping(products[0], variant, null), status);
     await saveMapping(products[0], saved, hash);
+    const entry = mappingsByProduct.find(({ product }) => product.id === products[0].id);
+    if (entry?.reclaiming) await logSkuReclaimed(products[0], entry.archivedMappings, saved, jobId);
     await syncInventory(products[0], jobId);
     return { sku: trigger.code, updated: true, variants: 1 };
   }
   const saved = await setShopifyVariantGroup(products, existingProductId, {
     status,
     checkpoint: (group) => checkpointFamily(products, group),
-    resumeFields: familyMappings.some((mapping) => mapping.sync_status === "mapped" && mapping.last_sync_hash === null),
+    resumeFields: !reclaiming && familyMappings.some((mapping) => mapping.sync_status === "mapped" && mapping.last_sync_hash === null),
   });
   const savedBySku = new Map(
     saved.variants.map((variant) => [normalizeSku(variant.sku), variant]),
@@ -219,6 +274,8 @@ async function syncVariantFamily(
     if (!variant)
       throw new Error(`Shopify did not return variant ${product.code}`);
     await saveMapping(product, variant, hash);
+    const entry = mappingsByProduct.find((entry) => entry.product.id === product.id);
+    if (entry?.reclaiming) await logSkuReclaimed(product, entry.archivedMappings, variant, jobId);
     await syncInventory(product, jobId);
   }
   await log("info", "KiotViet variant family synchronized to Shopify", {
@@ -267,20 +324,23 @@ export async function syncDeletedKiotVietProducts(
         FROM product_mappings WHERE kiotviet_product_id::text=$1`,
         [String(productId)],
       );
-    if (!deletedMappings.length && normalizedCode)
+    // An ID-bearing old webhook must never fall back to a SKU now owned by B.
+    if (!productId && normalizedCode)
       deletedMappings = await query<DeletedMapping>(
         `SELECT shopify_product_id,kiotviet_product_id::text AS kiotviet_product_id,sync_status
         FROM product_mappings
         WHERE normalized_sku=$1 OR upper(trim(kiotviet_code))=$1`,
         [normalizedCode],
       );
+    if (deletedMappings.every((mapping) => mapping.sync_status === "archived")) continue;
     const matchedKiotVietIds = new Set(
       deletedMappings.map((mapping) => mapping.kiotviet_product_id).filter(Boolean),
     );
     if (!productId && matchedKiotVietIds.size > 1)
       throw new MappingError(
-        `Deleted KiotViet code ${code} matches multiple mapped KiotViet products`,
+        `Deleted KiotViet code ${code} matches multiple mapped KiotViet products; product ID required for manual review`,
       );
+    deletedMappings = deletedMappings.filter((mapping) => mapping.sync_status !== "archived");
     const productIds = [
       ...new Set(
         deletedMappings
@@ -294,8 +354,6 @@ export async function syncDeletedKiotVietProducts(
       );
     const shopifyProductId = productIds[0];
     if (!shopifyProductId) continue;
-    if (deletedMappings.every((mapping) => mapping.sync_status === "archived"))
-      continue;
     const mappedKiotVietIds = [
       ...new Set(
         deletedMappings
@@ -419,15 +477,7 @@ export async function syncKiotVietProductToShopify(
 
   const status = await resolveProductStatus([product]);
   const hash = await productSyncHash([product], status);
-  const mappings = await mappingsRepository.findBySku(sku);
-  if (
-    mappings.some(
-      (mapping) =>
-        mapping.kiotviet_product_id &&
-        mapping.kiotviet_product_id !== String(product.id),
-    )
-  )
-    throw new MappingError(`SKU ${sku} is mapped to another KiotViet product`);
+  const { activeMappings: mappings, archivedMappings, reclaiming } = await readProductMappings(product, jobId);
   let variant =
     mappings.length === 1 && mappings[0].shopify_variant_id
       ? await getShopifyVariant(mappings[0].shopify_variant_id)
@@ -439,24 +489,26 @@ export async function syncKiotVietProductToShopify(
     mappings[0].kiotviet_product_id === String(product.id) &&
     mappings[0].shopify_product_id === variant.product.id;
   if (variant && normalizeSku(variant.sku) !== sku && !pendingCreation) variant = undefined;
-  if (variant && shouldSkipUnchangedProduct(hash, mappings)) {
+  const resumingCheckpoint = variant && mappings[0]?.sync_status === "mapped" &&
+    mappings[0].last_sync_hash === null && mappings[0].kiotviet_product_id === String(product.id);
+  const match = resumingCheckpoint ? undefined : await findUniqueShopifyVariant(product.code);
+  if (variant && match && variant.id !== match.id)
+    throw new MappingError(`Shopify variant identity conflicts for SKU ${sku}; manual review required`);
+  if (variant && shouldSkipUnchangedProduct(hash, mappings.filter(
+    (mapping) => mapping.kiotviet_product_id === String(product.id),
+  ))) {
     await syncInventory(product, jobId);
     return { sku, updated: false, reason: "unchanged" };
   }
-  if (!variant) {
-    const matches = (await findShopifyVariantsBySku(product.code)).filter(
-      (match) => normalizeSku(match.sku) === sku,
-    );
-    if (matches.length > 1)
-      throw new Error(`Multiple Shopify variants found for SKU ${sku}`);
-    variant = matches[0];
-  }
+  variant ??= match;
+  if (variant && reclaiming) await assertReclaimableShopifyProduct(variant.product.id, [product]);
   const saved = variant
     ? (await shopifyProductHasCustomOptions(variant.product.id))
       ? await collapseShopifyVariantGroup(product, variant.product.id, (saved) => saveMapping(product, saved, null), status)
       : await updateShopifyProduct(product, variant, true, (saved) => saveMapping(product, saved, null), status)
     : await createShopifyProduct(product, (created) => saveMapping(product, created, null), status);
   await saveMapping(product, saved, hash);
+  if (reclaiming) await logSkuReclaimed(product, archivedMappings, saved, jobId);
   await syncInventory(product, jobId);
   await log("info", "KiotViet product synchronized to Shopify", {
     action: "update_shopify_product",

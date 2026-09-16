@@ -33,35 +33,23 @@ export const mappingsRepository = {
     );
   },
   async upsert(input: Omit<MappingRecord, "id" | "last_sync_hash">) {
-    return transaction(async (client) => {
-      const result = await client.query<MappingRecord>(
-        `INSERT INTO product_mappings(sku,normalized_sku,shopify_product_id,shopify_variant_id,shopify_inventory_item_id,kiotviet_product_id,kiotviet_code,sync_direction,sync_status)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,'mapped') ON CONFLICT(normalized_sku) WHERE shopify_variant_id IS NOT NULL AND kiotviet_product_id IS NOT NULL
-      DO UPDATE SET shopify_product_id=EXCLUDED.shopify_product_id,shopify_variant_id=EXCLUDED.shopify_variant_id,shopify_inventory_item_id=EXCLUDED.shopify_inventory_item_id,kiotviet_product_id=EXCLUDED.kiotviet_product_id,updated_at=now() RETURNING *`,
-        [
-          input.sku,
-          input.normalized_sku,
-          input.shopify_product_id,
-          input.shopify_variant_id,
-          input.shopify_inventory_item_id,
-          input.kiotviet_product_id,
-          input.kiotviet_code,
-          input.sync_direction,
-        ],
-      );
-      return result.rows[0];
-    });
+    return mappingsRepository.upsertExact(input, { resetSyncHash: true });
   },
   async upsertExact(
     input: Omit<MappingRecord, "id" | "last_sync_hash">,
     options: { resetSyncHash?: boolean } = {},
   ) {
     return transaction(async (client) => {
+      // Row locks alone cannot serialize two claims when no active row exists.
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        input.normalized_sku,
+      ]);
       const locked = await client.query<MappingRecord>(
         "SELECT * FROM product_mappings WHERE normalized_sku=$1 FOR UPDATE",
         [input.normalized_sku],
       );
-      const conflict = locked.rows.find(
+      const activeMappings = locked.rows.filter((mapping) => mapping.sync_status !== "archived");
+      const conflict = activeMappings.find(
         (mapping) =>
           mapping.kiotviet_product_id &&
           mapping.kiotviet_product_id !== input.kiotviet_product_id,
@@ -70,11 +58,13 @@ export const mappingsRepository = {
         throw new MappingError(
           `SKU ${input.normalized_sku} is already mapped to KiotViet product ${conflict.kiotviet_product_id}`,
         );
+      if (activeMappings.length > 1)
+        throw new MappingError(`Multiple active product mappings exist for SKU ${input.normalized_sku}`);
       const target =
-        locked.rows.find(
+        activeMappings.find(
           (mapping) =>
             mapping.kiotviet_product_id === input.kiotviet_product_id,
-        ) ?? locked.rows.find((mapping) => !mapping.kiotviet_product_id);
+        ) ?? activeMappings.find((mapping) => !mapping.kiotviet_product_id);
       if (target) {
         const updated = await client.query<MappingRecord>(
           `UPDATE product_mappings SET sku=$2,normalized_sku=$3,

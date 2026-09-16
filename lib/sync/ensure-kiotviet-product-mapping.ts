@@ -24,7 +24,7 @@ export async function ensureKiotVietProductMapping(
   if (matches.length > 1)
     return { status: "duplicate_shopify", productId, sku, matches: matches.length };
 
-  const existing = await mappingsRepository.findBySku(sku);
+  const existing = (await mappingsRepository.findBySku(sku)).filter((mapping) => mapping.sync_status !== "archived");
   if (existing.length > 1)
     throw new MappingError(`Multiple product mappings exist for SKU ${sku}`);
   if (
@@ -46,7 +46,7 @@ export async function ensureKiotVietProductMapping(
     sync_direction: "kiotviet_to_shopify",
     sync_status: "mapped",
   });
-  const reconciled = await mappingsRepository.findBySku(sku);
+  const reconciled = (await mappingsRepository.findBySku(sku)).filter((mapping) => mapping.sync_status !== "archived");
   if (reconciled.length !== 1)
     throw new MappingError(`Mapping for SKU ${sku} could not be reconciled`);
   return { status: "mapped", mapping: reconciled[0], productId: String(product.id), sku };

@@ -26,12 +26,14 @@ export async function syncInventoryNotification(
 ) {
   const sku = normalizeSku(notification.ProductCode);
   if (!sku) throw new MappingError("Inventory event has an empty SKU");
-  const mappings = await mappingsRepository.findBySku(sku);
+  const mappings = (await mappingsRepository.findBySku(sku)).filter((mapping) => mapping.sync_status !== "archived");
   if (mappings.length !== 1)
     throw mappings.length > 1
       ? new ConflictError(`Duplicate mapping for SKU ${sku}`)
       : new MappingError(`No mapping for SKU ${sku}`);
   const mapping = mappings[0];
+  if (mapping.kiotviet_product_id && mapping.kiotviet_product_id !== String(notification.ProductId))
+    throw new MappingError(`Inventory event for KiotViet product ${notification.ProductId} does not own SKU ${sku}`);
   if (!mapping.shopify_inventory_item_id)
     throw new MappingError(`Mapping ${sku} has no Shopify inventory item`);
   let locations = await query<{

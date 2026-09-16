@@ -166,7 +166,7 @@ describe("product-to-inventory sync", () => {
     const hash = mocks.query.mock.calls.find(([sql]) => sql.includes("last_sync_hash=$3"))![1][2];
     mocks.findBySku.mockResolvedValue([{
       shopify_inventory_item_id: "inventory-1", shopify_variant_id: saved.id,
-      last_sync_hash: hash,
+      kiotviet_product_id: "501", last_sync_hash: hash,
     }]);
     mocks.getVariant.mockResolvedValue(saved);
     mocks.setInventory.mockClear();
@@ -179,7 +179,7 @@ describe("product-to-inventory sync", () => {
   it("does not hide missing inventory behind the unchanged-product shortcut", async () => {
     await syncKiotVietProductToShopify(501);
     const hash = mocks.query.mock.calls.find(([sql]) => sql.includes("last_sync_hash=$3"))![1][2];
-    mocks.findBySku.mockResolvedValue([{ shopify_variant_id: saved.id, last_sync_hash: hash }]);
+    mocks.findBySku.mockResolvedValue([{ shopify_variant_id: saved.id, kiotviet_product_id: "501", last_sync_hash: hash }]);
     mocks.getVariant.mockResolvedValue(saved);
     mocks.fetch.mockResolvedValueOnce({ ...product, inventories: [] })
       .mockResolvedValueOnce({ data: [], total: 0, pageSize: 100 });
