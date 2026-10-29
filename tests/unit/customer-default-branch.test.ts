@@ -76,6 +76,24 @@ describe("customer default branch resolution", () => {
     });
   });
 
+  it("does not overwrite an already mapped KiotViet customer", async () => {
+    mocks.query.mockImplementation(async (sql: string) =>
+      sql.includes("SELECT kiotviet_customer_id")
+        ? [{ kiotviet_customer_id: "777" }]
+        : [],
+    );
+
+    await expect(
+      syncShopifyCustomer({
+        ...customer,
+        default_address: { province: "Ho Chi Minh", country: "Vietnam" },
+      }),
+    ).resolves.toEqual({ created: false, kiotvietCustomerId: "777" });
+
+    expect(mocks.updateCustomer).not.toHaveBeenCalled();
+    expect(mocks.createCustomer).not.toHaveBeenCalled();
+  });
+
   it("uses an existing valid defaultBranchId for customer sync", async () => {
     const settings = { defaultBranchId: 42, futureSetting: "preserved" };
     mockNewCustomerQueries(settings);
