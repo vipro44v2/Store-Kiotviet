@@ -227,13 +227,25 @@ export async function processSyncJob(job: Job<SyncJobPayload>) {
     case "shopify_order_cancel":
       await cancelShopifyOrder(payload as unknown as ShopifyOrderWebhook);
       break;
-    case "shopify_customer_to_kiotviet":
+    case "shopify_customer_to_kiotviet": {
+      const settings = await query<{ value: { syncCustomers?: boolean } }>(
+        "SELECT value FROM system_settings WHERE key='orders'",
+      );
+      if (settings[0]?.value?.syncCustomers === false) {
+        await log("info", "Shopify customer webhook ignored", {
+          action: "customer_webhook_ignored",
+          reason: "customer_sync_disabled",
+          eventId: job.data.eventId,
+        });
+        break;
+      }
       await syncShopifyCustomer(
         recordPayload(payload) as unknown as Parameters<
           typeof syncShopifyCustomer
         >[0],
       );
       break;
+    }
     case "product_mapping_scan":
     case "full_product_sync":
       await initializeProductMappings();
