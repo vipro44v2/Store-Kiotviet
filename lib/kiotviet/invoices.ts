@@ -31,6 +31,8 @@ export interface KiotVietInvoiceDetail extends KiotVietInvoice {
   totalPayment?: number;
   invoiceDetails?: Array<{ productId: number; quantity: number; price: number; discount?: number }>;
   invoiceOrderSurcharges?: Array<{ surchargeId?: number | null; price?: number | null }> | null;
+  /** GET /invoices/{id} payments (documented: id, code, amount, method, status, transDate, …). */
+  payments?: Array<{ amount?: number | null; method?: string | null }> | null;
 }
 
 /** Not idempotent: never resent automatically; callers look the invoice up first. */

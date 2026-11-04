@@ -13,6 +13,9 @@ export const OVERRIDABLE_INVOICE_WARNINGS: Readonly<Record<string, string>> = {
   overpaid: "KiotViet already records more payment than the expected total",
   unsupported_discount: "Discount accounting differs between Shopify and KiotViet",
   unsupported_tax: "Tax added on top of prices is not represented in KiotViet",
+  // Manual single-order exception only: the invoice is sent with no additional
+  // payment and is always stored as needs_review (inheritance is checked after the POST).
+  prepayment_inheritance_unverified: "It is unverified whether the invoice inherits the KiotViet order prepayment",
 };
 
 export function invoiceReasonCode(reason: string) {

@@ -204,7 +204,8 @@ Recommended instead of the legacy `autoInvoice`. With `invoiceCreationTrigger = 
   - KiotViet payment: prepayment, additional payment, total recorded, overpayment, remaining balance.
   - **Differences that remain after invoicing**: `merchandise_difference`, `shipping_unrecorded`, `overpayment`, `remaining_balance`, `payment_not_recorded`.
   An invoice created with any remaining difference is saved as `needs_review` (`checks.financiallyReconciled = false`), never as `created`/reconciled.
-- **Prepaid orders** (automatic and override): KiotViet does not document whether an invoice created with `orderId` inherits the order's prepayment. Invoicing any order with a prepayment is blocked (`prepayment_inheritance_unverified`, not overridable) until both conditions hold:
+- **"Bỏ qua PLAN: blocked"**: when the strict dry run is blocked only by financial warnings, the admin must tick this option for the single order, approve every warning, confirm and give a reason (all stored in `audit_logs` and `reconciliation.manualOverride`). Safety codes can never be bypassed.
+- **Prepaid orders**: KiotViet does not document whether an invoice created with `orderId` inherits the order's prepayment. Automatic invoicing of prepaid orders stays blocked (`prepayment_inheritance_unverified`). The manual exception may override it for one order: the invoice is sent with `totalPayment: 0` (no added payment, no surcharge, unchanged prices). Its ID is stored as soon as KiotViet returns it, and the read-back payment rows and stock movement are recorded. The invoice is always `needs_review` until accounting reconciles it. Automatic invoicing unlocks only when both conditions hold:
   1. sandbox evidence with result `carried` is stored (see below);
   2. accounting has ticked "Kế toán đã xác nhận…" (`orders.invoicePrepaymentVerified`).
   After creation the invoice must report "Khách đã trả" = prepayment + new payment. Otherwise it is `needs_review`.

@@ -92,3 +92,21 @@ describe("override rules", () => {
     expect(blockers).toHaveLength(13);
   });
 });
+
+describe("Bỏ qua PLAN: blocked", () => {
+  it("passes the explicit bypass decision to the server-side checks (default false)", async () => {
+    await call(submitBody);
+    expect(m.submit).toHaveBeenLastCalledWith(expect.objectContaining({ bypassPlanBlocked: false }));
+    await call({ ...submitBody, bypassPlanBlocked: true });
+    expect(m.submit).toHaveBeenLastCalledWith(expect.objectContaining({ bypassPlanBlocked: true }));
+  });
+
+  it("lets only the manual flow override unverified prepayment inheritance, never safety codes", () => {
+    const { warnings, blockers } = classifyInvoiceReasons([
+      "prepayment_inheritance_unverified: x", "invoice_lookup_incomplete: x", "duplicate_invoices: x",
+      "existing_active_invoice: x", "invoice_in_flight: x", "invoice_outcome_unknown: x", "stale_payload: x",
+    ]);
+    expect(warnings.map((item) => item.code)).toEqual(["prepayment_inheritance_unverified"]);
+    expect(blockers).toHaveLength(6);
+  });
+});

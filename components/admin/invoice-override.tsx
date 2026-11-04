@@ -12,6 +12,7 @@ export function InvoiceOverride() {
   const [previewToken, setPreviewToken] = useState("");
   const [approved, setApproved] = useState<string[]>([]);
   const [confirmed, setConfirmed] = useState(false);
+  const [bypassPlanBlocked, setBypassPlanBlocked] = useState(false);
   const [reason, setReason] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
@@ -21,6 +22,7 @@ export function InvoiceOverride() {
     setPreviewToken("");
     setApproved([]);
     setConfirmed(false);
+    setBypassPlanBlocked(false);
   }
 
   async function call(body: unknown) {
@@ -52,7 +54,7 @@ export function InvoiceOverride() {
   async function submit() {
     setLoading(true);
     try {
-      const data = await call({ step: "submit", previewToken, approvedWarnings: approved, confirm: true, reason });
+      const data = await call({ step: "submit", previewToken, bypassPlanBlocked, approvedWarnings: approved, confirm: true, reason });
       setMessage(data.result?.message ?? (data.success ? "Đã tạo hóa đơn" : "Không tạo hóa đơn"));
       // A token is single-purpose; any further action needs a fresh dry run.
       reset();
@@ -65,7 +67,7 @@ export function InvoiceOverride() {
 
   const warnings = preview?.warnings ?? [];
   const allApproved = warnings.every((warning) => approved.includes(warning.code));
-  const canSubmit = Boolean(preview?.submitAllowed && previewToken && allApproved && confirmed && reason.trim().length >= 10 && !loading);
+  const canSubmit = Boolean(preview?.submitAllowed && previewToken && (warnings.length === 0 || bypassPlanBlocked) && allApproved && confirmed && reason.trim().length >= 10 && !loading);
   const currency = preview?.amounts?.currency;
 
   return (
@@ -126,15 +128,29 @@ export function InvoiceOverride() {
               <ul>{preview.blockers.map((item) => <li key={item.message}>{item.message}</li>)}</ul>
             </div>
           )}
+          {preview.planStatus === "blocked" && (
+            <p><strong>PLAN: blocked</strong> — Dry Run nghiêm ngặt chặn tạo hóa đơn tự động cho đơn này.</p>
+          )}
           {warnings.length > 0 && (
-            <fieldset>
+            <label style={{ display: "block" }}>
+              <input
+                type="checkbox"
+                checked={bypassPlanBlocked}
+                disabled={!preview.submitAllowed}
+                onChange={(event) => { setBypassPlanBlocked(event.target.checked); if (!event.target.checked) setApproved([]); }}
+              />{" "}
+              <strong>Bỏ qua PLAN: blocked</strong> (chỉ cho đơn Shopify {preview.shopifyOrderId}; chỉ các cảnh báo tài chính bên dưới, không bao giờ bỏ qua các điều kiện an toàn)
+            </label>
+          )}
+          {warnings.length > 0 && (
+            <fieldset disabled={!bypassPlanBlocked}>
               <legend>Cảnh báo tài chính cần phê duyệt từng mục</legend>
               {warnings.map((warning) => (
                 <label key={warning.message} style={{ display: "block" }}>
                   <input
                     type="checkbox"
                     checked={approved.includes(warning.code)}
-                    disabled={!preview.submitAllowed}
+                    disabled={!preview.submitAllowed || !bypassPlanBlocked}
                     onChange={(event) => setApproved((codes) => event.target.checked ? [...new Set([...codes, warning.code])] : codes.filter((code) => code !== warning.code))}
                   />{" "}
                   {warning.message}

@@ -11,6 +11,7 @@ const body = z.discriminatedUnion("step", [
   z.object({
     step: z.literal("submit"),
     previewToken: z.string().min(1).max(4000),
+    bypassPlanBlocked: z.boolean().default(false),
     approvedWarnings: z.array(z.string().max(64)).max(20),
     confirm: z.literal(true),
     reason: z.string().trim().min(10).max(1000),
@@ -31,7 +32,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ ord
       return Response.json({ success: true, preview, previewToken });
     }
     const result = await submitInvoiceOverride({
-      orderId, admin, previewToken: input.previewToken, approvedWarnings: input.approvedWarnings,
+      orderId, admin, previewToken: input.previewToken, bypassPlanBlocked: input.bypassPlanBlocked, approvedWarnings: input.approvedWarnings,
       confirm: input.confirm, reason: input.reason,
       ipAddress: request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null,
     });

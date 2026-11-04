@@ -259,9 +259,11 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
     reasons.push(`overpaid: KiotViet order already records ${plan.prepaid} paid, more than ${plan.expectedTotal}`);
   // Undocumented KiotViet behavior: never invoice a prepaid order (automatically or by
   // override) without sandbox evidence that the invoice inherits the prepayment.
+  let inheritanceVerified = true;
   if (prepaidCents > 0) {
     const [evidenceRow] = await query<{ value: unknown }>("SELECT value FROM system_settings WHERE key=$1", [PREPAYMENT_EVIDENCE_KEY]);
     const inheritance = prepaymentInheritanceStatus(evidenceRow?.value, settings.invoicePrepaymentVerified);
+    inheritanceVerified = inheritance.verified;
     if (!inheritance.verified)
       reasons.push(`prepayment_inheritance_unverified: KiotViet already records ${plan.prepaid} paid on this order and it is undocumented whether an invoice created from it inherits that payment; ${inheritance.reason}`);
   }
@@ -289,7 +291,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
       return block(`invoice_outcome_unknown: a previous attempt is ${invoiceRow.status} and no invoice is visible; check KiotViet, then run with --reset-uncertain --apply`);
     return { ...plan, action: { kind: "reset_uncertain" } };
   }
-  if (plan.prepared && plan.expectedLines) plan.proposal = buildInvoiceProposal(plan.prepared, plan.financials, kiotVietOrder, prepaidCents, settings);
+  if (plan.prepared && plan.expectedLines) plan.proposal = buildInvoiceProposal(plan.prepared, plan.financials, kiotVietOrder, prepaidCents, settings, inheritanceVerified);
   if (reasons.length) return block(...reasons);
   return {
     ...plan,
@@ -318,7 +320,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
  * received for goods, minus what KiotViet already recorded, so a payment is
  * never invented or recorded twice. Product prices are never changed.
  */
-function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinancials | undefined, kiotVietOrder: KiotVietOrderDetail, prepaidCents: number, settings: OrderSettings): InvoiceProposal {
+function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinancials | undefined, kiotVietOrder: KiotVietOrderDetail, prepaidCents: number, settings: OrderSettings, inheritanceVerified: boolean): InvoiceProposal {
   const invoiceDetails = (kiotVietOrder.orderDetails ?? []).map((detail) => ({
     productId: Number(detail.productId), productCode: String(detail.productCode ?? ""),
     productName: String(detail.productName ?? detail.productCode ?? ""),
@@ -333,7 +335,9 @@ function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinanc
     blockers.push("surcharge_inheritance_unverified: confirm in KiotViet that an invoice created from an order keeps its surcharges");
   const invoiceTotalCents = detailsCents + surchargeCents;
   const paidCents = cents(prepared.amounts.adjustedTotal);
-  const additionalCents = Math.max(0, Math.min(invoiceTotalCents, paidCents) - prepaidCents);
+  // While prepayment inheritance is unverified, never record any further payment:
+  // the manual exception sends totalPayment 0 and leaves the rest to accounting.
+  const additionalCents = inheritanceVerified ? Math.max(0, Math.min(invoiceTotalCents, paidCents) - prepaidCents) : 0;
   const recordedCents = prepaidCents + additionalCents;
   const shopifyMerchandiseCents = cents(financials?.merchandiseTotal ?? 0);
   const shopifyShippingCents = cents(financials?.shippingTotal ?? 0);
@@ -350,6 +354,9 @@ function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinanc
     `KiotViet will record ${money(recordedCents)} paid for an invoice of ${money(invoiceTotalCents)}`);
   add("remaining_balance", Math.max(0, invoiceTotalCents - recordedCents),
     `The invoice will remain ${money(invoiceTotalCents - recordedCents)} unpaid`);
+  if (!inheritanceVerified && prepaidCents > 0)
+    differences.push({ code: "prepayment_inheritance_unverified", amount: prepaidCents / 100,
+      message: `KiotViet holds ${money(prepaidCents)} prepaid on the order; whether the invoice inherits it is verified only after the POST` });
   add("payment_not_recorded", paidCents - recordedCents,
     `Customer paid ${money(paidCents)} in Shopify (excluding fees); KiotViet will record ${money(recordedCents)}`);
   return {
@@ -503,7 +510,23 @@ export async function applyInvoiceRecovery(
         : `Outcome unknown (${errorText(error)}); NOT resent. Run the dry run again in 5 minutes to link or review it.`,
     };
   }
-  const result = await finalizeInvoice({ ...claimed, reconciliation }, created.id, ref, { prepaid: plan.prepaid, source: "recovery" });
+  // KiotViet returned an invoice: record its ID immediately (needs_review until verified),
+  // so a failing read-back can never lose it or lead to a second invoice.
+  await query(
+    "UPDATE invoice_mappings SET kiotviet_invoice_id=$3,kiotviet_invoice_code=$4,status='needs_review',last_error='Invoice created; verification pending',failure_stage='verify_invoice',invoiced_at=now(),updated_at=now() WHERE shopify_order_id=$1 AND claim_token=$2",
+    [orderId, token, created.id, created.code],
+  );
+  let result: Awaited<ReturnType<typeof finalizeInvoice>>;
+  try {
+    result = await finalizeInvoice({ ...claimed, reconciliation }, created.id, ref, { prepaid: plan.prepaid, source: "recovery" });
+  } catch (error) {
+    return {
+      applied: true,
+      invoiceCode: created.code,
+      status: "needs_review",
+      message: `Created invoice ${created.code} (ID saved) but could not verify it: ${errorText(error)}; status needs_review`,
+    };
+  }
   return {
     applied: true,
     invoiceCode: created.code,

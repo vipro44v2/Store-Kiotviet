@@ -39,7 +39,7 @@ export interface InvoiceReconciliation {
   stockAfter?: Record<string, number | null>;
   stockVerified?: boolean;
   prepaid?: number;
-  invoice?: { id: number; code: string; total: number | null; totalPayment: number | null; status: number | null };
+  invoice?: { id: number; code: string; total: number | null; totalPayment: number | null; status: number | null; paymentRows?: Array<{ amount: number; method: string | null }> | null };
   checks?: Record<string, boolean>;
   [key: string]: unknown;
 }
@@ -192,10 +192,16 @@ export async function finalizeInvoice(
     payment: row.expected_total !== null && cents(detail.totalPayment) === expectedPayment,
     // Approved override differences (shipping, payment) are never reported as reconciled.
     financiallyReconciled: !(Array.isArray(reconciliation.remainingDifferences) && reconciliation.remainingDifferences.length > 0),
+    // Actual payment rows must add up to "Khách đã trả". Without rows, a prepaid order's
+    // payment cannot be verified.
+    paymentRecords: Array.isArray(detail.payments)
+      ? detail.payments.reduce((sum, row) => sum + cents(row?.amount), 0) === cents(detail.totalPayment)
+      : cents(reconciliation.prepaid ?? 0) === 0,
   };
   reconciliation.invoice = {
     id: detail.id, code: detail.code,
     total: detail.total ?? null, totalPayment: detail.totalPayment ?? null, status: detail.status ?? null,
+    paymentRows: Array.isArray(detail.payments) ? detail.payments.map((row) => ({ amount: Number(row?.amount ?? 0), method: row?.method ?? null })) : null,
   };
   reconciliation.checks = checks;
   if (reconciliation.branchId && reconciliation.expectedLines?.length) {
@@ -214,7 +220,7 @@ export async function finalizeInvoice(
     `UPDATE invoice_mappings SET kiotviet_invoice_id=$2,kiotviet_invoice_code=$3,status=$4,source=COALESCE($8,source),reconciliation=$5,
       last_error=$6,failure_stage=$7,claim_token=NULL,invoiced_at=now(),updated_at=now(),
       kiotviet_order_id=COALESCE(kiotviet_order_id,$9),kiotviet_order_code=COALESCE(kiotviet_order_code,$10)
-    WHERE shopify_order_id=$1 AND kiotviet_invoice_id IS NULL RETURNING shopify_order_id`,
+    WHERE shopify_order_id=$1 AND (kiotviet_invoice_id IS NULL OR kiotviet_invoice_id=$2) RETURNING shopify_order_id`,
     [
       row.shopify_order_id, detail.id, detail.code, ok ? "created" : "needs_review", JSON.stringify(reconciliation),
       ok ? null : `KiotViet invoice ${detail.code} does not match: ${failed.join(", ")}`, ok ? null : "verify_invoice",

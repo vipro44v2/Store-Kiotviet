@@ -21,6 +21,8 @@ import { applyInvoiceRecovery, planInvoiceRecovery, type InvoiceProposal, type I
 export const OVERRIDE_PREVIEW_TTL_MS = 10 * 60_000;
 
 export interface InvoiceOverridePreview {
+  /** Result of the strict dry run ("PLAN: blocked" when any validation reason exists). */
+  planStatus: InvoiceRecoveryPlan["action"]["kind"];
   shopifyOrderId: string;
   shopifyOrderName: string | null;
   kiotVietOrder: { id: number; code: string } | null;
@@ -52,6 +54,7 @@ export async function buildOverridePreview(orderId: string) {
   if (!proposal && !blockers.length) blockers.push(blocker("no_invoice_proposal", "the dry run could not build an exact invoice"));
   for (const reason of proposal?.blockers ?? []) blockers.push({ code: reason.split(":")[0], message: reason });
   const preview: InvoiceOverridePreview = {
+    planStatus: action.kind,
     shopifyOrderId: orderId,
     shopifyOrderName: plan.shopifySnapshot?.name ?? plan.mapping?.shopify_order_number ?? null,
     kiotVietOrder: plan.kiotVietOrder ? { id: plan.kiotVietOrder.id, code: plan.kiotVietOrder.code } : null,
@@ -122,6 +125,8 @@ export interface OverrideSubmission {
   orderId: string;
   admin: string;
   previewToken: string;
+  /** Explicit "Bỏ qua PLAN: blocked" decision; required whenever the strict plan is blocked by warnings. */
+  bypassPlanBlocked?: boolean;
   approvedWarnings: string[];
   confirm: boolean;
   reason: string;
@@ -141,6 +146,8 @@ export async function submitInvoiceOverride(submission: OverrideSubmission) {
     throw new ConflictError("The order, invoice state or payload changed since the preview; run the dry run again");
   if (!preview.submitAllowed || !plan.proposal)
     throw new ConflictError(`Invoice cannot be created: ${preview.blockers.map((item) => item.message).join("; ")}`);
+  if (preview.warnings.length && submission.bypassPlanBlocked !== true)
+    throw new ValidationError("The strict plan is blocked; tick \"Bỏ qua PLAN: blocked\" to override its financial warnings for this order only");
   const required = [...new Set(preview.warnings.map((warning) => warning.code))].sort();
   const approved = [...new Set(submission.approvedWarnings ?? [])].sort();
   if (JSON.stringify(required) !== JSON.stringify(approved))
@@ -154,7 +161,11 @@ export async function submitInvoiceOverride(submission: OverrideSubmission) {
     lines: proposal.input.invoiceDetails.map(({ productId, productCode, quantity, price }) => ({ productId, productCode, quantity, price })),
   };
   const at = new Date().toISOString();
-  const manualOverride = { admin, reason, approvedWarnings: approved, at, payloadSummary };
+  const manualOverride = {
+    admin, reason, at, payloadSummary, approvedWarnings: approved,
+    bypassPlanBlocked: preview.warnings.length > 0, planStatus: preview.planStatus,
+    planBlockedReasons: preview.warnings.map((warning) => warning.message),
+  };
   await audit("kiotviet_invoice_override_requested", admin, orderId, manualOverride, null, submission.ipAddress);
 
   let result: Awaited<ReturnType<typeof applyInvoiceRecovery>>;
