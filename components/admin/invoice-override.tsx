@@ -91,6 +91,7 @@ export function InvoiceOverride() {
             <tbody>
               <tr><th>Shopify Order ID</th><td>{preview.shopifyOrderId}{preview.shopifyOrderName ? ` (${preview.shopifyOrderName})` : ""}</td></tr>
               <tr><th>KiotViet order</th><td>{preview.kiotVietOrder ? `${preview.kiotVietOrder.code} (ID ${preview.kiotVietOrder.id})` : "—"}</td></tr>
+              <tr><th>Người bán (soldById)</th><td>{preview.seller.verified ? `Đã xác minh (${preview.seller.source === "order" ? "người bán của đơn KiotViet" : "người bán mặc định từ ENV"})` : "Không có người bán hợp lệ — không thể tạo hóa đơn"}{preview.sellerRejected.length > 0 && <small> — bị loại: {preview.sellerRejected.join("; ")}</small>}</td></tr>
               <tr><th colSpan={2}>Shopify (khách đã bị tính)</th></tr>
               <tr><th>Tiền hàng Shopify</th><td>{money(preview.amounts?.shopify.merchandise, currency)}</td></tr>
               <tr><th>Phí vận chuyển Shopify</th><td>{money(preview.amounts?.shopify.shipping, currency)}</td></tr>

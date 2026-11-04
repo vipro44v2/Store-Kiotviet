@@ -9,6 +9,8 @@ export interface KiotVietOrderInput {
   totalPayment: number;
   makeInvoice: boolean;
   customer?: { id: number };
+  /** Seller (KiotViet user ID), verified before sending; invoices later reuse it. */
+  soldById?: number;
   /** Documented POST /orders field (sic). Used only for Shopify shipping. */
   surchages?: Array<{ id: number; code: string; price: number }>;
   orderDetails: Array<{
@@ -83,6 +85,9 @@ export interface KiotVietOrderDetail {
   status: number;
   statusValue?: string;
   customerId?: number | null;
+  /** Seller of the order (KiotViet user ID); invoices reuse it as soldById. */
+  soldById?: number | null;
+  soldByName?: string | null;
   total?: number;
   totalPayment?: number;
   description?: string | null;

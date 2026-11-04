@@ -110,3 +110,10 @@ describe("Bỏ qua PLAN: blocked", () => {
     expect(blockers).toHaveLength(6);
   });
 });
+
+describe("seller is server-side only", () => {
+  it("rejects a client-supplied soldById", async () => {
+    expect((await call({ ...submitBody, soldById: 1 })).status).toBe(400);
+    expect(m.submit).not.toHaveBeenCalled();
+  });
+});

@@ -25,6 +25,9 @@ export interface InvoiceOverridePreview {
   planStatus: InvoiceRecoveryPlan["action"]["kind"];
   shopifyOrderId: string;
   shopifyOrderName: string | null;
+  /** Seller verification status only; the soldById itself never leaves the server. */
+  seller: { verified: boolean; source: "order" | "default" | null };
+  sellerRejected: string[];
   kiotVietOrder: { id: number; code: string } | null;
   amounts: (Pick<InvoiceProposal, "shopify" | "invoice" | "payment"> & { currency: string | null }) | null;
   /** Differences that remain after invoicing; the invoice is "reconciled" only when empty. */
@@ -33,7 +36,8 @@ export interface InvoiceOverridePreview {
   lines: Array<{ productId: number; productCode: string; productName: string; quantity: number; price: number }>;
   warnings: Array<{ code: string; message: string }>;
   blockers: Array<{ code: string; message: string }>;
-  payload: KiotVietInvoiceInput | null;
+  /** Exact POST /invoices body, with soldById shown only as "[verified seller]". */
+  payload: (Omit<KiotVietInvoiceInput, "soldById"> & { soldById?: string }) | null;
   submitAllowed: boolean;
 }
 
@@ -57,6 +61,8 @@ export async function buildOverridePreview(orderId: string) {
     planStatus: action.kind,
     shopifyOrderId: orderId,
     shopifyOrderName: plan.shopifySnapshot?.name ?? plan.mapping?.shopify_order_number ?? null,
+    seller: { verified: Boolean(plan.seller), source: plan.seller?.source ?? null },
+    sellerRejected: plan.sellerRejected ?? [],
     kiotVietOrder: plan.kiotVietOrder ? { id: plan.kiotVietOrder.id, code: plan.kiotVietOrder.code } : null,
     amounts: proposal ? {
       shopify: proposal.shopify, invoice: proposal.invoice, payment: proposal.payment,
@@ -67,17 +73,24 @@ export async function buildOverridePreview(orderId: string) {
     lines: proposal?.input.invoiceDetails ?? [],
     warnings,
     blockers,
-    payload: proposal?.input ?? null,
+    payload: proposal ? redactSeller(proposal.input) : null,
     submitAllowed: Boolean(proposal) && blockers.length === 0,
   };
   return { preview, plan, fingerprint: fingerprintOf(plan, preview) };
+}
+
+function redactSeller(input: KiotVietInvoiceInput) {
+  const { soldById, ...rest } = input;
+  return soldById ? { ...rest, soldById: "[verified seller]" } : rest;
 }
 
 /** Changes to the payload, the remote orders or the local invoice state invalidate a preview. */
 function fingerprintOf(plan: InvoiceRecoveryPlan, preview: InvoiceOverridePreview) {
   return createHash("sha256").update(JSON.stringify({
     orderId: preview.shopifyOrderId,
-    payload: preview.payload,
+    // The real payload and seller (server-side only, hashed): a seller change invalidates the preview.
+    payload: plan.proposal?.input ?? null,
+    seller: plan.seller ?? null,
     amounts: preview.amounts,
     warnings: preview.warnings.map((warning) => warning.message),
     blockers: preview.blockers.map((item) => item.message),
@@ -155,7 +168,7 @@ export async function submitInvoiceOverride(submission: OverrideSubmission) {
 
   const proposal = plan.proposal;
   const payloadSummary = {
-    kiotVietOrderId: preview.kiotVietOrder?.id, kiotVietOrderCode: preview.kiotVietOrder?.code,
+    kiotVietOrderId: preview.kiotVietOrder?.id, kiotVietOrderCode: preview.kiotVietOrder?.code, seller: preview.seller.source,
     invoiceTotal: proposal.invoice.total, prepaid: proposal.payment.existingPrepayment,
     additionalPayment: proposal.payment.additionalPayment, remainingDifferences: proposal.remainingDifferences,
     lines: proposal.input.invoiceDetails.map(({ productId, productCode, quantity, price }) => ({ productId, productCode, quantity, price })),

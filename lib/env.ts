@@ -19,6 +19,8 @@ const schema = z.object({
   KIOTVIET_CLIENT_SECRET: z.string().default(""),
   KIOTVIET_RETAILER: z.string().default(""),
   KIOTVIET_WEBHOOK_SECRET: z.string().default(""),
+  /** Fallback KiotViet seller (user ID) for invoices when the order's own seller is invalid; verified via GET /users before use. */
+  KIOTVIET_DEFAULT_SOLD_BY_ID: z.string().default(""),
   SESSION_SECRET: z.string().default(""),
   ADMIN_USERNAME: z.string().default(""),
   ADMIN_PASSWORD: z.string().default(""),

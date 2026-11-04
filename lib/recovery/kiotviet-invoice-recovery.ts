@@ -26,6 +26,7 @@ import { mappingsRepository } from "@/repositories/mappings";
 import type { ShopifyOrderWebhook } from "@/types/shopify";
 import { RecoveryArgsError } from "./shopify-order-recovery";
 import { PREPAYMENT_EVIDENCE_KEY, prepaymentInheritanceStatus } from "@/lib/kiotviet/prepayment-evidence";
+import { resolveInvoiceSeller, type VerifiedSeller } from "@/lib/kiotviet/users";
 
 export const INVOICE_RECOVERY_USAGE = `Usage:
   recover-kiotviet-invoice.ts --list
@@ -95,6 +96,9 @@ export interface InvoiceRecoveryPlan {
   stockNow?: Record<string, number | null>;
   /** Exact invoice a manual override would send; only built when no hard block returned earlier. */
   proposal?: InvoiceProposal;
+  /** Verified seller (soldById) sent with the invoice; candidates that failed verification. */
+  seller?: VerifiedSeller;
+  sellerRejected?: string[];
   action: InvoiceRecoveryAction;
 }
 
@@ -163,6 +167,13 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
   plan.validationReasons = reasons;
   const [settingsRow] = await query<{ value: OrderSettings }>("SELECT value FROM system_settings WHERE key='orders'");
   const settings = settingsRow?.value ?? {};
+  // KiotViet rejects an invoice whose seller was deleted (HTTP 420), so the seller is
+  // verified before planning; this is never overridable.
+  const sellerResolution = await resolveInvoiceSeller(kiotVietOrder);
+  plan.seller = sellerResolution.seller ?? undefined;
+  plan.sellerRejected = sellerResolution.rejected;
+  if (!sellerResolution.seller)
+    reasons.push(`seller_invalid: no valid KiotViet seller for the invoice (${sellerResolution.rejected.join("; ")})`);
   const event = { payload: await getInvoiceOrder(orderId) };
   plan.shopifySnapshot = event.payload;
   if (!event) reasons.push("no_shopify_payload: no stored Shopify order webhook");
@@ -291,7 +302,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
       return block(`invoice_outcome_unknown: a previous attempt is ${invoiceRow.status} and no invoice is visible; check KiotViet, then run with --reset-uncertain --apply`);
     return { ...plan, action: { kind: "reset_uncertain" } };
   }
-  if (plan.prepared && plan.expectedLines) plan.proposal = buildInvoiceProposal(plan.prepared, plan.financials, kiotVietOrder, prepaidCents, settings, inheritanceVerified);
+  if (plan.prepared && plan.expectedLines) plan.proposal = buildInvoiceProposal(plan.prepared, plan.financials, kiotVietOrder, prepaidCents, settings, inheritanceVerified, plan.seller);
   if (reasons.length) return block(...reasons);
   return {
     ...plan,
@@ -301,6 +312,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
         branchId: Number(kiotVietOrder.branchId),
         orderId: kiotVietOrder.id,
         ...(kiotVietOrder.customerId ? { customerId: Number(kiotVietOrder.customerId) } : {}),
+        ...(plan.seller ? { soldById: plan.seller.soldById } : {}),
         discount: 0,
         totalPayment: (cents(plan.expectedTotal) - prepaidCents) / 100,
         method: "Transfer",
@@ -320,7 +332,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
  * received for goods, minus what KiotViet already recorded, so a payment is
  * never invented or recorded twice. Product prices are never changed.
  */
-function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinancials | undefined, kiotVietOrder: KiotVietOrderDetail, prepaidCents: number, settings: OrderSettings, inheritanceVerified: boolean): InvoiceProposal {
+function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinancials | undefined, kiotVietOrder: KiotVietOrderDetail, prepaidCents: number, settings: OrderSettings, inheritanceVerified: boolean, seller: VerifiedSeller | undefined): InvoiceProposal {
   const invoiceDetails = (kiotVietOrder.orderDetails ?? []).map((detail) => ({
     productId: Number(detail.productId), productCode: String(detail.productCode ?? ""),
     productName: String(detail.productName ?? detail.productCode ?? ""),
@@ -364,6 +376,7 @@ function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinanc
       branchId: Number(kiotVietOrder.branchId),
       orderId: kiotVietOrder.id,
       ...(kiotVietOrder.customerId ? { customerId: Number(kiotVietOrder.customerId) } : {}),
+      ...(seller ? { soldById: seller.soldById } : {}),
       discount: 0,
       totalPayment: additionalCents / 100,
       method: "Transfer",
@@ -539,6 +552,10 @@ export function describeInvoiceRecoveryPlan(plan: InvoiceRecoveryPlan): string[]
   const lines = [`== Shopify order ${plan.shopifyOrderId}${plan.mapping?.shopify_order_number ? ` (${plan.mapping.shopify_order_number})` : ""}`];
   if (plan.kiotVietOrder)
     lines.push(`KiotViet order ${plan.kiotVietOrder.code} (${plan.kiotVietOrder.id}): status=${plan.kiotVietOrder.status} branch=${plan.kiotVietOrder.branchId} total=${plan.kiotVietOrder.total} prepaid=${plan.prepaid}`);
+  // The seller ID itself is never printed (it may come from KIOTVIET_DEFAULT_SOLD_BY_ID).
+  if (plan.seller) lines.push(`seller: verified (${plan.seller.source === "order" ? "the KiotViet order's seller" : "default seller from KIOTVIET_DEFAULT_SOLD_BY_ID"})`);
+  else if (plan.sellerRejected) lines.push("seller: NOT verified");
+  for (const rejected of plan.sellerRejected ?? []) lines.push(`seller rejected: ${rejected}`);
   if (plan.invoiceRow) lines.push(`local invoice state: ${plan.invoiceRow.status}${plan.invoiceRow.kiotviet_invoice_code ? ` ${plan.invoiceRow.kiotviet_invoice_code}` : ""}`);
   for (const fee of plan.prepared?.fees ?? [])
     lines.push(`excluded fee: line ${fee.line.id} "${fee.line.title ?? fee.line.name ?? ""}" amount=${fee.chargedCents / 100}`);

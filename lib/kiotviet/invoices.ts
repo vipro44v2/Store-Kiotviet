@@ -8,6 +8,8 @@ export interface KiotVietInvoiceInput {
   branchId: number;
   orderId: number;
   customerId?: number;
+  /** Seller (KiotViet user ID). KiotViet rejects invoices whose seller was deleted (HTTP 420). */
+  soldById?: number;
   purchaseDate?: string;
   discount: number;
   totalPayment: number;

@@ -181,6 +181,15 @@ Recommended instead of the legacy `autoInvoice`. With `invoiceCreationTrigger = 
 3. Build the invoice index until it reports "current": `scripts/build-kiotviet-invoice-index.ts`.
 4. Fulfill one new test order in Shopify, then check `SELECT status,kiotviet_invoice_code,last_error FROM invoice_mappings ORDER BY updated_at DESC LIMIT 5;`.
 
+## Seller (`soldById`)
+
+KiotViet rejects orders and invoices whose seller was deleted (HTTP 420 "Người bán không tồn tại hoặc đã bị xóa khỏi hệ thống"). The seller is always verified against `GET /users`. The user must exist, must not be `isActive: false`, and must belong to the order's branch when KiotViet returns `branchIds`. No employee ID is hardcoded.
+
+- **New KiotViet orders** (Shopify → KiotViet) send `soldById` = `KIOTVIET_DEFAULT_SOLD_BY_ID`, after verification. Missing, malformed or invalid → `seller_invalid`: the order is not sent and the mapping becomes `create_failed` (re-claimed by the next webhook or the recovery script once fixed).
+- **Invoices** (automatic, CLI recovery, manual override) re-read the order with `GET /orders/{id}` and keep its own `soldById` when it is still valid; the env value is not needed then. Otherwise they use the verified `KIOTVIET_DEFAULT_SOLD_BY_ID`. If neither is valid, the result is `seller_invalid`: it cannot be overridden and nothing is POSTed.
+- **Other branches:** in a store with several active branches, the env seller is refused when KiotViet does not return branch membership. Staff from another branch are never used automatically.
+- **Privacy:** `KIOTVIET_DEFAULT_SOLD_BY_ID` is read only on the server. The dry run, the Admin preview, API responses, audit logs and messages show only "verified (order seller / default seller)" and `soldById: "[verified seller]"`. The real ID is hashed into the signed preview, so a seller change between preview and submit forces a new dry run. The API rejects a client-supplied `soldById`.
+
 ## Manual invoice override (Admin → Invoices)
 
 **Bỏ qua cảnh báo & tạo hóa đơn** invoices one existing KiotViet order when only approved financial warnings remain. Automatic invoicing (Shopify Fulfilled/Paid) stays strict and never uses it.

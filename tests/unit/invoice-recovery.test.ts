@@ -4,6 +4,10 @@ import type { ShopifyOrderWebhook } from "@/types/shopify";
 
 const ORDER_ID = "7108106289336";
 const mocks = vi.hoisted(() => ({
+  branches: [] as Array<{ id: number }>,
+  users: [] as Array<Record<string, unknown>>,
+  usersError: undefined as Error | undefined,
+  defaultSeller: "",
   orderMapping: {} as Record<string, unknown>,
   evidence: undefined as Record<string, unknown> | undefined,
   audit: [] as Array<{ actor: unknown; action: unknown; entityId: unknown; before: Record<string, unknown>; after: Record<string, unknown> | null }>,
@@ -62,7 +66,8 @@ function run(sql: string, params: unknown[]): Record<string, unknown>[] {
     return [{}];
   }
   if (sql.startsWith("UPDATE invoice_mappings SET status='failed'")) {
-    if (row.claim_token === params[1]) Object.assign(row, { status: "failed", updated_at: now() });
+    // Mirrors the real statement: status='failed',claim_token=NULL.
+    if (row.claim_token === params[1]) Object.assign(row, { status: "failed", claim_token: null, updated_at: now() });
     return [];
   }
   if (sql.startsWith("UPDATE invoice_mappings SET status=$4")) {
@@ -112,7 +117,18 @@ vi.mock("@/lib/kiotviet/products", () => ({
 }));
 vi.mock("@/repositories/mappings", () => ({ mappingsRepository: { findBySku: mocks.findBySku } }));
 vi.mock("@/lib/logger", () => ({ log: vi.fn() }));
-vi.mock("@/lib/env", () => ({ getEnv: () => ({ SESSION_SECRET: "test-session-secret-0123456789abcdef" }) }));
+vi.mock("@/lib/env", () => ({ getEnv: () => ({ SESSION_SECRET: "test-session-secret-0123456789abcdef", KIOTVIET_DEFAULT_SOLD_BY_ID: mocks.defaultSeller }) }));
+vi.mock("@/lib/kiotviet/branches", () => ({ getActiveKiotVietBranches: async () => mocks.branches }));
+// GET /users for seller verification (the real resolveInvoiceSeller runs on top of it).
+vi.mock("@/lib/kiotviet/client", () => ({
+  kiotVietClient: {
+    get: async (url: string) => {
+      if (!url.startsWith("/users")) throw new Error(`Unexpected KiotViet GET ${url}`);
+      if (mocks.usersError) throw mocks.usersError;
+      return { total: mocks.users.length, pageSize: 100, data: mocks.users };
+    },
+  },
+}));
 
 import {
   applyInvoiceRecovery,
@@ -140,7 +156,7 @@ const order1072 = (overrides: Partial<ShopifyOrderWebhook> = {}): ShopifyOrderWe
   ...overrides,
 });
 const kiotVietOrder = (overrides: Record<string, unknown> = {}) => ({
-  id: 5555, code: "DH1072", branchId: 10, status: 1, total: 90, totalPayment: 90, customerId: 77,
+  id: 5555, code: "DH1072", branchId: 10, status: 1, total: 90, totalPayment: 90, customerId: 77, soldById: 1000012735, soldByName: "Dũng",
   createdDate: "2026-10-30T00:00:00Z",
   orderDetails: products.map((product) => ({ productId: product.productId, productCode: product.sku, productName: product.sku, quantity: 1, price: Number(product.price), discount: 0 })),
   ...overrides,
@@ -194,6 +210,10 @@ beforeEach(() => {
   mocks.sql = [];
   mocks.audit = [];
   mocks.orderMapping = {};
+  mocks.users = [{ id: 1000012735, userName: "dung", givenName: "Dũng" }];
+  mocks.usersError = undefined;
+  mocks.defaultSeller = "";
+  mocks.branches = [{ id: 10 }];
   // Sandbox evidence that invoices inherit the order prepayment, plus accounting sign-off.
   mocks.evidence = carriedEvidence;
   mocks.orderSettings.invoicePrepaymentVerified = true;
@@ -738,7 +758,7 @@ describe("Shopify #1072 manual exception (KiotViet DH031113, Bỏ qua PLAN: bloc
     ]);
     // Exact POST /invoices body: existing lines and prices, no added payment, no invented shipping.
     expect(preview.payload).toEqual({
-      branchId: 10, orderId: 25598189, customerId: 77, discount: 0, totalPayment: 0, method: "Transfer",
+      branchId: 10, orderId: 25598189, customerId: 77, soldById: "[verified seller]", discount: 0, totalPayment: 0, method: "Transfer",
       invoiceDetails: [
         { productId: 377001, productCode: "377", productName: "377", quantity: 1, price: 20, discount: 0 },
         { productId: 711001, productCode: "711", productName: "711", quantity: 1, price: 25, discount: 0 },
@@ -808,5 +828,113 @@ describe("Shopify #1072 manual exception (KiotViet DH031113, Bỏ qua PLAN: bloc
     await expect(submit(previewToken)).rejects.toBeInstanceOf(ConflictError);
     expect(mocks.createInvoice).toHaveBeenCalledOnce();
     expect(mocks.invoice).toMatchObject({ status: "creating" });
+  });
+});
+
+describe("invoice seller (soldById, KiotViet HTTP 420)", () => {
+  const fallback = { id: 1000099999, userName: "kho", givenName: "Kho chung" };
+  const override = (previewToken: string) => submitInvoiceOverride({
+    orderId: ORDER_ID, admin: "admin", previewToken, bypassPlanBlocked: true, approvedWarnings: [], confirm: true, reason: "Duyệt tạo hóa đơn theo đối soát",
+  });
+
+  it("existing order: uses the KiotViet order's own verified seller without needing the ENV fallback", async () => {
+    const plan = await planInvoiceRecovery(ORDER_ID);
+    expect(plan.seller).toEqual({ soldById: 1000012735, source: "order" });
+    expect(plan.action).toMatchObject({ kind: "create_invoice", input: { soldById: 1000012735 } });
+    const output = describeInvoiceRecoveryPlan(plan).join("\n");
+    expect(output).toContain("seller: verified (the KiotViet order's seller)");
+    expect(output).not.toContain("1000012735");
+    // The dry-run payload is exactly the POSTed payload.
+    await applyInvoiceRecovery(plan);
+    expect(mocks.createInvoice).toHaveBeenCalledWith((plan.action as { input: unknown }).input);
+  });
+
+  it.each([
+    ["was deleted", () => { mocks.users = [fallback]; }, "order seller does not exist or was deleted"],
+    ["is missing on the order", () => { mocks.users = [fallback]; mocks.kiotVietOrder.mockResolvedValue(kiotVietOrder({ soldById: null })); }, "the KiotViet order has no seller"],
+    ["is deactivated", () => { mocks.users = [{ id: 1000012735, isActive: false }, fallback]; }, "order seller is inactive"],
+    ["belongs to another branch", () => { mocks.users = [{ id: 1000012735, branchIds: [99] }, fallback]; }, "order seller does not belong to the order's branch"],
+  ])("falls back to the verified ENV seller when the order seller %s", async (_label, setup, rejected) => {
+    setup();
+    mocks.defaultSeller = String(fallback.id);
+    const plan = await planInvoiceRecovery(ORDER_ID);
+    expect(plan.seller).toEqual({ soldById: fallback.id, source: "default" });
+    expect(plan.sellerRejected).toContain(rejected);
+    expect(plan.action).toMatchObject({ kind: "create_invoice", input: { soldById: fallback.id } });
+    expect(JSON.stringify(plan.sellerRejected)).not.toMatch(/\d{6,}/);
+  });
+
+  it.each([
+    ["the ENV fallback is missing", () => { mocks.users = []; }, "KIOTVIET_DEFAULT_SOLD_BY_ID) is not configured"],
+    ["the ENV fallback is malformed", () => { mocks.users = []; mocks.defaultSeller = "12abc"; }, "is not a positive integer"],
+    ["the ENV fallback is zero", () => { mocks.users = []; mocks.defaultSeller = "0"; }, "is not a positive integer"],
+    ["the ENV fallback was deleted", () => { mocks.users = []; mocks.defaultSeller = String(fallback.id); }, "KIOTVIET_DEFAULT_SOLD_BY_ID) does not exist or was deleted"],
+    ["the ENV fallback belongs to another branch", () => { mocks.users = [{ ...fallback, branchIds: [99] }]; mocks.defaultSeller = String(fallback.id); }, "does not belong to the order's branch"],
+    ["the ENV fallback's branch cannot be proven in a multi-branch store", () => {
+      mocks.users = [fallback]; mocks.defaultSeller = String(fallback.id); mocks.branches = [{ id: 10 }, { id: 11 }];
+    }, "cannot be verified for the order's branch"],
+  ])("blocks invoicing (not overridable, nothing POSTed) when the order seller is gone and %s", async (_label, setup, message) => {
+    setup();
+    const plan = await planInvoiceRecovery(ORDER_ID);
+    expect(plan.action).toMatchObject({ kind: "blocked", reasons: expect.arrayContaining([expect.stringContaining(message)]) });
+    const { preview, previewToken } = await previewInvoiceOverride(ORDER_ID, "admin");
+    expect(preview).toMatchObject({ submitAllowed: false, seller: { verified: false, source: null } });
+    expect(preview.blockers.map((item) => item.code)).toContain("seller_invalid");
+    // The ENV value never appears in the API response.
+    expect(JSON.stringify(preview)).not.toContain(String(fallback.id));
+    await expect(override(previewToken)).rejects.toBeInstanceOf(ConflictError);
+    expect(mocks.createInvoice).not.toHaveBeenCalled();
+  });
+
+  it("does not plan anything when GET /users fails", async () => {
+    mocks.usersError = new Error("KiotViet 503 on GET /users");
+    await expect(planInvoiceRecovery(ORDER_ID)).rejects.toThrow("503");
+    expect(mocks.createInvoice).not.toHaveBeenCalled();
+  });
+
+  it("manual override: shows only the verification status, sends the server-verified seller, and audits no ID", async () => {
+    mocks.users = [fallback];
+    mocks.defaultSeller = String(fallback.id);
+    const { preview, previewToken } = await previewInvoiceOverride(ORDER_ID, "admin");
+    expect(preview.seller).toEqual({ verified: true, source: "default" });
+    expect(preview.payload).toMatchObject({ soldById: "[verified seller]" });
+    expect(JSON.stringify(preview)).not.toContain(String(fallback.id));
+    expect(previewToken).not.toContain(String(fallback.id));
+    expect(Buffer.from(previewToken.split(".")[0], "base64url").toString()).not.toContain(String(fallback.id));
+    await expect(override(previewToken)).resolves.toMatchObject({ applied: true });
+    expect(mocks.createInvoice.mock.calls[0][0]).toMatchObject({ soldById: fallback.id, totalPayment: 0 });
+    expect(JSON.stringify(mocks.audit)).not.toContain(String(fallback.id));
+  });
+
+  it("requires a new dry run when the seller changes between preview and submit", async () => {
+    const { previewToken } = await previewInvoiceOverride(ORDER_ID, "admin");
+    mocks.users = [fallback];
+    mocks.defaultSeller = String(fallback.id);
+    await expect(override(previewToken)).rejects.toThrow("changed since the preview");
+    expect(mocks.createInvoice).not.toHaveBeenCalled();
+  });
+
+  it("never accepts a client-supplied seller (the API body is strict)", async () => {
+    const { previewToken } = await previewInvoiceOverride(ORDER_ID, "admin");
+    await expect(submitInvoiceOverride({ orderId: ORDER_ID, admin: "admin", previewToken, approvedWarnings: [], confirm: true, reason: "Duyệt tạo hóa đơn theo đối soát", soldById: 1 } as never))
+      .resolves.toMatchObject({ applied: true });
+    // Even if smuggled past the route, the service ignores it and uses the verified seller.
+    expect(mocks.createInvoice.mock.calls[0][0]).toMatchObject({ soldById: 1000012735 });
+  });
+
+  it("records the HTTP 420 seller rejection as a definite failure, never an unknown outcome", async () => {
+    mocks.createInvoice.mockRejectedValueOnce(new ApiError("KiotViet API error (420): Người bán không tồn tại hoặc đã bị xóa khỏi hệ thống", 420));
+    await expect(applyInvoiceRecovery(await planInvoiceRecovery(ORDER_ID))).resolves.toMatchObject({ applied: false, message: expect.stringContaining("rejected") });
+    expect(mocks.invoice).toMatchObject({ status: "failed", claim_token: null });
+    expect((await planInvoiceRecovery(ORDER_ID)).action.kind).toBe("create_invoice");
+  });
+
+  it("never records an extra payment for a prepaid order and never creates a duplicate", async () => {
+    const plan = await planInvoiceRecovery(ORDER_ID);
+    expect(plan.action).toMatchObject({ kind: "create_invoice", input: { totalPayment: 0 } });
+    await applyInvoiceRecovery(plan);
+    await applyInvoiceRecovery(plan);
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+    expect((await planInvoiceRecovery(ORDER_ID)).action.kind).toBe("none");
   });
 });

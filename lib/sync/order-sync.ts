@@ -34,6 +34,7 @@ import {
 } from "./default-branch";
 import { ensureProductMapping } from "./ensure-product-mapping";
 import { log } from "@/lib/logger";
+import { resolveNewOrderSeller } from "@/lib/kiotviet/users";
 import {
   shippingChargedCents,
   computeOrderAmounts,
@@ -557,6 +558,10 @@ async function createMappedOrder(
   try {
     progress.stage = "resolve_branch";
     const branchId = await resolveDefaultBranchId(undefined, settings);
+    // A deleted seller makes KiotViet reject the order and every later invoice (HTTP 420).
+    // No valid seller: stop here (nothing sent); the claim is released as create_failed.
+    progress.stage = "resolve_seller";
+    const seller = await resolveNewOrderSeller(branchId);
     if (invoiceRequested && !(await hasEnabledLocationMapping(branchId))) {
       // Stock deducted by the invoice could not reach Shopify; create the order only.
       await blockAutoInvoice(orderId, token, `branch_location_unmapped: KiotViet branch ${branchId} has no enabled Shopify location mapping`, progress.stage);
@@ -577,6 +582,7 @@ async function createMappedOrder(
     }
     input = {
       branchId,
+      soldById: seller.soldById,
       customer: customerId ? { id: customerId } : undefined,
       description: `Shopify ${order.name} (${order.id})`,
       discount: 0,

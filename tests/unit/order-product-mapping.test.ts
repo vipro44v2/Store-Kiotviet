@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+const sellerMock = vi.hoisted(() => vi.fn(async () => ({ soldById: 4242, source: "default" as const })));
 
 const mocks = vi.hoisted(() => ({
   query: vi.fn(),
@@ -14,6 +15,7 @@ vi.mock("@/lib/db/client", () => ({
     sql.includes("RETURNING") ? [{ shopify_order_id: "100" }] : [],
 }));
 vi.mock("@/lib/logger", () => ({ log: vi.fn() }));
+vi.mock("@/lib/kiotviet/users", () => ({ resolveNewOrderSeller: async () => sellerMock() }));
 vi.mock("@/lib/sync/ensure-product-mapping", () => ({
   ensureProductMapping: mocks.ensureMapping,
 }));

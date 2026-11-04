@@ -1,6 +1,7 @@
 const invoiceJob = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/sync/fulfillment-invoice", () => ({ requestFulfillmentInvoice: invoiceJob }));
 import { beforeEach, describe, expect, it, vi } from "vitest";
+const sellerMock = vi.hoisted(() => vi.fn(async () => ({ soldById: 4242, source: "default" as const })));
 import type { ShopifyOrderWebhook } from "@/types/shopify";
 
 interface Row {
@@ -205,6 +206,7 @@ vi.mock("@/lib/kiotviet/orders", () => ({
 vi.mock("@/lib/sync/customer-sync", () => ({ syncShopifyCustomer: mocks.syncCustomer }));
 vi.mock("@/lib/shopify/orders", () => ({ cancelShopifyOrderById: vi.fn(), fulfillShopifyOrderById: vi.fn() }));
 vi.mock("@/lib/logger", () => ({ log: mocks.log }));
+vi.mock("@/lib/kiotviet/users", () => ({ resolveNewOrderSeller: async () => sellerMock() }));
 vi.mock("@/lib/kiotviet/invoices", () => ({
   findKiotVietInvoicesForOrder: mocks.findInvoices,
   getKiotVietInvoiceDetail: mocks.invoiceDetail,
@@ -813,5 +815,21 @@ describe("Shopify shipping on new KiotViet orders", () => {
   it("keeps the existing payload when no surcharge is configured", async () => {
     await syncShopifyOrder(shipped());
     expect(mocks.createOrder.mock.calls[0][0]).not.toHaveProperty("surchages");
+  });
+});
+
+describe("seller on new KiotViet orders", () => {
+  it("sends the verified default seller as soldById", async () => {
+    await syncShopifyOrder(order());
+    expect(mocks.createOrder).toHaveBeenCalledWith(expect.objectContaining({ soldById: 4242 }));
+  });
+
+  it("does not create the KiotViet order without a valid seller, and records a reclaimable failure", async () => {
+    sellerMock.mockRejectedValueOnce(new ConflictError("seller_invalid: default seller (KIOTVIET_DEFAULT_SOLD_BY_ID) is not configured; the KiotViet order was not created"));
+    await expect(syncShopifyOrder(order())).rejects.toBeInstanceOf(ConflictError);
+    expect(mocks.createOrder).not.toHaveBeenCalled();
+    expect(mocks.db.rows.get("5001")).toMatchObject({ status: "create_failed", failure_stage: "resolve_seller", claim_token: null });
+    // Once the seller is fixed, the next webhook creates the order.
+    await expect(syncShopifyOrder(order(), { jobType: "shopify_order_update" })).resolves.toMatchObject({ action: "created" });
   });
 });
