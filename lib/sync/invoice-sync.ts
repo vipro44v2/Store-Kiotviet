@@ -167,9 +167,13 @@ export async function finalizeInvoice(
   const reconciliation: InvoiceReconciliation = { ...(row.reconciliation ?? {}) };
   const expected = cents(row.expected_total);
   const prepaid = cents(options.prepaid ?? reconciliation.prepaid ?? 0);
+  // An approved override may leave a balance (payment capped at what Shopify received).
+  const expectedPayment = typeof reconciliation.expectedPaymentTotal === "number" ? cents(reconciliation.expectedPaymentTotal) : expected;
   const checks = {
     branch: Number(detail.branchId) === reconciliation.branchId,
-    financialValidation: !Array.isArray(reconciliation.validationReasons) || reconciliation.validationReasons.length === 0,
+    // Validation reasons must be absent, or each one explicitly approved by an admin override.
+    financialValidation: !Array.isArray(reconciliation.validationReasons) || reconciliation.validationReasons.every((reason) =>
+      Array.isArray(reconciliation.approvedWarnings) && reconciliation.approvedWarnings.includes(String(reason).split(":")[0].trim())),
     lines: Boolean(detail.invoiceDetails?.length && reconciliation.expectedLines?.length) &&
       detail.invoiceDetails!.length === reconciliation.expectedLines!.length &&
       reconciliation.expectedLines!.every(line => detail.invoiceDetails!.some(actual =>
@@ -184,7 +188,7 @@ export async function finalizeInvoice(
         (detail.invoiceOrderSurcharges ?? []).reduce((sum, surcharge) => sum + cents(surcharge?.price), 0) === cents(reconciliation.shippingTotal))),
     // KiotViet may report the invoice payment alone or including the order's prepayment.
     payment: row.expected_total !== null &&
-      (cents(detail.totalPayment) === expected || cents(detail.totalPayment) + prepaid === expected),
+      (cents(detail.totalPayment) === expectedPayment || cents(detail.totalPayment) + prepaid === expectedPayment),
   };
   reconciliation.invoice = {
     id: detail.id, code: detail.code,

@@ -24,6 +24,12 @@ export interface OrderSettings {
    * invoice created from an order keeps the order's surcharge.
    */
   shippingSurcharge?: { id: number; code: string; invoiceInheritsFromOrder?: boolean };
+  /**
+   * Set only after accounting verified, on a real KiotViet invoice, how an
+   * order's prepayment is carried to an invoice created from it. Until then the
+   * manual override cannot invoice prepaid orders (no double payment risk).
+   */
+  invoicePrepaymentVerified?: boolean;
   /** Shopify line items that are payment-processing fees, never KiotViet products. See lib/sync/order-line-items.ts. */
   processingFeeVariantIds?: Array<number | string>;
   processingFeeProductIds?: Array<number | string>;

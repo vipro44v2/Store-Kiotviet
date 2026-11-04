@@ -6,6 +6,7 @@ export const ordersSettingsSchema = z
     autoInvoice: z.boolean().optional(),
     invoiceCreationTrigger: z.enum(["shopify_fulfilled", "shopify_paid", "disabled"]).optional(),
     kiotVietCurrency: z.string().regex(/^[A-Z]{3}$/).optional(),
+    invoicePrepaymentVerified: z.boolean().optional(),
     shippingSurcharge: z
       .object({
         id: z.number().int().positive(),

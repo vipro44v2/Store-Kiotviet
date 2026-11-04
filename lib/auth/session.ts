@@ -29,6 +29,17 @@ export async function verifySession(token?: string): Promise<boolean> {
     return false;
   }
 }
+/** Username of the signed-in admin, or null. */
+export async function getSessionUsername(): Promise<string | null> {
+  const token = (await cookies()).get(SESSION_COOKIE)?.value;
+  if (!token) return null;
+  try {
+    const { payload } = await jwtVerify(token, secret(), { issuer: "shopify-kiotviet-sync" });
+    return payload.role === "admin" && typeof payload.username === "string" && payload.username ? payload.username : null;
+  } catch {
+    return null;
+  }
+}
 export async function isAuthenticated(): Promise<boolean> {
   return verifySession((await cookies()).get(SESSION_COOKIE)?.value);
 }

@@ -1,7 +1,13 @@
 import { AuthenticationError } from "@/lib/errors";
-import { isAuthenticated } from "./session";
+import { getSessionUsername, isAuthenticated } from "./session";
 export async function requireAdmin(): Promise<void> {
   if (!(await isAuthenticated())) throw new AuthenticationError();
+}
+/** Like requireAdmin, and returns the admin username for audit logs. */
+export async function requireAdminUser(): Promise<string> {
+  const username = await getSessionUsername();
+  if (!username) throw new AuthenticationError();
+  return username;
 }
 
 export function adminApiErrorResponse(

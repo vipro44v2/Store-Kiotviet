@@ -181,6 +181,26 @@ Recommended instead of the legacy `autoInvoice`. With `invoiceCreationTrigger = 
 3. Build the invoice index until it reports "current": `scripts/build-kiotviet-invoice-index.ts`.
 4. Fulfill one new test order in Shopify, then check `SELECT status,kiotviet_invoice_code,last_error FROM invoice_mappings ORDER BY updated_at DESC LIMIT 5;`.
 
+## Manual invoice override (Admin → Invoices)
+
+**Bỏ qua cảnh báo & tạo hóa đơn** invoices one existing KiotViet order when only approved financial warnings remain. Automatic invoicing (Shopify Fulfilled/Paid) stays strict and never uses it.
+
+- **Overridable** (`lib/sync/invoice-override-rules.ts`): `unsupported_shipping`, `shipping_not_on_kiotviet_order`, `shipping_mismatch`, `total_mismatch`, `amount_mismatch`, `kiotviet_currency_not_configured`, `overpaid`, `unsupported_discount`, `unsupported_tax`.
+- **Never overridable**: everything else, including codes added later. For example: an existing or duplicate invoice, an incomplete invoice index, a request in flight or with unknown outcome, cancelled orders, stale Shopify state, a currency mismatch, invalid SKU mappings, quantities or prices, refunds, surcharge inheritance not verified, and prepayment handling not verified.
+- **Step 1, "Xem trước (Dry Run)"**: a fresh, read-only dry run on the server. It shows:
+  - the Shopify order and the KiotViet order ID and code;
+  - merchandise subtotal, Shopify shipping, surcharges already on the KiotViet order, excluded fees and the KiotViet prepayment;
+  - the invoice total, the additional payment and the balance;
+  - product quantities, warnings, blockers and the exact `POST /invoices` payload.
+  The payload copies the existing KiotViet order lines. Product prices are never changed and no shipping surcharge is invented. The additional payment is `min(invoice total, Shopify total − fees) − prepayment`, never negative, so money that was never received is not recorded and nothing is recorded twice.
+- **Step 2**: the admin must approve every warning shown, tick the confirmation and write a reason of at least 10 characters. The server then:
+  - checks the signed preview token (10 minutes, bound to the admin and the order);
+  - runs the dry run again and rejects the request if the payload, the Shopify or KiotViet order, or the local invoice state changed;
+  - goes through the usual claim, which re-checks invoice existence and the live orders right before the `POST`.
+  Timeouts leave `creating` and are never resent. Concurrent submissions produce at most one invoice.
+- **Prepaid orders**: submission stays disabled until accounting has checked, on a real invoice, how KiotViet carries an order's prepayment, and ticked "Kế toán đã xác nhận…" (`orders.invoicePrepaymentVerified`) in Settings.
+- **Audit**: `audit_logs` gets `kiotviet_invoice_override_requested` and `kiotviet_invoice_override_result` (admin, order, approved warnings, reason, time, payload summary, result, client IP). `invoice_mappings.reconciliation.manualOverride` stores the same approval.
+
 ## Production deployment
 
 Run on the server. Commands assume the PM2 layout in `ecosystem.config.js` and an env file containing `DATABASE_URL` (adjust `--env-file` to yours).

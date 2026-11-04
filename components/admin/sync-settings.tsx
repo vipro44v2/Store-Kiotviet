@@ -56,6 +56,7 @@ export function SyncSettingsCard({
   const [surchargeId, setSurchargeId] = useState(storedSurcharge.id ? String(storedSurcharge.id) : "");
   const [surchargeCode, setSurchargeCode] = useState(storedSurcharge.code ?? "");
   const [surchargeVerified, setSurchargeVerified] = useState(storedSurcharge.invoiceInheritsFromOrder === true);
+  const [prepaymentVerified, setPrepaymentVerified] = useState(orders?.invoicePrepaymentVerified === true);
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -87,6 +88,7 @@ export function SyncSettingsCard({
           throw new Error("Nhập cả ID và mã thu khác KiotViet cho phí vận chuyển, hoặc để trống cả hai");
         nextOrders.shippingSurcharge = { id: Number(surchargeId.trim()), code: surchargeCode.trim(), invoiceInheritsFromOrder: surchargeVerified };
       } else delete nextOrders.shippingSurcharge;
+      nextOrders.invoicePrepaymentVerified = prepaymentVerified;
       if (JSON.stringify(nextOrders) !== JSON.stringify(orders ?? {})) await put("orders", nextOrders);
       setMessage("Đã lưu. Áp dụng cho cả các job đang chờ trong hàng đợi.");
       router.refresh();
@@ -163,6 +165,14 @@ export function SyncSettingsCard({
             Mã phải tồn tại trong KiotViet (GET /surchages). Đơn có phí vận chuyển chỉ được tạo hóa đơn sau khi đánh dấu đã kiểm tra.
           </small>
         </fieldset>
+        <label style={{ display: "block", marginBottom: 12 }}>
+          <input type="checkbox" checked={prepaymentVerified} onChange={(event) => setPrepaymentVerified(event.target.checked)} />{" "}
+          <strong>Kế toán đã xác nhận cách KiotViet ghi nhận tiền trả trước khi tạo hóa đơn từ đơn đặt hàng</strong>
+          <br />
+          <small>
+            Lưu tại orders.invoicePrepaymentVerified. Khi chưa xác nhận, nút &ldquo;Bỏ qua cảnh báo &amp; tạo hóa đơn&rdquo; bị khóa với đơn đã có tiền trả trước, để tránh ghi nhận thanh toán hai lần.
+          </small>
+        </label>
         <label style={{ display: "block" }}>
           <strong>Khi Shopify đã trừ tồn (đơn bán) nhưng KiotViet chưa phản ánh</strong>
           <br />

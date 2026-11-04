@@ -92,7 +92,28 @@ export interface InvoiceRecoveryPlan {
   currency?: string | null;
   expectedLines?: Array<{ productId: number; sku: string; quantity: number; price: number }>;
   stockNow?: Record<string, number | null>;
+  /** Exact invoice a manual override would send; only built when no hard block returned earlier. */
+  proposal?: InvoiceProposal;
   action: InvoiceRecoveryAction;
+}
+
+export interface InvoiceProposal {
+  input: KiotVietInvoiceInput;
+  /** Σ price × quantity of the KiotViet order lines that the invoice copies. */
+  merchandiseSubtotal: number;
+  shopifyShipping: number;
+  /** Surcharges already on the KiotViet order (never added by this app to make totals match). */
+  orderSurcharges: number;
+  excludedFees: number;
+  prepaid: number;
+  invoiceTotal: number;
+  /** Shopify total − excluded processing fees: the most that may ever be recorded as paid. */
+  shopifyPaidForGoods: number;
+  additionalPayment: number;
+  /** > 0: unpaid balance remaining on the invoice; < 0: KiotViet holds more payment than the invoice. */
+  balanceAfterInvoice: number;
+  /** Conditions that disable submission even with approved warnings. */
+  blockers: string[];
 }
 
 const cents = (value: unknown) => Math.round(Number(value ?? 0) * 100);
@@ -259,6 +280,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
       return block(`invoice_outcome_unknown: a previous attempt is ${invoiceRow.status} and no invoice is visible; check KiotViet, then run with --reset-uncertain --apply`);
     return { ...plan, action: { kind: "reset_uncertain" } };
   }
+  if (plan.prepared && plan.expectedLines) plan.proposal = buildInvoiceProposal(plan.prepared, cents(plan.financials?.shippingTotal ?? 0), kiotVietOrder, prepaidCents, settings);
   if (reasons.length) return block(...reasons);
   return {
     ...plan,
@@ -281,12 +303,59 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
   };
 }
 
+/**
+ * The invoice the admin override would send: exactly the existing KiotViet
+ * order lines and surcharges. Payment is capped at what Shopify actually
+ * received for goods, minus what KiotViet already recorded, so a payment is
+ * never invented or recorded twice. Product prices are never changed.
+ */
+function buildInvoiceProposal(prepared: PreparedOrder, shopifyShippingCents: number, kiotVietOrder: KiotVietOrderDetail, prepaidCents: number, settings: OrderSettings): InvoiceProposal {
+  const invoiceDetails = (kiotVietOrder.orderDetails ?? []).map((detail) => ({
+    productId: Number(detail.productId), productCode: String(detail.productCode ?? ""),
+    productName: String(detail.productName ?? detail.productCode ?? ""),
+    quantity: Number(detail.quantity), price: Number(detail.price), discount: 0,
+  }));
+  const blockers: string[] = [];
+  if (!invoiceDetails.length || invoiceDetails.some((detail) => !Number.isSafeInteger(detail.quantity) || detail.quantity <= 0 || !Number.isFinite(detail.price) || detail.price < 0))
+    blockers.push("invalid_kiotviet_lines: the KiotViet order lines are missing or invalid");
+  const detailsCents = invoiceDetails.reduce((sum, detail) => sum + cents(detail.price) * detail.quantity, 0);
+  const surchargeCents = (kiotVietOrder.invoiceOrderSurcharges ?? []).reduce((sum, surcharge) => sum + cents(surcharge?.price), 0);
+  if (surchargeCents > 0 && settings.shippingSurcharge?.invoiceInheritsFromOrder !== true)
+    blockers.push("surcharge_inheritance_unverified: confirm in KiotViet that an invoice created from an order keeps its surcharges");
+  if (prepaidCents > 0 && settings.invoicePrepaymentVerified !== true)
+    blockers.push("prepayment_behavior_unverified: accounting must confirm how KiotViet records an order's prepayment on its invoice (orders.invoicePrepaymentVerified) before invoicing prepaid orders");
+  const invoiceTotalCents = detailsCents + surchargeCents;
+  const paidCents = cents(prepared.amounts.adjustedTotal);
+  const additionalCents = Math.max(0, Math.min(invoiceTotalCents, paidCents) - prepaidCents);
+  return {
+    input: {
+      branchId: Number(kiotVietOrder.branchId),
+      orderId: kiotVietOrder.id,
+      ...(kiotVietOrder.customerId ? { customerId: Number(kiotVietOrder.customerId) } : {}),
+      discount: 0,
+      totalPayment: additionalCents / 100,
+      method: "Transfer",
+      invoiceDetails,
+    },
+    merchandiseSubtotal: detailsCents / 100,
+    shopifyShipping: shopifyShippingCents / 100,
+    orderSurcharges: surchargeCents / 100,
+    excludedFees: prepared.amounts.excludedFeeTotal,
+    prepaid: prepaidCents / 100,
+    invoiceTotal: invoiceTotalCents / 100,
+    shopifyPaidForGoods: paidCents / 100,
+    additionalPayment: additionalCents / 100,
+    balanceAfterInvoice: (invoiceTotalCents - prepaidCents - additionalCents) / 100,
+    blockers,
+  };
+}
+
 function invoiceSearchStart(order: KiotVietOrderDetail) {
   return new Date(new Date(order.createdDate ?? order.purchaseDate ?? Date.now()).getTime() - 86_400_000);
 }
 
-function reconciliationFor(plan: InvoiceRecoveryPlan): InvoiceReconciliation {
-  return { ...plan.invoiceRow?.reconciliation, branchId: Number(plan.kiotVietOrder?.branchId), expectedLines: plan.expectedLines, prepaid: plan.prepaid, shippingTotal: plan.financials?.shippingTotal ?? 0, validationReasons: plan.validationReasons };
+function reconciliationFor(plan: InvoiceRecoveryPlan, extra: Record<string, unknown> = {}): InvoiceReconciliation {
+  return { ...plan.invoiceRow?.reconciliation, ...extra, branchId: Number(plan.kiotVietOrder?.branchId), expectedLines: plan.expectedLines, prepaid: plan.prepaid, shippingTotal: plan.financials?.shippingTotal ?? 0, validationReasons: plan.validationReasons };
 }
 
 /**
@@ -294,7 +363,10 @@ function reconciliationFor(plan: InvoiceRecoveryPlan): InvoiceReconciliation {
  * the unique invoice_mappings constraints; the planned row version must still
  * be current, so concurrent runs or workers make this a no-op.
  */
-export async function applyInvoiceRecovery(plan: InvoiceRecoveryPlan): Promise<{ applied: boolean; message: string }> {
+export async function applyInvoiceRecovery(
+  plan: InvoiceRecoveryPlan,
+  options: { reconciliation?: Record<string, unknown> } = {},
+): Promise<{ applied: boolean; message: string; invoiceCode?: string; status?: string }> {
   const orderId = plan.shopifyOrderId, action = plan.action, kiotVietOrder = plan.kiotVietOrder;
   const plannedVersion = plan.invoiceRow?.updated_at ?? null;
   if (action.kind === "reset_uncertain") {
@@ -322,7 +394,7 @@ export async function applyInvoiceRecovery(plan: InvoiceRecoveryPlan): Promise<{
         AND ($9::timestamptz IS NOT NULL) AND (invoice_mappings.status IN ('failed','blocked') OR $4='linked')
       RETURNING ${INVOICE_COLUMNS}`,
       [orderId, kiotVietOrder.id, kiotVietOrder.code, action.kind === "link" ? "linked" : "recovery", token,
-        plan.expectedTotal ?? null, plan.currency ?? null, JSON.stringify(reconciliationFor(plan)), plannedVersion],
+        plan.expectedTotal ?? null, plan.currency ?? null, JSON.stringify(reconciliationFor(plan, options.reconciliation)), plannedVersion],
     );
     return result.rows[0];
   });
@@ -336,7 +408,7 @@ export async function applyInvoiceRecovery(plan: InvoiceRecoveryPlan): Promise<{
 
   // Fresh stock reading and a last look for an invoice created since the plan (e.g. by staff).
   const reconciliation: InvoiceReconciliation = {
-    ...reconciliationFor(plan),
+    ...reconciliationFor(plan, options.reconciliation),
     stockBefore: await readBranchStock((plan.expectedLines ?? []).map((line) => line.productId), Number(kiotVietOrder.branchId)),
   };
   const recheck = await findKiotVietInvoicesForOrder(ref, invoiceSearchStart(kiotVietOrder));
@@ -387,6 +459,8 @@ export async function applyInvoiceRecovery(plan: InvoiceRecoveryPlan): Promise<{
   const result = await finalizeInvoice({ ...claimed, reconciliation }, created.id, ref, { prepaid: plan.prepaid, source: "recovery" });
   return {
     applied: true,
+    invoiceCode: created.code,
+    status: result.status,
     message: `Created invoice ${created.code}: ${result.status}; stock ${result.reconciliation.stockVerified !== true ? "moved unexpectedly (review)" : "verified"}`,
   };
 }
