@@ -56,7 +56,7 @@ export async function readBranchStock(productIds: number[], branchId: number) {
   for (const productId of [...new Set(productIds)]) {
     const product = await getKiotVietProduct(productId);
     const row = product.inventories?.find((inventory) => Number(inventory.branchId) === Number(branchId));
-    stock[String(productId)] = row ? Number(row.onHand) : null;
+    stock[String(productId)] = row && row.onHand != null && Number.isFinite(Number(row.onHand)) ? Number(row.onHand) : null;
   }
   return stock;
 }
@@ -85,7 +85,7 @@ export interface AutoInvoiceDecision {
 
 /** Only orders being created now are auto-invoiced; enabling the setting never touches existing orders. */
 export function decideAutoInvoice(order: ShopifyOrderWebhook, prepared: PreparedOrder, settings: OrderSettings): AutoInvoiceDecision {
-  if (settings.autoInvoice !== true) return { enabled: false, request: false };
+  if (settings.invoiceCreationTrigger !== undefined || settings.autoInvoice !== true) return { enabled: false, request: false };
   const financials = evaluateInvoiceFinancials(order, prepared, settings);
   return { enabled: true, request: financials.eligible, financials };
 }
@@ -168,8 +168,15 @@ export async function finalizeInvoice(
   const expected = cents(row.expected_total);
   const prepaid = cents(options.prepaid ?? reconciliation.prepaid ?? 0);
   const checks = {
+    branch: Number(detail.branchId) === reconciliation.branchId,
+    financialValidation: !Array.isArray(reconciliation.validationReasons) || reconciliation.validationReasons.length === 0,
+    lines: Boolean(detail.invoiceDetails?.length && reconciliation.expectedLines?.length) &&
+      detail.invoiceDetails!.length === reconciliation.expectedLines!.length &&
+      reconciliation.expectedLines!.every(line => detail.invoiceDetails!.some(actual =>
+        Number(actual.productId) === line.productId && Number(actual.quantity) === line.quantity &&
+        cents(actual.price) === cents(line.price) && cents(actual.discount) === 0)),
     orderCode: detail.orderCode === kiotVietOrder.code,
-    notCancelled: Number(detail.status) !== KIOTVIET_INVOICE_CANCELLED,
+    completed: Number(detail.status) === 1,
     total: row.expected_total !== null && cents(detail.total) === expected,
     // KiotViet may report the invoice payment alone or including the order's prepayment.
     payment: row.expected_total !== null &&
@@ -181,11 +188,17 @@ export async function finalizeInvoice(
   };
   reconciliation.checks = checks;
   if (reconciliation.branchId && reconciliation.expectedLines?.length) {
-    reconciliation.stockAfter = await readBranchStock(reconciliation.expectedLines.map((line) => line.productId), reconciliation.branchId);
-    reconciliation.stockVerified = verifyStockMovement(reconciliation, reconciliation.stockAfter);
+    try {
+      reconciliation.stockAfter = await readBranchStock(reconciliation.expectedLines.map((line) => line.productId), reconciliation.branchId);
+      reconciliation.stockVerified = verifyStockMovement(reconciliation, reconciliation.stockAfter);
+    } catch (error) {
+      reconciliation.stockVerified = false;
+      reconciliation.stockReadError = errorText(error);
+    }
   }
-  const ok = Object.values(checks).every(Boolean);
+  const ok = Object.values(checks).every(Boolean) && reconciliation.stockVerified === true;
   const failed = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);
+  if (reconciliation.stockVerified !== true) failed.push("stock_movement_unverified");
   const updated = await query(
     `UPDATE invoice_mappings SET kiotviet_invoice_id=$2,kiotviet_invoice_code=$3,status=$4,source=COALESCE($8,source),reconciliation=$5,
       last_error=$6,failure_stage=$7,claim_token=NULL,invoiced_at=now(),updated_at=now(),
@@ -228,7 +241,8 @@ export async function verifyOrderInvoice(orderId: string) {
     await markNeedsReview(orderId, "verify_invoice", message);
     throw new ConflictError(message, { shopifyOrderId: orderId, mappingStatus: "duplicate_invoice" });
   }
-  if (active.length === 1) return finalizeInvoice(row, active[0].id, kiotVietOrder);
+  if (active.length === 1) return finalizeInvoice({ ...row, reconciliation: { ...row.reconciliation,
+    ...(!lookup.complete ? { validationReasons: ["invoice_lookup_incomplete"] } : {}) } }, active[0].id, kiotVietOrder);
   if (!lookup.complete || Date.now() - claimedAt < INVOICE_VERIFY_WINDOW_MS)
     throw new RetryableError(`KiotViet invoice for order ${kiotVietOrder.code} is not visible yet`);
   const message = `KiotViet order ${kiotVietOrder.code} was created with makeInvoice but no invoice was found; manual review required (scripts/recover-kiotviet-invoice.ts)`;

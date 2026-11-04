@@ -46,6 +46,32 @@ export async function POST(
         { status: 404 },
       );
     if (action === "retry") {
+      if (job.type === "shopify_invoice_create") {
+        // Permanent per-order audit identity. Retrying never resets invoice claims.
+        if (!isRedisEnabled()) return Response.json({ success: false, error: "Redis worker is required for invoice retries" }, { status: 409 });
+        const queue = getQueue("sync");
+        const queueId = job.queue_job_id ?? `invoice-${id}`;
+        const existing = await queue.getJob(queueId);
+        const state = existing ? await existing.getState() : undefined;
+        if (existing) {
+          if (state !== "failed" && state !== "completed")
+            return Response.json({ success: false, error: "Invoice job is already queued or processing" }, { status: 409 });
+        }
+        const claimed = await query("UPDATE sync_jobs SET queue_job_id=$2,status='pending',error=NULL,error_code=NULL,updated_at=now() WHERE id=$1 AND status NOT IN ('pending','processing') RETURNING id", [id, queueId]);
+        if (!claimed.length) return Response.json({ success: false, error: "Invoice retry already requested" }, { status: 409 });
+        try {
+        if (existing) await existing.retry(state as "failed" | "completed");
+        else {
+          await queue.add(job.type, { ...job.payload, auditJobId: id }, {
+            jobId: queueId, attempts: 1, removeOnComplete: false, removeOnFail: false,
+          });
+        }
+        } catch (error) {
+          await query("UPDATE sync_jobs SET status='failed',error=$2,updated_at=now() WHERE id=$1 AND status='pending'", [id, String(error)]);
+          throw error;
+        }
+        return Response.json({ success: true, jobId: queueId });
+      }
       const queued = await enqueueJob(
         queueFor(job.type),
         job.type,

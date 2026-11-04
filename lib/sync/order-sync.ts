@@ -353,7 +353,12 @@ export async function syncShopifyOrder(
   const progress = { stage: "validate_payload" };
   try {
     assertShopifyOrderPayload(order);
-    return await runShopifyOrderSync(order, context, progress);
+    const result = await runShopifyOrderSync(order, context, progress);
+    if (result.action !== "skipped") {
+      const { requestFulfillmentInvoice } = await import("./fulfillment-invoice");
+      await requestFulfillmentInvoice(String(order.id));
+    }
+    return result;
   } catch (error) {
     await reportOrderSyncFailure(
       order && typeof order === "object" ? order : undefined,
@@ -723,39 +728,19 @@ export async function syncKiotVietInvoice(invoice: KiotVietInvoiceUpdate) {
     ).trim(),
     partner = delivery?.PartnerDelivery ?? delivery?.partnerDelivery,
     company = String(partner?.Name ?? partner?.name ?? "").trim();
-  return transaction(async (client) => {
-    const result = await client.query<{
-      shopify_order_id: string;
-      kiotviet_order_id: string;
-    }>(
-      "SELECT shopify_order_id,kiotviet_order_id FROM order_mappings WHERE kiotviet_order_code=$1",
-      [orderCode],
-    );
-    if (result.rowCount !== 1)
-      throw new MappingError(
-        `KiotViet order ${orderCode} is not uniquely mapped`,
-      );
-    if (!trackingNumber && (await hasAppInvoice(client, result.rows[0].shopify_order_id)))
-      return { fulfilled: false, reason: "invoice_created_by_sync_app" };
-    const fulfilled = await fulfillShopifyOrderById(
-      result.rows[0].shopify_order_id,
-      orderCode,
-      trackingNumber
-        ? { number: trackingNumber, company: company || undefined }
-        : undefined,
-    );
-    if (trackingNumber)
-      await client.query(
-        "INSERT INTO fulfillment_mappings(shopify_fulfillment_id,shopify_order_id,kiotviet_order_id,tracking_number,status) VALUES($1,$2,$3,$4,'synced') ON CONFLICT(shopify_fulfillment_id) DO UPDATE SET tracking_number=EXCLUDED.tracking_number,status='synced',updated_at=now()",
-        [
-          `kiotviet-invoice-${invoice.Id ?? invoice.id}`,
-          result.rows[0].shopify_order_id,
-          result.rows[0].kiotviet_order_id,
-          trackingNumber,
-        ],
-      );
-    return fulfilled;
+  const decision = await transaction(async (client) => {
+    const result = await client.query<{ shopify_order_id: string; kiotviet_order_id: string }>(
+      "SELECT shopify_order_id,kiotviet_order_id FROM order_mappings WHERE kiotviet_order_code=$1", [orderCode]);
+    if (result.rowCount !== 1) throw new MappingError(`KiotViet order ${orderCode} is not uniquely mapped`);
+    return { mapping: result.rows[0], appInvoice: await hasAppInvoice(client, result.rows[0].shopify_order_id) };
   });
+  if (decision.appInvoice) return { fulfilled: false, reason: "invoice_created_by_sync_app" };
+  const fulfilled = await fulfillShopifyOrderById(decision.mapping.shopify_order_id, orderCode,
+    trackingNumber ? { number: trackingNumber, company: company || undefined } : undefined);
+  if (trackingNumber) await query(
+    "INSERT INTO fulfillment_mappings(shopify_fulfillment_id,shopify_order_id,kiotviet_order_id,tracking_number,status) VALUES($1,$2,$3,$4,'synced') ON CONFLICT(shopify_fulfillment_id) DO UPDATE SET tracking_number=EXCLUDED.tracking_number,status='synced',updated_at=now()",
+    [`kiotviet-invoice-${invoice.Id ?? invoice.id}`, decision.mapping.shopify_order_id, decision.mapping.kiotviet_order_id, trackingNumber]);
+  return fulfilled;
 }
 
 export async function syncKiotVietOrderStatus(order: KiotVietOrderUpdate) {
@@ -775,55 +760,27 @@ export async function syncKiotVietOrderStatus(order: KiotVietOrderUpdate) {
   if (!cancelled && !completed)
     return { updated: false, reason: "no_terminal_status" };
 
-  return transaction(async (client) => {
-    await client.query(
-      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-      [`kiotviet-order:${kiotVietOrderId}`],
-    );
-    const result = await client.query<{
-      shopify_order_id: string;
-      status: string | null;
-      kiotviet_order_code: string | null;
-    }>(
-      "SELECT shopify_order_id,status,kiotviet_order_code FROM order_mappings WHERE kiotviet_order_id=$1",
-      [kiotVietOrderId],
-    );
+  const { mapping, appInvoice } = await transaction(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`kiotviet-order:${kiotVietOrderId}`]);
+    const result = await client.query<{ shopify_order_id: string; status: string | null; kiotviet_order_code: string | null }>(
+      "SELECT shopify_order_id,status,kiotviet_order_code FROM order_mappings WHERE kiotviet_order_id=$1", [kiotVietOrderId]);
     const mapping = result.rows[0];
-    if (!mapping)
-      throw new MappingError(`KiotViet order ${kiotVietOrderId} is not mapped`);
-    const code = mapping.kiotviet_order_code ?? order.Code ?? order.code;
-    if (cancelled) {
-      if (mapping.status === "cancelled")
-        return { updated: false, reason: "already_cancelled" };
-      await cancelShopifyOrderById(mapping.shopify_order_id, code);
-      await client.query(
-        "UPDATE order_mappings SET status='cancelled',sync_status='synced',last_sync_at=now(),updated_at=now() WHERE kiotviet_order_id=$1",
-        [kiotVietOrderId],
-      );
-      return {
-        updated: true,
-        action: "cancelled",
-        shopifyOrderId: mapping.shopify_order_id,
-      };
-    }
-    if (mapping.status === "cancelled")
-      return { updated: false, reason: "shopify_order_cancelled" };
-    if (mapping.status === "completed")
-      return { updated: false, reason: "already_completed" };
-    // Invoicing completes the KiotViet order; that alone does not mean it shipped.
-    if (await hasAppInvoice(client, mapping.shopify_order_id))
-      return { updated: false, reason: "completed_by_app_invoice" };
-    await fulfillShopifyOrderById(mapping.shopify_order_id, code);
-    await client.query(
-      "UPDATE order_mappings SET status='completed',fulfillment_status='fulfilled',sync_status='synced',last_sync_at=now(),updated_at=now() WHERE kiotviet_order_id=$1",
-      [kiotVietOrderId],
-    );
-    return {
-      updated: true,
-      action: "fulfilled",
-      shopifyOrderId: mapping.shopify_order_id,
-    };
+    if (!mapping) throw new MappingError(`KiotViet order ${kiotVietOrderId} is not mapped`);
+    return { mapping, appInvoice: await hasAppInvoice(client, mapping.shopify_order_id) };
   });
+  const code = mapping.kiotviet_order_code ?? order.Code ?? order.code;
+  if (cancelled) {
+    if (mapping.status === "cancelled") return { updated: false, reason: "already_cancelled" };
+    await cancelShopifyOrderById(mapping.shopify_order_id, code);
+    await query("UPDATE order_mappings SET status='cancelled',sync_status='synced',last_sync_at=now(),updated_at=now() WHERE kiotviet_order_id=$1", [kiotVietOrderId]);
+    return { updated: true, action: "cancelled", shopifyOrderId: mapping.shopify_order_id };
+  }
+  if (mapping.status === "cancelled") return { updated: false, reason: "shopify_order_cancelled" };
+  if (mapping.status === "completed") return { updated: false, reason: "already_completed" };
+  if (appInvoice) return { updated: false, reason: "completed_by_app_invoice" };
+  await fulfillShopifyOrderById(mapping.shopify_order_id, code);
+  await query("UPDATE order_mappings SET status='completed',fulfillment_status='fulfilled',sync_status='synced',last_sync_at=now(),updated_at=now() WHERE kiotviet_order_id=$1 AND status IS DISTINCT FROM 'cancelled'", [kiotVietOrderId]);
+  return { updated: true, action: "fulfilled", shopifyOrderId: mapping.shopify_order_id };
 }
 
 export const syncKiotVietOrderCancellation = syncKiotVietOrderStatus;

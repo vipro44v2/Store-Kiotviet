@@ -190,7 +190,7 @@ describe("product media reconciliation", () => {
       normalized_sku: "A", kiotviet_code: "A", sync_status: "synced", last_sync_hash: await productSyncHash([next]),
       shopify_product_id: "p1", shopify_variant_id: "v1", shopify_inventory_item_id: "i1",
     });
-    expect(syncInventoryNotification).toHaveBeenLastCalledWith(expect.objectContaining({ ProductId: 2, OnHand: 17 }), undefined);
+    expect(syncInventoryNotification).toHaveBeenLastCalledWith(expect.objectContaining({ ProductId: 2, OnHand: 17 }), undefined, { refreshFromKiotViet: true, conflictStrategy: "kiotviet_wins" });
     await syncDeletedKiotVietProducts([{ id: 1, code: "A" }]);
     expect(calls("ArchiveSyncedProduct")).toHaveLength(1);
     expect(persisted.find((item) => item.kiotviet_product_id === "2")?.sync_status).toBe("synced");

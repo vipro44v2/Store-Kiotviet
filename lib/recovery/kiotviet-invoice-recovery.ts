@@ -1,3 +1,4 @@
+import { getInvoiceOrder } from "@/lib/shopify/invoice-order";
 import { randomUUID } from "node:crypto";
 import { query, transaction } from "@/lib/db/client";
 import {
@@ -79,11 +80,13 @@ export type InvoiceRecoveryAction =
 
 export interface InvoiceRecoveryPlan {
   shopifyOrderId: string;
+  shopifySnapshot?: ShopifyOrderWebhook;
   mapping?: OrderMapping;
   invoiceRow?: InvoiceRow;
   kiotVietOrder?: KiotVietOrderDetail;
   prepared?: PreparedOrder;
   financials?: InvoiceFinancials;
+  validationReasons?: string[];
   expectedTotal?: number;
   prepaid?: number;
   currency?: string | null;
@@ -100,6 +103,7 @@ async function staleness(orderId: string, payload: ShopifyOrderWebhook) {
   const live = await getShopifyOrderPaymentState(orderId);
   if (!live) return ["shopify_order_missing: the order no longer exists in Shopify"];
   const reasons: string[] = [];
+  if (live.updatedAt && payload.updated_at !== live.updatedAt) reasons.push("stale_payload: order changed during validation");
   if (Boolean(live.cancelledAt) !== Boolean(payload.cancelled_at)) reasons.push("stale_payload: cancellation differs from Shopify");
   if (live.displayFinancialStatus.toLowerCase() !== String(payload.financial_status ?? "").toLowerCase())
     reasons.push(`stale_payload: Shopify financial status is ${live.displayFinancialStatus}, stored webhook says ${payload.financial_status}`);
@@ -128,7 +132,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
   if (mapping.status === "cancelled") return block("order_cancelled: the KiotViet order mapping is cancelled");
   const [invoiceRow] = await query<InvoiceRow>(`SELECT ${INVOICE_COLUMNS} FROM invoice_mappings WHERE shopify_order_id=$1`, [orderId]);
   plan.invoiceRow = invoiceRow;
-  if (invoiceRow?.status === "created")
+  if (invoiceRow?.kiotviet_invoice_id)
     return { ...plan, action: { kind: "none", reason: `already invoiced: ${invoiceRow.kiotviet_invoice_code} (${invoiceRow.kiotviet_invoice_id})` } };
 
   const kiotVietOrder = await getKiotVietOrder(Number(mapping.kiotviet_order_id));
@@ -138,16 +142,15 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
 
   // Validation runs before the invoice lookup so a linked invoice is also checked.
   const reasons: string[] = [];
+  plan.validationReasons = reasons;
   const [settingsRow] = await query<{ value: OrderSettings }>("SELECT value FROM system_settings WHERE key='orders'");
   const settings = settingsRow?.value ?? {};
-  const [event] = await query<{ id: string; payload: ShopifyOrderWebhook }>(
-    `SELECT id,payload FROM webhook_events WHERE provider='shopify' AND external_resource_id=$1
-    AND event_type IN ('orders/updated','orders/create','orders/paid') ORDER BY received_at DESC LIMIT 1`,
-    [orderId],
-  );
+  const event = { payload: await getInvoiceOrder(orderId) };
+  plan.shopifySnapshot = event.payload;
   if (!event) reasons.push("no_shopify_payload: no stored Shopify order webhook");
   else {
     reasons.push(...(await staleness(orderId, event.payload)));
+    if (["partial", "partially_fulfilled"].includes(event.payload.fulfillment_status ?? "")) reasons.push("partial_fulfillment: manual review required");
     try {
       plan.prepared = prepareOrderForKiotViet(event.payload, settings);
       plan.financials = evaluateInvoiceFinancials(event.payload, plan.prepared, settings);
@@ -205,6 +208,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
     if (plan.expectedTotal !== undefined && cents(kiotVietOrder.total) !== cents(plan.expectedTotal))
       reasons.push(`total_mismatch: KiotViet order total ${kiotVietOrder.total} differs from expected ${plan.expectedTotal}`);
     plan.stockNow = await readBranchStock([...expected.keys()], Number(kiotVietOrder.branchId));
+    if (Object.values(plan.stockNow).some(value => value === null || !Number.isFinite(value))) reasons.push("branch_stock_unavailable: cannot establish stock before invoicing");
   }
 
   // Payment already recorded on the order (prepayment) must not be recorded again.
@@ -212,15 +216,21 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
     ? cents(kiotVietOrder.totalPayment)
     : (kiotVietOrder.payments ?? []).reduce((sum, payment) => sum + cents(payment?.amount), 0);
   plan.prepaid = prepaidCents / 100;
+  if (!Number.isFinite(prepaidCents) || prepaidCents < 0 || (kiotVietOrder.totalPayment == null && !Array.isArray(kiotVietOrder.payments)))
+    reasons.push("payment_unknown: KiotViet prepayment is missing or invalid");
+  if (kiotVietOrder.totalPayment != null && kiotVietOrder.payments?.length &&
+      kiotVietOrder.payments.reduce((sum, payment) => sum + cents(payment.amount), 0) !== prepaidCents)
+    reasons.push("payment_mismatch: KiotViet payment rows disagree with totalPayment");
   if (plan.expectedTotal !== undefined && prepaidCents > cents(plan.expectedTotal))
     reasons.push(`overpaid: KiotViet order already records ${plan.prepaid} paid, more than ${plan.expectedTotal}`);
 
   // Never issue an invoice before proving none exists.
-  const lookup = await findKiotVietInvoicesForOrder({ id: kiotVietOrder.id, code: kiotVietOrder.code }, invoiceSearchStart(kiotVietOrder));
+  const lookup = await findKiotVietInvoicesForOrder({ id: kiotVietOrder.id, code: kiotVietOrder.code, branchId: kiotVietOrder.branchId, customerId: kiotVietOrder.customerId }, invoiceSearchStart(kiotVietOrder));
   const active = lookup.invoices.filter((invoice) => Number(invoice.status) !== KIOTVIET_INVOICE_CANCELLED);
   if (active.length > 1) return block(`duplicate_invoices: KiotViet order ${kiotVietOrder.code} has ${active.length} invoices (${active.map((invoice) => invoice.code).join(", ")})`);
+  if (!lookup.complete && active.length === 1) reasons.push("invoice_lookup_incomplete: invoice uniqueness cannot be fully verified");
   if (active.length === 1) return { ...plan, action: { kind: "link", invoice: { id: active[0].id, code: active[0].code } } };
-  if (!lookup.complete) return block("invoice_lookup_incomplete: could not prove that no invoice exists for this KiotViet order");
+  if (!lookup.complete) return block(...reasons, "invoice_lookup_incomplete: could not prove that no invoice exists for this KiotViet order");
   if (lookup.invoices.length)
     return block(`cancelled_invoice_exists: ${lookup.invoices.map((invoice) => invoice.code).join(", ")}; review in KiotViet before invoicing again`);
   if (kiotVietOrder.status === 3) reasons.push("kiotviet_order_completed: the KiotViet order is completed but has no invoice");
@@ -260,7 +270,7 @@ function invoiceSearchStart(order: KiotVietOrderDetail) {
 }
 
 function reconciliationFor(plan: InvoiceRecoveryPlan): InvoiceReconciliation {
-  return { branchId: Number(plan.kiotVietOrder?.branchId), expectedLines: plan.expectedLines, prepaid: plan.prepaid };
+  return { ...plan.invoiceRow?.reconciliation, branchId: Number(plan.kiotVietOrder?.branchId), expectedLines: plan.expectedLines, prepaid: plan.prepaid, validationReasons: plan.validationReasons };
 }
 
 /**
@@ -301,7 +311,7 @@ export async function applyInvoiceRecovery(plan: InvoiceRecoveryPlan): Promise<{
     return result.rows[0];
   });
   if (!claimed) return { applied: false, message: "Invoice state changed since the dry run (another run or worker); nothing changed" };
-  const ref = { id: kiotVietOrder.id, code: kiotVietOrder.code };
+  const ref = { id: kiotVietOrder.id, code: kiotVietOrder.code, branchId: kiotVietOrder.branchId, customerId: kiotVietOrder.customerId };
 
   if (action.kind === "link") {
     const result = await finalizeInvoice(claimed, action.invoice.id, ref, { prepaid: plan.prepaid, source: "linked" });
@@ -315,7 +325,7 @@ export async function applyInvoiceRecovery(plan: InvoiceRecoveryPlan): Promise<{
   };
   const recheck = await findKiotVietInvoicesForOrder(ref, invoiceSearchStart(kiotVietOrder));
   if (!recheck.complete) {
-    await query("UPDATE invoice_mappings SET status='failed',claim_token=NULL,last_error=$2,updated_at=now() WHERE shopify_order_id=$1 AND claim_token=$3",
+    await query("UPDATE invoice_mappings SET status='needs_review',claim_token=NULL,last_error=$2,updated_at=now() WHERE shopify_order_id=$1 AND claim_token=$3",
       [orderId, "Invoice lookup was incomplete right before sending; nothing sent", token]);
     return { applied: false, message: "Could not re-confirm that no invoice exists; nothing sent" };
   }
@@ -329,6 +339,11 @@ export async function applyInvoiceRecovery(plan: InvoiceRecoveryPlan): Promise<{
       [orderId, `KiotViet order ${ref.code} now has ${appeared.length} invoices`, token]);
     return { applied: false, message: "Several invoices appeared since the dry run; marked needs_review" };
   }
+  if (recheck.invoices.length) return { applied: false, message: "Cancelled invoice exists; manual review required" };
+  const fresh = await getInvoiceOrder(orderId);
+  const freshOrder = await getKiotVietOrder(kiotVietOrder.id);
+  if (JSON.stringify(fresh) !== JSON.stringify(plan.shopifySnapshot) || JSON.stringify(freshOrder) !== JSON.stringify(kiotVietOrder))
+    return { applied: false, message: "Order changed during validation; nothing sent; manual review required" };
   const marked = await query(
     "UPDATE invoice_mappings SET status='creating',reconciliation=$3,updated_at=now() WHERE shopify_order_id=$1 AND status='pending' AND claim_token=$2 RETURNING shopify_order_id",
     [orderId, token, JSON.stringify(reconciliation)],
@@ -356,7 +371,7 @@ export async function applyInvoiceRecovery(plan: InvoiceRecoveryPlan): Promise<{
   const result = await finalizeInvoice({ ...claimed, reconciliation }, created.id, ref, { prepaid: plan.prepaid, source: "recovery" });
   return {
     applied: true,
-    message: `Created invoice ${created.code}: ${result.status}; stock ${result.reconciliation.stockVerified === false ? "moved unexpectedly (review)" : "verified"}`,
+    message: `Created invoice ${created.code}: ${result.status}; stock ${result.reconciliation.stockVerified !== true ? "moved unexpectedly (review)" : "verified"}`,
   };
 }
 
@@ -371,6 +386,7 @@ export function describeInvoiceRecoveryPlan(plan: InvoiceRecoveryPlan): string[]
     lines.push(`amounts: shopify_total=${plan.prepared.amounts.shopifyTotal} excluded_fees=${plan.prepared.amounts.excludedFeeTotal} expected_invoice_total=${plan.expectedTotal} currency=${plan.currency ?? "?"}`);
   for (const line of plan.expectedLines ?? [])
     lines.push(`line: SKU ${line.sku} product ${line.productId} qty=${line.quantity} price=${line.price} stock_now=${plan.stockNow?.[String(line.productId)] ?? "?"}`);
+  for (const reason of plan.validationReasons ?? []) lines.push(`validation: ${reason}`);
   const action = plan.action;
   if (action.kind === "blocked") lines.push("PLAN: blocked", ...action.reasons.map((reason) => `  - ${reason}`));
   else if (action.kind === "none") lines.push(`PLAN: nothing to do (${action.reason})`);

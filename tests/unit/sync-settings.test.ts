@@ -173,7 +173,7 @@ describe("worker gating", () => {
     mocks.syncOrder.mockRejectedValue(new TypeError("Cannot read properties of null (reading 'trim')"));
     await expect(processSyncJob(job("shopify_order_update", { eventId: "evt-4" }))).rejects.toThrow(TypeError);
     await expect(processSyncJob(job("inventory_reconciliation"))).resolves.toBeUndefined();
-    expect(mocks.page).toHaveBeenCalledWith(0, "audit-1", "chain", { conflictStrategy: "hold" });
+    expect(mocks.page).toHaveBeenCalledWith(0, "audit-1", "chain", { conflictStrategy: "hold", refreshFromKiotViet: true });
   });
 
   it("does not write Shopify inventory when inventory sync is disabled, without failing the job", async () => {

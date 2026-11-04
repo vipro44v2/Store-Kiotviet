@@ -6,6 +6,7 @@ import { enqueueJob } from "@/lib/queue/queues";
 import type { JobType } from "@/lib/queue/jobs";
 import { log } from "@/lib/logger";
 const topicJobs: Record<string, JobType | null> = {
+  "orders/paid": "shopify_order_update",
   "orders/create": "shopify_order_create",
   "orders/updated": "shopify_order_update",
   "orders/cancelled": "shopify_order_cancel",

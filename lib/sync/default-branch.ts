@@ -12,6 +12,8 @@ export interface OrderSettings {
   defaultBranchId?: number | string | null;
   /** Create the KiotViet invoice together with new orders (makeInvoice). Default false. */
   autoInvoice?: boolean;
+  invoiceCreationTrigger?: "shopify_fulfilled" | "shopify_paid" | "disabled";
+  invoiceTriggerEnabledAt?: string;
   /** Currency that KiotViet prices are recorded in; must equal the Shopify order currency to invoice. */
   kiotVietCurrency?: string;
   /** Shopify line items that are payment-processing fees, never KiotViet products. See lib/sync/order-line-items.ts. */

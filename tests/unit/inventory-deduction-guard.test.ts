@@ -1,3 +1,4 @@
+vi.mock("@/lib/db/inventory-lock", () => ({ withInventoryLock: async (_key: string, work: () => Promise<unknown>) => work() }));
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { KiotVietStockNotification } from "@/lib/kiotviet/types";
 

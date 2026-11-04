@@ -40,10 +40,10 @@ describe("KiotViet invoices created by this app do not fulfill Shopify orders", 
     expect(mocks.fulfill).not.toHaveBeenCalled();
   });
 
-  it("still fulfills when staff add a delivery tracking number", async () => {
+  it("does not fulfill app invoices even when tracking is attached", async () => {
     mocks.appInvoice = true;
     await syncKiotVietInvoice({ Id: 9001, OrderCode: "DH700", InvoiceDelivery: { DeliveryCode: "GHN123" } });
-    expect(mocks.fulfill).toHaveBeenCalledWith("5001", "DH700", { number: "GHN123", company: undefined });
+    expect(mocks.fulfill).not.toHaveBeenCalled();
   });
 
   it("keeps the existing behavior for invoices staff create in KiotViet", async () => {

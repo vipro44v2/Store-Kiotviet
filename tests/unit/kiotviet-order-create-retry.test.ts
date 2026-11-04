@@ -106,7 +106,7 @@ describe("KiotViet invoice API", () => {
     await expect(findKiotVietInvoicesForOrder({ id: 5555, code: "DH1072" }, new Date("2026-10-29T00:00:00Z")))
       .resolves.toEqual({ invoices: [{ id: 2, code: "HD2", orderCode: "DH1072", status: 1 }], complete: true });
     expect(String(fetchMock.mock.calls[0][0])).toContain("orderId=5555");
-    expect(String(fetchMock.mock.calls[1][0])).toContain("fromPurchaseDate=2026-10-29");
+    expect(String(fetchMock.mock.calls[1][0])).not.toContain("fromPurchaseDate");
   });
 
   it("reports an incomplete lookup when the scan cannot finish", async () => {

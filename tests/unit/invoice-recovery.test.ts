@@ -1,3 +1,4 @@
+vi.mock("@/lib/shopify/invoice-order", () => ({ getInvoiceOrder: async () => structuredClone(mocks.event?.payload) }));
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ShopifyOrderWebhook } from "@/types/shopify";
 
@@ -128,6 +129,36 @@ const kiotVietOrder = (overrides: Record<string, unknown> = {}) => ({
 });
 const noInvoices = { invoices: [], complete: true };
 
+it("retains the invoice ID but requires review when inventory did not move", async () => {
+  mocks.createInvoice.mockResolvedValue({ id: 8001, code: "HD8001" });
+  await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_ID));
+  expect(mocks.invoice).toMatchObject({ kiotviet_invoice_id: "8001", status: "needs_review",
+    reconciliation: expect.objectContaining({ stockVerified: false }) });
+  await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_ID));
+  expect(mocks.createInvoice).toHaveBeenCalledOnce();
+});
+
+it("blocks the reported 80 product / 90 prepaid discrepancy", async () => {
+  const snapshot = order1072();
+  snapshot.line_items[0].price = "10.00";
+  mocks.event = { id: "e", payload: snapshot };
+  const remote = kiotVietOrder({ total: 80 });
+  remote.orderDetails[0].price = 10;
+  mocks.kiotVietOrder.mockResolvedValue(remote);
+  const plan = await planInvoiceRecovery(ORDER_ID);
+  expect(plan.action).toMatchObject({ kind: "blocked", reasons: expect.arrayContaining([
+    expect.stringContaining("amount_mismatch"), expect.stringContaining("overpaid"),
+  ]) });
+  expect(mocks.createInvoice).not.toHaveBeenCalled();
+});
+
+it("does not send an invoice if the live order changes after planning", async () => {
+  const plan = await planInvoiceRecovery(ORDER_ID);
+  mocks.event = { id: "new", payload: order1072({ cancelled_at: "2026-11-04" }) };
+  await expect(applyInvoiceRecovery(plan)).resolves.toMatchObject({ applied: false, message: expect.stringContaining("Order changed") });
+  expect(mocks.createInvoice).not.toHaveBeenCalled();
+});
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.invoice = undefined;
@@ -148,7 +179,7 @@ beforeEach(() => {
     for (const product of products) mocks.stock[String(product.productId)] -= 1;
     return { id: 8001, code: "HD8001" };
   });
-  mocks.invoiceDetail.mockResolvedValue({ id: 8001, code: "HD8001", orderCode: "DH1072", status: 1, total: 90, totalPayment: 0 });
+  mocks.invoiceDetail.mockResolvedValue({ id: 8001, code: "HD8001", orderCode: "DH1072", status: 1, branchId: 10, invoiceDetails: kiotVietOrder().orderDetails, total: 90, totalPayment: 0 });
 });
 
 describe("invoice recovery CLI arguments", () => {
@@ -199,7 +230,7 @@ describe("existing order #1072 without invoice", () => {
     expect(plan.action).toEqual({ kind: "link", invoice: { id: 8001, code: "HD8001" } });
     await applyInvoiceRecovery(plan);
     expect(mocks.createInvoice).not.toHaveBeenCalled();
-    expect(mocks.invoice).toMatchObject({ status: "created", source: "linked", kiotviet_invoice_id: "8001" });
+    expect(mocks.invoice).toMatchObject({ status: "needs_review", source: "linked", kiotviet_invoice_id: "8001" });
   });
 
   it("does nothing once the invoice is recorded", async () => {
@@ -226,7 +257,7 @@ describe("existing order #1072 without invoice", () => {
     mocks.findInvoices.mockResolvedValue({ invoices: [{ id: 8001, code: "HD8001", orderCode: "DH1072", status: 1 }], complete: true });
     await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_ID));
     expect(mocks.createInvoice).toHaveBeenCalledOnce();
-    expect(mocks.invoice).toMatchObject({ status: "created", kiotviet_invoice_id: "8001" });
+    expect(mocks.invoice).toMatchObject({ status: "needs_review", kiotviet_invoice_id: "8001" });
   });
 
   it("lets an operator reset a confirmed-missing uncertain attempt, then invoice", async () => {

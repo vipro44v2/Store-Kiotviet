@@ -1,3 +1,4 @@
+import { getSyncSettings } from "./sync-settings";
 import {
   getKiotVietProduct,
   getKiotVietVariantFamily,
@@ -198,6 +199,7 @@ async function syncInventory(product: KiotVietProduct, jobId?: string) {
         Reserved: inventory.reserved ?? inventory.actualReserved ?? 0,
       },
       jobId,
+      { refreshFromKiotViet: true, conflictStrategy: (await getSyncSettings()).inventoryConflictStrategy },
     );
   }
 }

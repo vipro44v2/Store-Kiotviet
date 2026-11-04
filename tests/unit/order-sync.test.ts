@@ -1,3 +1,5 @@
+const invoiceJob = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/sync/fulfillment-invoice", () => ({ requestFulfillmentInvoice: invoiceJob }));
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ShopifyOrderWebhook } from "@/types/shopify";
 
@@ -608,7 +610,7 @@ describe("Auto Invoice (orders.autoInvoice)", () => {
     mocks.findInvoices.mockResolvedValue({
       invoices: [{ id: 9001, code: "HD9001", orderCode: "DH700", status: 1, statusValue: "Completed" }], complete: true,
     });
-    mocks.invoiceDetail.mockResolvedValue({ id: 9001, code: "HD9001", orderCode: "DH700", status: 1, total: 300000, totalPayment: 300000 });
+    mocks.invoiceDetail.mockResolvedValue({ id: 9001, code: "HD9001", orderCode: "DH700", status: 1, branchId: 10, invoiceDetails: [{ productId: 501, quantity: 2, price: 150000 }], total: 300000, totalPayment: 300000 });
   });
 
   it("creates the order with makeInvoice, verifies the invoice and stock movement, and saves both IDs", async () => {
@@ -752,4 +754,11 @@ describe("Auto Invoice (orders.autoInvoice)", () => {
     expect(stock["501"]).toBe(8);
     expect(mocks.db.invoices.get("5001")).toMatchObject({ kiotviet_invoice_id: "9001" });
   });
+});
+
+it.each([null, "fulfilled"])("new fulfilled trigger always creates order only (fulfillment=%s)", async fulfillment_status => {
+  mocks.db.orders = { autoInvoice: true, invoiceCreationTrigger: "shopify_fulfilled", kiotVietCurrency: "VND" };
+  await syncShopifyOrder(order({ currency: "VND", fulfillment_status }));
+  expect(mocks.createOrder).toHaveBeenCalledWith(expect.objectContaining({ makeInvoice: false }));
+  expect(invoiceJob).toHaveBeenCalledWith("5001");
 });

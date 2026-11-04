@@ -1,3 +1,4 @@
+import { withInventoryLock } from "@/lib/db/inventory-lock";
 import { ConflictError, MappingError, RetryableError } from "@/lib/errors";
 import { normalizeSku } from "./mappings";
 import { mappingsRepository } from "@/repositories/mappings";
@@ -27,13 +28,8 @@ export interface InventorySyncOptions {
 async function currentKiotVietStock(notification: KiotVietStockNotification, jobId?: string) {
   const product = await getKiotVietProduct(Number(notification.ProductId));
   const current = product.inventories?.find((inventory) => Number(inventory.branchId) === Number(notification.BranchId));
-  if (!current) {
-    await log("warn", "KiotViet returned no stock row for the branch; using the webhook value", {
-      action: "inventory_refresh_unavailable", provider: "kiotviet", entityType: "inventory",
-      entityId: notification.ProductCode, branchId: notification.BranchId, jobId,
-    });
-    return notification;
-  }
+  if (!current || current.onHand == null || !Number.isFinite(Number(current.onHand)))
+    throw new RetryableError("Authoritative KiotViet branch stock unavailable; stale webhook ignored");
   const refreshed = { ...notification, OnHand: Number(current.onHand), Reserved: Number(current.reserved ?? notification.Reserved ?? 0) };
   if (refreshed.OnHand !== Number(notification.OnHand))
     await log("info", "Stale KiotViet stock event superseded by current stock", {
@@ -92,6 +88,13 @@ export function calculateInventory(
   return allowsNegative ? value : Math.max(0, value);
 }
 export async function syncInventoryNotification(
+  notification: KiotVietStockNotification, jobId?: string, options: InventorySyncOptions = {},
+) {
+  return withInventoryLock(`inventory:${notification.BranchId}:${notification.ProductId}`,
+    () => syncInventoryNotificationLocked(notification, jobId, options));
+}
+
+async function syncInventoryNotificationLocked(
   notification: KiotVietStockNotification,
   jobId?: string,
   options: InventorySyncOptions = {},

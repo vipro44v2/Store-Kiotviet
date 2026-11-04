@@ -31,5 +31,5 @@ it("skips an overlapping scheduler root", async () => {
 it("passes the same chain to pagination", async () => {
   mocks.admit.mockResolvedValue({ deduplicated: false, payload: { reconciliationChainId: "chain" } });
   await processSyncJob(job({ currentItem: 100, auditJobId: "page", reconciliationChainId: "chain" }));
-  expect(mocks.page).toHaveBeenCalledWith(100, "page", "chain", { conflictStrategy: "hold" });
+  expect(mocks.page).toHaveBeenCalledWith(100, "page", "chain", { conflictStrategy: "hold", refreshFromKiotViet: true });
 });

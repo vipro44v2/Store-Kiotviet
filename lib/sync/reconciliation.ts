@@ -47,4 +47,12 @@ export async function reconcileInventoryPage(currentItem = 0, jobId?: string, re
   return { processed: page.data.length, next: next < page.total ? next : null, total: page.total };
 }
 
-export async function cleanupOldData(){await query("DELETE FROM webhook_events WHERE status IN ('processed','ignored') AND received_at < now()-interval '30 days'");await query("DELETE FROM sync_jobs WHERE status IN ('completed','skipped') AND completed_at < now()-interval '30 days'");await query("DELETE FROM sync_logs WHERE created_at < now()-interval '90 days'");await query("DELETE FROM audit_logs WHERE created_at < now()-interval '180 days'");}
+export async function cleanupOldData() {
+  // One bounded batch per table per scheduler tick; never delete failed/manual_review or invoice outbox records.
+  for (const [table, condition, time] of [
+    ["webhook_events", "status IN ('processed','ignored') AND received_at < now()-interval '30 days'", "received_at"],
+    ["sync_jobs", "type <> 'shopify_invoice_create' AND status IN ('completed','skipped') AND completed_at < now()-interval '30 days'", "completed_at"],
+    ["sync_logs", "created_at < now()-interval '90 days'", "created_at"],
+    ["audit_logs", "created_at < now()-interval '180 days'", "created_at"],
+  ]) await query(`DELETE FROM ${table} WHERE id IN (SELECT id FROM ${table} WHERE ${condition} ORDER BY ${time} LIMIT 500 FOR UPDATE SKIP LOCKED)`);
+}

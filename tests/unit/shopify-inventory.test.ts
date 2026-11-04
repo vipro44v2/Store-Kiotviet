@@ -1,3 +1,4 @@
+vi.mock("@/lib/db/inventory-lock", () => ({ withInventoryLock: async (_key: string, work: () => Promise<unknown>) => work() }));
 ﻿import { beforeEach, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ graphql: vi.fn(), query: vi.fn(), log: vi.fn(), findBySku: vi.fn() }));
 vi.mock("@/lib/shopify/graphql", () => ({ shopifyGraphql: mocks.graphql }));

@@ -78,7 +78,7 @@ export interface DisabledSync {
   reason: string;
 }
 
-const ORDER_JOBS = new Set(["shopify_order_create", "shopify_order_update"]);
+const ORDER_JOBS = new Set(["shopify_invoice_create", "shopify_fulfillment", "fulfillment_invoice_reconciliation", "shopify_order_create", "shopify_order_update"]);
 const ORDER_STATUS_JOBS = new Set(["kiotviet_order_to_shopify", "kiotviet_invoice_to_shopify"]);
 const INVENTORY_JOBS = new Set(["kiotviet_inventory_to_shopify", "inventory_reconciliation", "full_inventory_sync"]);
 

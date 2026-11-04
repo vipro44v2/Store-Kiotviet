@@ -20,7 +20,7 @@ it("renders each sync direction with Vietnamese labels and the stored values", (
   expect(html).toContain("Đồng bộ trạng thái đơn KiotViet → Shopify");
   expect(html).toContain("Đồng bộ tồn kho KiotViet → Shopify");
   expect(html).toContain("Đồng bộ khách hàng Shopify → KiotViet");
-  expect(html).toContain("Tự động tạo hóa đơn KiotViet");
+  expect(html).toContain("Invoice Creation Trigger");
   expect(html).toContain("Tiền tệ của giá trên KiotViet");
   // orders, cancellations and inventory are on; reverse status and customers are off.
   expect(html.match(/checked=""/g)).toHaveLength(3);

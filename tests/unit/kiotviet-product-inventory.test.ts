@@ -1,3 +1,4 @@
+vi.mock("@/lib/db/inventory-lock", () => ({ withInventoryLock: async (_key: string, work: () => Promise<unknown>) => work() }));
 import { beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/repositories/settings", () => ({ settingsRepository: { get: vi.fn().mockResolvedValue(undefined) } }));
 import type { KiotVietProduct } from "@/lib/kiotviet/types";
@@ -105,6 +106,8 @@ describe("product-to-inventory sync", () => {
     const sibling = { ...product, id: 502, code: "SKU-2", masterProductId: 501 };
     mocks.fetch.mockImplementation(async (endpoint: string) => {
       if (endpoint === "/products/501") return trigger;
+      if (endpoint === "/products/502") return sibling;
+      if (endpoint.includes("name=SKU-1")) return { data: [product], total: 1, pageSize: 100 };
       if (endpoint.includes("masterProductId=501"))
         return { data: [{ ...product, hasVariants: true }, sibling], total: 2, pageSize: 100 };
       return { data: [], total: 0, pageSize: 100 };

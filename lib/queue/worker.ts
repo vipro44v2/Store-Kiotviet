@@ -1,3 +1,4 @@
+import { requestFulfillmentInvoice, processFulfillmentInvoice, reconcileFulfillmentInvoices } from "@/lib/sync/fulfillment-invoice";
 import type { Job } from "bullmq";
 import {
   isManualReviewError,
@@ -318,8 +319,16 @@ export async function processSyncJob(
         );
       }
       break;
-    case "shopify_refund":
     case "shopify_fulfillment":
+      await requestFulfillmentInvoice(String(recordPayload(payload).order_id ?? job.data.entityId ?? ""));
+      break;
+    case "shopify_invoice_create":
+      await processFulfillmentInvoice(String(job.data.entityId));
+      break;
+    case "fulfillment_invoice_reconciliation":
+      await reconcileFulfillmentInvoices();
+      break;
+    case "shopify_refund":
     case "shopify_product_to_kiotviet":
       throw new PermanentError(
         `${job.name} requires manual review because the provider operation is not safely supported by the configured mapping`,
@@ -355,7 +364,7 @@ export async function processSyncJob(
         Number(job.data.currentItem ?? 0),
         String(job.data.auditJobId),
         admission.payload.reconciliationChainId,
-        inventoryOptions,
+        { ...inventoryOptions, refreshFromKiotViet: true },
       );
       break;
     }

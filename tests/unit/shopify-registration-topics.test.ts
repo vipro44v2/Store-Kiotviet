@@ -14,6 +14,9 @@ describe("Shopify production webhook registration", () => {
       ]),
     );
     expect(Object.keys(SHOPIFY_REGISTRATION_TOPICS)).toEqual([
+      "orders/paid",
+      "fulfillments/create",
+      "fulfillments/update",
       "orders/create",
       "orders/updated",
       "orders/cancelled",

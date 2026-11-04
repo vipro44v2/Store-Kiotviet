@@ -49,7 +49,8 @@ export function SyncSettingsCard({
   const router = useRouter();
   const [settings, setSettings] = useState(() => parseSyncSettings(stored));
   const [syncCustomers, setSyncCustomers] = useState(orders?.syncCustomers !== false);
-  const [autoInvoice, setAutoInvoice] = useState(orders?.autoInvoice === true);
+  const [invoiceCreationTrigger, setInvoiceCreationTrigger] = useState(String(orders?.invoiceCreationTrigger ?? "legacy"));
+  const autoInvoice = invoiceCreationTrigger === "legacy" ? orders?.autoInvoice === true : invoiceCreationTrigger !== "disabled";
   const [kiotVietCurrency, setKiotVietCurrency] = useState(typeof orders?.kiotVietCurrency === "string" ? orders.kiotVietCurrency : "");
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
@@ -73,7 +74,8 @@ export function SyncSettingsCard({
       const currency = kiotVietCurrency.trim().toUpperCase();
       if (autoInvoice && !/^[A-Z]{3}$/.test(currency))
         throw new Error("Nhập mã tiền tệ 3 chữ cái (ví dụ USD hoặc VND) trước khi bật tự động tạo hóa đơn");
-      const nextOrders: Record<string, unknown> = { ...(orders ?? {}), syncCustomers, autoInvoice };
+      const nextOrders: Record<string, unknown> = { ...(orders ?? {}), syncCustomers, autoInvoice: invoiceCreationTrigger === "legacy" && autoInvoice };
+      if (invoiceCreationTrigger !== "legacy") nextOrders.invoiceCreationTrigger = invoiceCreationTrigger;
       if (currency) nextOrders.kiotVietCurrency = currency;
       else delete nextOrders.kiotVietCurrency;
       if (JSON.stringify(nextOrders) !== JSON.stringify(orders ?? {})) await put("orders", nextOrders);
@@ -116,13 +118,14 @@ export function SyncSettingsCard({
           </small>
         </label>
         <label style={{ display: "block", marginBottom: 12 }}>
-          <input type="checkbox" checked={autoInvoice} onChange={(event) => setAutoInvoice(event.target.checked)} />{" "}
-          <strong>Tự động tạo hóa đơn KiotViet</strong>
-          <br />
-          <small>
-            Lưu tại orders.autoInvoice (mặc định tắt). Chỉ áp dụng cho đơn Shopify mới đã thanh toán đủ; đơn đã đồng bộ trước đó không bị tạo hóa đơn.
-            Hóa đơn trừ tồn kho KiotViet. Đơn có giảm giá, phí vận chuyển, thuế cộng thêm, tiền tip, hoàn tiền sản phẩm hoặc khác tiền tệ sẽ chỉ tạo đơn đặt hàng và cần xử lý thủ công.
-          </small>
+          <strong>Invoice Creation Trigger</strong>{" "}
+          <select value={invoiceCreationTrigger} onChange={(event) => setInvoiceCreationTrigger(event.target.value)}>
+            {invoiceCreationTrigger === "legacy" && <option value="legacy">Existing behavior ({orders?.autoInvoice === true ? "Paid" : "Disabled"})</option>}
+            <option value="shopify_fulfilled">Shopify Fulfilled (recommended)</option>
+            <option value="shopify_paid">Shopify Paid</option>
+            <option value="disabled">Disabled</option>
+          </select>
+          <p>Applies only to Shopify orders created after this trigger is enabled. Partial fulfillment and financial mismatches require manual review. Invoices deduct KiotViet stock.</p>
         </label>
         <label style={{ display: "block", marginBottom: 12 }}>
           <strong>Tiền tệ của giá trên KiotViet</strong>{" "}

@@ -39,10 +39,23 @@ export async function PUT(
     if (key === "orders")
       value = z.object({
         autoInvoice: z.boolean().optional(),
+        invoiceCreationTrigger: z.enum(["shopify_fulfilled", "shopify_paid", "disabled"]).optional(),
         kiotVietCurrency: z.string().regex(/^[A-Z]{3}$/).optional(),
-      }).passthrough().refine((orders) => orders.autoInvoice !== true || Boolean(orders.kiotVietCurrency), {
+      }).passthrough().refine((orders) => (orders.invoiceCreationTrigger === "disabled" || (!orders.invoiceCreationTrigger && orders.autoInvoice !== true)) || Boolean(orders.kiotVietCurrency), {
         message: "orders.kiotVietCurrency is required when orders.autoInvoice is enabled",
       }).parse(value);
+    if (key === "orders") {
+      // Derive activation time in PostgreSQL, never trust a browser-supplied cutoff.
+      delete value.invoiceTriggerEnabledAt;
+      await query(
+        `INSERT INTO system_settings(key,value,updated_at) VALUES('orders',$1::jsonb || jsonb_build_object('invoiceTriggerEnabledAt',now()),now())
+        ON CONFLICT(key) DO UPDATE SET value=$1::jsonb || jsonb_build_object('invoiceTriggerEnabledAt',
+          CASE WHEN system_settings.value->>'invoiceCreationTrigger' IS DISTINCT FROM $1::jsonb->>'invoiceCreationTrigger'
+          THEN to_jsonb(now()) ELSE COALESCE(system_settings.value->'invoiceTriggerEnabledAt',to_jsonb(now())) END),updated_at=now()`,
+        [JSON.stringify(value)],
+      );
+      return Response.json({ success: true });
+    }
     await query(
       "INSERT INTO system_settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",
       [key, JSON.stringify(value)],
