@@ -40,6 +40,18 @@ import {
   type ExcludedFeeLine,
   type OrderAmounts,
 } from "./order-line-items";
+import {
+  attachKiotVietOrderToInvoice,
+  blockAutoInvoice,
+  claimAutoInvoice,
+  decideAutoInvoice,
+  failAutoInvoice,
+  hasAppInvoice,
+  hasEnabledLocationMapping,
+  markAutoInvoiceSending,
+  readBranchStock,
+  verifyOrderInvoice,
+} from "./invoice-sync";
 
 /*
  * order_mappings.status while creating a KiotViet order from a Shopify order:
@@ -73,7 +85,7 @@ export interface OrderSyncContext {
   jobId?: string;
 }
 export type OrderSyncResult =
-  | { action: "created" | "recovered" | "updated"; kiotVietOrderId: string }
+  | { action: "created" | "recovered" | "updated"; kiotVietOrderId: string; invoiceStatus?: string }
   | { action: "skipped"; reason: string };
 
 interface OrderMappingRow {
@@ -264,7 +276,7 @@ async function resolveOrderCustomerId(
 }
 
 /** KiotViet answered and refused the request, so nothing was created. */
-function isDefiniteRejection(error: unknown) {
+export function isDefiniteRejection(error: unknown) {
   return (
     error instanceof ApiError ||
     error instanceof AuthenticationError ||
@@ -410,7 +422,9 @@ async function runShopifyOrderSync(
         "INSERT INTO order_mappings(shopify_order_id,shopify_order_number,status,financial_status,fulfillment_status,sync_status,claim_token,claimed_at) VALUES($1,$2,'pending_create',$3,$4,'pending',$5,now())",
         [orderId, order.name ?? null, order.financial_status ?? null, order.fulfillment_status ?? null, token],
       );
-    return { kind: "create", settings, prepared, token } as const;
+    // Auto Invoice applies only to orders created now, never to existing ones.
+    const invoiceRequested = await claimAutoInvoice(client, orderId, token, decideAutoInvoice(order, prepared, settings));
+    return { kind: "create", settings, prepared, token, invoiceRequested } as const;
   });
 
   switch (decision.kind) {
@@ -440,7 +454,7 @@ async function runShopifyOrderSync(
     case "verify":
       return verifyUncertainOrder(order, decision.mapping, progress);
     case "create":
-      return createMappedOrder(order, decision.settings, decision.prepared, decision.token, context, progress);
+      return createMappedOrder(order, decision.settings, decision.prepared, decision.token, decision.invoiceRequested, context, progress);
   }
 }
 
@@ -464,7 +478,10 @@ async function updateMappedOrder(
     "UPDATE order_mappings SET status=COALESCE(status,'created'),financial_status=$2,fulfillment_status=$3,sync_status='synced',last_sync_at=now(),updated_at=now() WHERE shopify_order_id=$1",
     [orderId, order.financial_status ?? null, order.fulfillment_status ?? null],
   );
-  return { action: "updated", kiotVietOrderId };
+  // Only settles an invoice already requested with the order; never creates one.
+  progress.stage = "verify_invoice";
+  const invoice = await verifyOrderInvoice(orderId);
+  return { action: "updated", kiotVietOrderId, ...(invoice.status !== "none" ? { invoiceStatus: invoice.status } : {}) };
 }
 
 async function verifyUncertainOrder(
@@ -487,7 +504,10 @@ async function verifyUncertainOrder(
       entityId: orderId,
       kiotVietOrderId: recovered.id,
     });
-    return { action: "recovered", kiotVietOrderId: String(recovered.id) };
+    await attachKiotVietOrderToInvoice(orderId, recovered);
+    progress.stage = "verify_invoice";
+    const invoice = await verifyOrderInvoice(orderId);
+    return { action: "recovered", kiotVietOrderId: String(recovered.id), ...(invoice.status !== "none" ? { invoiceStatus: invoice.status } : {}) };
   }
   if (isOrderRecoveryWindowOpen(mapping.claimed_at ?? mapping.created_at))
     throw new RetryableError(
@@ -509,18 +529,33 @@ async function createMappedOrder(
   settings: OrderSettings,
   prepared: PreparedOrder,
   token: string,
+  invoiceRequested: boolean,
   context: OrderSyncContext,
   progress: { stage: string },
 ): Promise<OrderSyncResult> {
   const orderId = String(order.id);
   let input: KiotVietOrderInput;
+  let invoiceReconciliation: Parameters<typeof markAutoInvoiceSending>[2] = {};
   try {
     progress.stage = "resolve_branch";
     const branchId = await resolveDefaultBranchId(undefined, settings);
+    if (invoiceRequested && !(await hasEnabledLocationMapping(branchId))) {
+      // Stock deducted by the invoice could not reach Shopify; create the order only.
+      await blockAutoInvoice(orderId, token, `branch_location_unmapped: KiotViet branch ${branchId} has no enabled Shopify location mapping`, progress.stage);
+      invoiceRequested = false;
+    }
     progress.stage = "sync_customer";
     const customerId = await resolveOrderCustomerId(order, settings, branchId);
     progress.stage = "product_mapping";
     const orderDetails = await buildOrderDetails(order, prepared.lines, context.jobId);
+    if (invoiceRequested) {
+      progress.stage = "read_stock_before";
+      invoiceReconciliation = {
+        branchId,
+        expectedLines: orderDetails.map((detail) => ({ productId: detail.productId, sku: detail.productCode, quantity: detail.quantity, price: detail.price })),
+        stockBefore: await readBranchStock(orderDetails.map((detail) => detail.productId), branchId),
+      };
+    }
     input = {
       branchId,
       customer: customerId ? { id: customerId } : undefined,
@@ -531,6 +566,7 @@ async function createMappedOrder(
       // excluded from the payment as well (see lib/sync/order-line-items.ts).
       totalPayment:
         order.financial_status === "paid" ? prepared.amounts.adjustedTotal : 0,
+      // Documented: creates the invoice and its receipt from this order (deducts stock).
       makeInvoice: false,
       orderDetails,
     };
@@ -540,6 +576,7 @@ async function createMappedOrder(
       "UPDATE order_mappings SET status='create_failed',sync_status=$3,claim_token=NULL,last_error=$4,failure_stage=$5,updated_at=now() WHERE shopify_order_id=$1 AND status='pending_create' AND claim_token=$2",
       [orderId, token, isManualReviewError(error) ? "manual_review" : "failed", errorText(error), progress.stage],
     ).catch(() => undefined);
+    if (invoiceRequested) await failAutoInvoice(orderId, token, error).catch(() => undefined);
     throw error;
   }
 
@@ -567,6 +604,11 @@ async function createMappedOrder(
       `${orderLabel(order)} creation claim was taken over by another job`,
     );
 
+  if (invoiceRequested) {
+    invoiceRequested = await markAutoInvoiceSending(orderId, token, invoiceReconciliation);
+    input.makeInvoice = invoiceRequested;
+  }
+
   progress.stage = "create_kiotviet_order";
   let created: { id: number; code: string };
   try {
@@ -581,6 +623,8 @@ async function createMappedOrder(
         : "UPDATE order_mappings SET sync_status='uncertain',last_error=$3,failure_stage=$4,updated_at=now() WHERE shopify_order_id=$1 AND status='creating' AND claim_token=$2",
       [orderId, token, errorText(error), progress.stage],
     ).catch(() => undefined);
+    // An uncertain request leaves the invoice in 'creating' to be verified, never resent.
+    if (rejected && invoiceRequested) await failAutoInvoice(orderId, token, error).catch(() => undefined);
     throw error;
   }
 
@@ -604,7 +648,11 @@ async function createMappedOrder(
     jobType: context.jobType,
     eventId: context.eventId,
   });
-  return { action: "created", kiotVietOrderId: String(created.id) };
+  if (!invoiceRequested) return { action: "created", kiotVietOrderId: String(created.id) };
+  await attachKiotVietOrderToInvoice(orderId, created);
+  progress.stage = "verify_invoice";
+  const invoice = await verifyOrderInvoice(orderId);
+  return { action: "created", kiotVietOrderId: String(created.id), invoiceStatus: invoice.status };
 }
 
 export async function cancelShopifyOrder(order: ShopifyOrderWebhook) {
@@ -687,6 +735,8 @@ export async function syncKiotVietInvoice(invoice: KiotVietInvoiceUpdate) {
       throw new MappingError(
         `KiotViet order ${orderCode} is not uniquely mapped`,
       );
+    if (!trackingNumber && (await hasAppInvoice(client, result.rows[0].shopify_order_id)))
+      return { fulfilled: false, reason: "invoice_created_by_sync_app" };
     const fulfilled = await fulfillShopifyOrderById(
       result.rows[0].shopify_order_id,
       orderCode,
@@ -760,6 +810,9 @@ export async function syncKiotVietOrderStatus(order: KiotVietOrderUpdate) {
       return { updated: false, reason: "shopify_order_cancelled" };
     if (mapping.status === "completed")
       return { updated: false, reason: "already_completed" };
+    // Invoicing completes the KiotViet order; that alone does not mean it shipped.
+    if (await hasAppInvoice(client, mapping.shopify_order_id))
+      return { updated: false, reason: "completed_by_app_invoice" };
     await fulfillShopifyOrderById(mapping.shopify_order_id, code);
     await client.query(
       "UPDATE order_mappings SET status='completed',fulfillment_status='fulfilled',sync_status='synced',last_sync_at=now(),updated_at=now() WHERE kiotviet_order_id=$1",

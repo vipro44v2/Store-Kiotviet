@@ -22,12 +22,73 @@ const mocks = vi.hoisted(() => ({
   cancelOrder: vi.fn(),
   syncCustomer: vi.fn(),
   log: vi.fn(),
+  findInvoices: vi.fn(),
+  invoiceDetail: vi.fn(),
+  getProduct: vi.fn(),
   db: {
+    invoices: new Map<string, Record<string, unknown>>(),
+    locationMapped: true,
     rows: new Map<string, Row>(),
     orders: {} as Record<string, unknown>,
     customers: new Map<string, string>(),
   },
 }));
+
+/** invoice_mappings statements from lib/sync/invoice-sync.ts, honoring their guards. */
+function runInvoice(sql: string, params: unknown[]): Record<string, unknown>[] | undefined {
+  const { db } = mocks;
+  const id = String(params[0]);
+  const invoice = db.invoices.get(id);
+  if (sql.includes("FROM branch_location_mappings")) return db.locationMapped ? [{ "?column?": 1 }] : [];
+  if (sql.startsWith("SELECT kiotviet_order_id::text,kiotviet_order_code FROM order_mappings")) {
+    const row = db.rows.get(id);
+    return row ? [{ kiotviet_order_id: row.kiotviet_order_id, kiotviet_order_code: row.kiotviet_order_code }] : [];
+  }
+  if (!sql.includes("invoice_mappings")) return undefined;
+  if (sql.startsWith("SELECT 1 FROM invoice_mappings"))
+    return invoice && ["pending", "creating", "created", "needs_review"].includes(String(invoice.status)) ? [{}] : [];
+  if (sql.startsWith("SELECT")) return invoice ? [{ ...invoice }] : [];
+  if (sql.startsWith("INSERT INTO invoice_mappings")) {
+    if (invoice && (invoice.kiotviet_invoice_id || !["pending", "failed", "blocked"].includes(String(invoice.status)))) return [];
+    db.invoices.set(id, {
+      ...(invoice ?? { shopify_order_id: id, kiotviet_order_id: null, kiotviet_order_code: null, kiotviet_invoice_id: null, created_at: new Date(), reconciliation: {} }),
+      status: params[1], source: "auto", claim_token: params[2], claimed_at: new Date(), expected_total: params[3] == null ? null : String(params[3]),
+      currency: params[4], last_error: params[5], failure_stage: params[6],
+    });
+    return [{ status: params[1] }];
+  }
+  if (!invoice) return [];
+  const token = invoice.claim_token === params[1];
+  if (sql.startsWith("UPDATE invoice_mappings SET status='blocked'")) {
+    if (invoice.status === "pending" && token) Object.assign(invoice, { status: "blocked", claim_token: null, last_error: params[2] });
+    return [];
+  }
+  if (sql.startsWith("UPDATE invoice_mappings SET status='creating'")) {
+    if (invoice.status !== "pending" || !token) return [];
+    Object.assign(invoice, { status: "creating", reconciliation: JSON.parse(String(params[2])) });
+    return [{ shopify_order_id: id }];
+  }
+  if (sql.startsWith("UPDATE invoice_mappings SET status='failed'")) {
+    if (["pending", "creating"].includes(String(invoice.status)) && token) Object.assign(invoice, { status: "failed", claim_token: null });
+    return [];
+  }
+  if (sql.startsWith("UPDATE invoice_mappings SET kiotviet_order_id=$2")) {
+    if (!invoice.kiotviet_order_id) Object.assign(invoice, { kiotviet_order_id: String(params[1]), kiotviet_order_code: params[2] });
+    return [];
+  }
+  if (sql.startsWith("UPDATE invoice_mappings SET status='needs_review'")) {
+    if (!invoice.kiotviet_invoice_id) Object.assign(invoice, { status: "needs_review", last_error: params[2] });
+    return [];
+  }
+  if (sql.startsWith("UPDATE invoice_mappings SET kiotviet_invoice_id=$2")) {
+    if (invoice.kiotviet_invoice_id) return [];
+    for (const other of db.invoices.values())
+      if (other !== invoice && other.kiotviet_invoice_id === String(params[1])) throw new Error("duplicate key kiotviet_invoice_id");
+    Object.assign(invoice, { kiotviet_invoice_id: String(params[1]), kiotviet_invoice_code: params[2], status: params[3], reconciliation: JSON.parse(String(params[4])), last_error: params[5] });
+    return [{ shopify_order_id: id }];
+  }
+  throw new Error(`Unhandled invoice SQL in fake: ${sql.slice(0, 80)}`);
+}
 
 /** Minimal order_mappings store that honors the WHERE guards order-sync relies on. */
 function run(sql: string, params: unknown[] = []): Record<string, unknown>[] {
@@ -36,6 +97,8 @@ function run(sql: string, params: unknown[] = []): Record<string, unknown>[] {
   const row = db.rows.get(id);
   const now = new Date();
   if (sql.includes("pg_advisory_xact_lock")) return [];
+  const invoiceRows = runInvoice(sql, params);
+  if (invoiceRows) return invoiceRows;
   if (sql.includes("FROM system_settings")) return [{ value: db.orders }];
   if (sql.includes("FROM customer_mappings"))
     return db.customers.has(id) ? [{ kiotviet_customer_id: db.customers.get(id) }] : [];
@@ -140,6 +203,12 @@ vi.mock("@/lib/kiotviet/orders", () => ({
 vi.mock("@/lib/sync/customer-sync", () => ({ syncShopifyCustomer: mocks.syncCustomer }));
 vi.mock("@/lib/shopify/orders", () => ({ cancelShopifyOrderById: vi.fn(), fulfillShopifyOrderById: vi.fn() }));
 vi.mock("@/lib/logger", () => ({ log: mocks.log }));
+vi.mock("@/lib/kiotviet/invoices", () => ({
+  findKiotVietInvoicesForOrder: mocks.findInvoices,
+  getKiotVietInvoiceDetail: mocks.invoiceDetail,
+  KIOTVIET_INVOICE_CANCELLED: 2,
+}));
+vi.mock("@/lib/kiotviet/products", () => ({ getKiotVietProduct: mocks.getProduct }));
 
 import { cancelShopifyOrder, syncShopifyOrder } from "@/lib/sync/order-sync";
 import { normalizeSku } from "@/lib/sync/mappings";
@@ -169,6 +238,8 @@ function order(overrides: Partial<ShopifyOrderWebhook> = {}): ShopifyOrderWebhoo
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.db.rows.clear();
+  mocks.db.invoices.clear();
+  mocks.db.locationMapped = true;
   mocks.db.customers.clear();
   mocks.db.orders = { autoCreate: true, paidOnly: true, syncCustomers: true };
   mocks.resolveBranch.mockResolvedValue(10);
@@ -517,5 +588,168 @@ describe("processing fees (Shopify #1081)", () => {
     mocks.createOrder.mockClear();
     mocks.db.rows.clear();
     await expect(syncShopifyOrder(feeOrder())).rejects.toBeInstanceOf(MappingError);
+  });
+});
+
+describe("Auto Invoice (orders.autoInvoice)", () => {
+  const stock: Record<string, number> = {};
+  const invoiceOrder = (overrides: Partial<ShopifyOrderWebhook> = {}) => order({ currency: "VND", ...overrides });
+  const fee = { id: 15977877143736, sku: null, quantity: 1, price: "9000", title: "SVC Fee - Credit Card Processing Fee" };
+
+  beforeEach(() => {
+    mocks.db.orders = { autoCreate: true, paidOnly: true, syncCustomers: true, autoInvoice: true, kiotVietCurrency: "VND" };
+    stock["501"] = 10;
+    mocks.getProduct.mockImplementation(async (id: number) => ({ id, inventories: [{ branchId: 10, onHand: stock[String(id)] }] }));
+    // KiotViet deducts stock when makeInvoice creates the invoice.
+    mocks.createOrder.mockImplementation(async (input: { makeInvoice: boolean; orderDetails: Array<{ productId: number; quantity: number }> }) => {
+      if (input.makeInvoice) for (const detail of input.orderDetails) stock[String(detail.productId)] -= detail.quantity;
+      return { id: 700, code: "DH700" };
+    });
+    mocks.findInvoices.mockResolvedValue({
+      invoices: [{ id: 9001, code: "HD9001", orderCode: "DH700", status: 1, statusValue: "Completed" }], complete: true,
+    });
+    mocks.invoiceDetail.mockResolvedValue({ id: 9001, code: "HD9001", orderCode: "DH700", status: 1, total: 300000, totalPayment: 300000 });
+  });
+
+  it("creates the order with makeInvoice, verifies the invoice and stock movement, and saves both IDs", async () => {
+    await expect(syncShopifyOrder(invoiceOrder())).resolves.toEqual({ action: "created", kiotVietOrderId: "700", invoiceStatus: "created" });
+    expect(mocks.createOrder).toHaveBeenCalledWith(expect.objectContaining({ makeInvoice: true, totalPayment: 300000 }));
+    expect(mocks.db.rows.get("5001")).toMatchObject({ kiotviet_order_id: "700" });
+    expect(mocks.db.invoices.get("5001")).toMatchObject({
+      status: "created", source: "auto", kiotviet_order_id: "700", kiotviet_invoice_id: "9001", kiotviet_invoice_code: "HD9001",
+      reconciliation: expect.objectContaining({ branchId: 10, stockBefore: { 501: 10 }, stockAfter: { 501: 8 }, stockVerified: true }),
+    });
+  });
+
+  it("keeps the order-only behavior when Auto Invoice is disabled", async () => {
+    mocks.db.orders.autoInvoice = false;
+    await expect(syncShopifyOrder(invoiceOrder())).resolves.toEqual({ action: "created", kiotVietOrderId: "700" });
+    expect(mocks.createOrder).toHaveBeenCalledWith(expect.objectContaining({ makeInvoice: false }));
+    expect(mocks.db.invoices.size).toBe(0);
+    expect(stock["501"]).toBe(10);
+  });
+
+  it("never invoices an order that already existed when the setting was enabled", async () => {
+    mocks.db.orders.autoInvoice = false;
+    await syncShopifyOrder(invoiceOrder());
+    mocks.db.orders.autoInvoice = true;
+    await expect(syncShopifyOrder(invoiceOrder(), { jobType: "shopify_order_update" })).resolves.toEqual({ action: "updated", kiotVietOrderId: "700" });
+    expect(mocks.createOrder).toHaveBeenCalledOnce();
+    expect(mocks.findInvoices).not.toHaveBeenCalled();
+    expect(mocks.db.invoices.size).toBe(0);
+  });
+
+  it("handles repeated webhooks without a second order, invoice or lookup", async () => {
+    await syncShopifyOrder(invoiceOrder());
+    await syncShopifyOrder(invoiceOrder(), { jobType: "shopify_order_update" });
+    await syncShopifyOrder(invoiceOrder(), { jobType: "shopify_order_update" });
+    expect(mocks.createOrder).toHaveBeenCalledOnce();
+    expect(mocks.findInvoices).toHaveBeenCalledOnce();
+    expect(stock["501"]).toBe(8);
+  });
+
+  it("links the invoice after a timeout even though KiotViet created it (no resend)", async () => {
+    mocks.createOrder.mockImplementationOnce(async () => { stock["501"] -= 2; throw new UncertainResultError("timeout"); });
+    await expect(syncShopifyOrder(invoiceOrder())).rejects.toBeInstanceOf(UncertainResultError);
+    expect(mocks.db.invoices.get("5001")).toMatchObject({ status: "creating" });
+    mocks.findOrder.mockResolvedValueOnce({ id: 700, code: "DH700" });
+    await expect(syncShopifyOrder(invoiceOrder())).resolves.toMatchObject({ action: "recovered", invoiceStatus: "created" });
+    expect(mocks.createOrder).toHaveBeenCalledOnce();
+    expect(mocks.db.invoices.get("5001")).toMatchObject({ status: "created", kiotviet_invoice_id: "9001" });
+  });
+
+  it("retries while the invoice is not visible yet, then links it from the next webhook", async () => {
+    mocks.findInvoices.mockResolvedValueOnce({ invoices: [], complete: true });
+    await expect(syncShopifyOrder(invoiceOrder())).rejects.toBeInstanceOf(RetryableError);
+    expect(mocks.db.rows.get("5001")).toMatchObject({ status: "created" });
+    await expect(syncShopifyOrder(invoiceOrder(), { jobType: "shopify_order_update" })).resolves.toMatchObject({ invoiceStatus: "created" });
+    expect(mocks.createOrder).toHaveBeenCalledOnce();
+  });
+
+  it("requires manual review when the invoice stays missing after the window", async () => {
+    mocks.findInvoices.mockResolvedValue({ invoices: [], complete: true });
+    await expect(syncShopifyOrder(invoiceOrder())).rejects.toBeInstanceOf(RetryableError);
+    mocks.db.invoices.get("5001")!.claimed_at = new Date(Date.now() - 10 * 60_000);
+    await expect(syncShopifyOrder(invoiceOrder(), { jobType: "shopify_order_update" })).rejects.toBeInstanceOf(ConflictError);
+    expect(mocks.db.invoices.get("5001")).toMatchObject({ status: "needs_review" });
+  });
+
+  it("requires manual review when KiotViet shows two invoices for the order", async () => {
+    mocks.findInvoices.mockResolvedValue({ invoices: [
+      { id: 9001, code: "HD9001", orderCode: "DH700", status: 1 }, { id: 9002, code: "HD9002", orderCode: "DH700", status: 1 },
+    ], complete: true });
+    await expect(syncShopifyOrder(invoiceOrder())).rejects.toBeInstanceOf(ConflictError);
+    expect(mocks.db.invoices.get("5001")).toMatchObject({ status: "needs_review", kiotviet_invoice_id: null });
+  });
+
+  it("flags an invoice whose total does not match instead of trusting it", async () => {
+    mocks.invoiceDetail.mockResolvedValue({ id: 9001, code: "HD9001", orderCode: "DH700", status: 1, total: 290000, totalPayment: 290000 });
+    await expect(syncShopifyOrder(invoiceOrder())).resolves.toMatchObject({ invoiceStatus: "needs_review" });
+    expect(mocks.db.invoices.get("5001")).toMatchObject({ status: "needs_review", kiotviet_invoice_id: "9001" });
+  });
+
+  it("does not invoice and marks the invoice failed when SKU mapping fails", async () => {
+    mocks.ensureMapping.mockRejectedValue(new MappingError("Cannot auto-map SKU NU012", { mappingStatus: "unmapped" }));
+    await expect(syncShopifyOrder(invoiceOrder())).rejects.toBeInstanceOf(MappingError);
+    expect(mocks.createOrder).not.toHaveBeenCalled();
+    expect(mocks.db.invoices.get("5001")).toMatchObject({ status: "failed" });
+  });
+
+  it("excludes the SVC fee from the invoice and never deducts stock for it", async () => {
+    await syncShopifyOrder(invoiceOrder({ total_price: "309000", line_items: [...order().line_items, fee] }));
+    const input = mocks.createOrder.mock.calls[0][0];
+    expect(input).toMatchObject({ makeInvoice: true, totalPayment: 300000 });
+    expect(input.orderDetails).toHaveLength(1);
+    expect(mocks.db.invoices.get("5001")).toMatchObject({ expected_total: "300000", status: "created" });
+    expect(stock["501"]).toBe(8);
+  });
+
+  it.each([
+    ["the KiotViet currency is not configured", {}, { kiotVietCurrency: undefined }, "kiotviet_currency_not_configured"],
+    ["the order is in another currency", { currency: "USD" }, {}, "currency_mismatch"],
+    ["a product line is discounted", { total_price: "290000", line_items: [{ id: 11, sku: "NU012", quantity: 2, price: "150000", name: "A", discount_allocations: [{ amount: "10000" }] }] }, {}, "unsupported_discount"],
+    ["the order has shipping", { total_price: "330000", shipping_lines: [{ price: "30000" }] }, {}, "unsupported_shipping"],
+    ["totals do not reconcile", { total_price: "310000" }, {}, "amount_mismatch"],
+    ["products were partially refunded", { financial_status: "partially_refunded", refunds: [{ id: 1, refund_line_items: [{ line_item_id: 11, quantity: 1 }], transactions: [{ kind: "refund", status: "success", amount: "150000" }] }] }, {}, "refund_affects_products"],
+  ])("creates the order without an invoice when %s", async (_label, orderOverrides, settingOverrides, code) => {
+    mocks.db.orders = { ...mocks.db.orders, ...settingOverrides, paidOnly: false };
+    await expect(syncShopifyOrder(invoiceOrder(orderOverrides as Partial<ShopifyOrderWebhook>))).resolves.toMatchObject({ action: "created" });
+    expect(mocks.createOrder).toHaveBeenCalledWith(expect.objectContaining({ makeInvoice: false }));
+    expect(mocks.db.invoices.get("5001")).toMatchObject({ status: "blocked", last_error: expect.stringContaining(code) });
+    expect(stock["501"]).toBe(10);
+  });
+
+  it("invoices a partially refunded order when only the processing fee was refunded", async () => {
+    // paidOnly (unchanged) only creates orders whose status is exactly "paid".
+    mocks.db.orders.paidOnly = false;
+    await syncShopifyOrder(invoiceOrder({
+      financial_status: "partially_refunded", total_price: "309000", line_items: [...order().line_items, fee],
+      refunds: [{ id: 1, refund_line_items: [{ line_item_id: 15977877143736, quantity: 1 }], transactions: [{ kind: "refund", status: "success", amount: "9000" }] }],
+    }));
+    expect(mocks.createOrder).toHaveBeenCalledWith(expect.objectContaining({ makeInvoice: true }));
+  });
+
+  it("never creates or invoices a cancelled order", async () => {
+    await expect(syncShopifyOrder(invoiceOrder({ cancelled_at: "2026-11-01T00:00:00Z" }))).resolves.toMatchObject({ action: "skipped" });
+    expect(mocks.createOrder).not.toHaveBeenCalled();
+  });
+
+  it("creates the order without invoice when the branch has no Shopify location mapping", async () => {
+    mocks.db.locationMapped = false;
+    await syncShopifyOrder(invoiceOrder());
+    expect(mocks.createOrder).toHaveBeenCalledWith(expect.objectContaining({ makeInvoice: false }));
+    expect(mocks.db.invoices.get("5001")).toMatchObject({ status: "blocked", last_error: expect.stringContaining("branch_location_unmapped") });
+  });
+
+  it("creates one order and one invoice for concurrent webhooks", async () => {
+    const results = await Promise.allSettled([
+      syncShopifyOrder(invoiceOrder(), { jobType: "shopify_order_create" }),
+      syncShopifyOrder(invoiceOrder(), { jobType: "shopify_order_update" }),
+      syncShopifyOrder(invoiceOrder(), { jobType: "shopify_order_update" }),
+    ]);
+    expect(results.some((result) => result.status === "fulfilled")).toBe(true);
+    expect(mocks.createOrder).toHaveBeenCalledOnce();
+    expect(stock["501"]).toBe(8);
+    expect(mocks.db.invoices.get("5001")).toMatchObject({ kiotviet_invoice_id: "9001" });
   });
 });

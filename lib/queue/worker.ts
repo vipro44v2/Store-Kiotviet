@@ -193,7 +193,7 @@ export async function processSyncJob(
           await syncInventoryNotification(
             item as KiotVietStockNotification,
             String(job.data.auditJobId),
-            inventoryOptions,
+            { ...inventoryOptions, refreshFromKiotViet: true },
           );
         }
       break;

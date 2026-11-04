@@ -73,6 +73,11 @@ export interface ShopifyShippingLine {
   discounted_price?: string | null;
   tax_lines?: ShopifyTaxLine[] | null;
 }
+export interface ShopifyRefund {
+  id: number;
+  refund_line_items?: Array<{ line_item_id: number; quantity: number }> | null;
+  transactions?: Array<{ kind?: string | null; status?: string | null; amount?: string | null }> | null;
+}
 export interface ShopifyOrderWebhook {
   id: number;
   name: string;
@@ -81,6 +86,9 @@ export interface ShopifyOrderWebhook {
   financial_status?: string | null;
   fulfillment_status?: string | null;
   total_price: string;
+  /** Shop currency of all amounts in this payload. */
+  currency?: string | null;
+  refunds?: ShopifyRefund[] | null;
   taxes_included?: boolean | null;
   total_tip_received?: string | null;
   shipping_lines?: ShopifyShippingLine[] | null;

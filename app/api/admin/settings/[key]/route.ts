@@ -36,6 +36,13 @@ export async function PUT(
       value = { categoryIds };
     }
     if (key === SYNC_SETTINGS_KEY) value = synchronizationSettingsSchema.parse(value);
+    if (key === "orders")
+      value = z.object({
+        autoInvoice: z.boolean().optional(),
+        kiotVietCurrency: z.string().regex(/^[A-Z]{3}$/).optional(),
+      }).passthrough().refine((orders) => orders.autoInvoice !== true || Boolean(orders.kiotVietCurrency), {
+        message: "orders.kiotVietCurrency is required when orders.autoInvoice is enabled",
+      }).parse(value);
     await query(
       "INSERT INTO system_settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",
       [key, JSON.stringify(value)],

@@ -73,3 +73,22 @@ export async function cancelKiotVietOrder(id: number) {
     `/orders/${id}?IsVoidPayment=true`,
   );
 }
+/** GET /orders/{id}. Status 3 = completed, 4 = cancelled (as used by order status sync). */
+export interface KiotVietOrderDetail {
+  id: number;
+  code: string;
+  branchId: number;
+  status: number;
+  statusValue?: string;
+  customerId?: number | null;
+  total?: number;
+  totalPayment?: number;
+  description?: string | null;
+  purchaseDate?: string;
+  createdDate?: string;
+  orderDetails?: Array<{ productId: number; productCode?: string; productName?: string; quantity: number; price: number; discount?: number | null }>;
+  payments?: Array<{ amount?: number | null }> | null;
+}
+export function getKiotVietOrder(id: number) {
+  return kiotVietClient.get<KiotVietOrderDetail>(`/orders/${id}`);
+}

@@ -10,11 +10,38 @@ import {
 import { getActiveShopifyLocations } from "@/lib/shopify/locations";
 import { log } from "@/lib/logger";
 import type { KiotVietStockNotification } from "@/lib/kiotviet/types";
+import { getKiotVietProduct } from "@/lib/kiotviet/products";
 import type { InventoryConflictStrategy } from "@/lib/settings/sync-settings";
 
 export interface InventorySyncOptions {
   /** Defaults to "hold". */
   conflictStrategy?: InventoryConflictStrategy;
+  /**
+   * Webhooks can arrive out of order, so a stock.update payload may be stale.
+   * When set, the current KiotViet on-hand for the branch is read and used
+   * instead (it is an absolute value; nothing is subtracted).
+   */
+  refreshFromKiotViet?: boolean;
+}
+
+async function currentKiotVietStock(notification: KiotVietStockNotification, jobId?: string) {
+  const product = await getKiotVietProduct(Number(notification.ProductId));
+  const current = product.inventories?.find((inventory) => Number(inventory.branchId) === Number(notification.BranchId));
+  if (!current) {
+    await log("warn", "KiotViet returned no stock row for the branch; using the webhook value", {
+      action: "inventory_refresh_unavailable", provider: "kiotviet", entityType: "inventory",
+      entityId: notification.ProductCode, branchId: notification.BranchId, jobId,
+    });
+    return notification;
+  }
+  const refreshed = { ...notification, OnHand: Number(current.onHand), Reserved: Number(current.reserved ?? notification.Reserved ?? 0) };
+  if (refreshed.OnHand !== Number(notification.OnHand))
+    await log("info", "Stale KiotViet stock event superseded by current stock", {
+      action: "inventory_event_superseded", provider: "kiotviet", entityType: "inventory",
+      entityId: notification.ProductCode, branchId: notification.BranchId,
+      eventOnHand: notification.OnHand, currentOnHand: refreshed.OnHand, jobId,
+    });
+  return refreshed;
 }
 export const SHOPIFY_DEDUCTION_CONFLICT = "inventory_shopify_deduction";
 
@@ -69,6 +96,7 @@ export async function syncInventoryNotification(
   jobId?: string,
   options: InventorySyncOptions = {},
 ) {
+  if (options.refreshFromKiotViet) notification = await currentKiotVietStock(notification, jobId);
   const sku = normalizeSku(notification.ProductCode);
   if (!sku) throw new MappingError("Inventory event has an empty SKU");
   const mappings = (await mappingsRepository.findBySku(sku)).filter((mapping) => mapping.sync_status !== "archived");

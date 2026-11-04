@@ -163,7 +163,7 @@ describe("worker gating", () => {
     mocks.get.mockResolvedValue(stockEvent);
     await expect(processSyncJob(job("kiotviet_inventory_to_shopify", { eventId: "evt-3" }))).resolves.toBeUndefined();
     expect(mocks.inventory).toHaveBeenCalledWith(
-      expect.objectContaining({ ProductCode: "SKU-1", OnHand: 5 }), "audit-1", { conflictStrategy: "hold" },
+      expect.objectContaining({ ProductCode: "SKU-1", OnHand: 5 }), "audit-1", { conflictStrategy: "hold", refreshFromKiotViet: true },
     );
     expect(mocks.processed).toHaveBeenCalledWith("evt-3");
   });
@@ -192,6 +192,6 @@ describe("worker gating", () => {
     use({ inventoryConflictStrategy: "kiotviet_wins" });
     mocks.get.mockResolvedValue(stockEvent);
     await processSyncJob(job("kiotviet_inventory_to_shopify", { eventId: "evt-6" }));
-    expect(mocks.inventory).toHaveBeenCalledWith(expect.anything(), "audit-1", { conflictStrategy: "kiotviet_wins" });
+    expect(mocks.inventory).toHaveBeenCalledWith(expect.anything(), "audit-1", { conflictStrategy: "kiotviet_wins", refreshFromKiotViet: true });
   });
 });

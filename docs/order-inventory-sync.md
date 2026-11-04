@@ -4,7 +4,7 @@
 
 | Data | Owner | Direction written by this app |
 | --- | --- | --- |
-| Stock on hand | **KiotViet** | KiotViet → Shopify `available` (absolute, compare-and-set) |
+| Stock on hand | **KiotViet** | KiotViet → Shopify `available` (absolute, compare-and-set); KiotViet invoices deduct it |
 | Online sale deductions | **Shopify** until KiotViet reflects them | never written back to KiotViet |
 | Orders | **Shopify** (online) | Shopify → KiotViet (create, update, cancel) |
 | Order status / tracking | **KiotViet** | KiotViet → Shopify only when `kiotVietOrderStatusToShopify` is on |
@@ -87,6 +87,57 @@ If Shopify dropped since the last verified sync (a sale) **and** the KiotViet va
 - `kiotviet_wins`: overwrites as before but still records the conflict.
 
 The hold clears by itself when KiotViet catches up (for example, the KiotViet order is invoiced): the conflict is auto-resolved and a new baseline is recorded. An admin can also **Resolve** the conflict. That accepts the Shopify quantity seen at detection as the baseline, so the next KiotViet sync writes again. **Ignore** keeps the hold.
+
+## KiotViet invoices (Auto Invoice)
+
+Settings in `orders` (Admin → Settings → "Chiều đồng bộ"):
+- `autoInvoice` ("Tự động tạo hóa đơn KiotViet"), default `false`. When it is `false`, orders are created exactly as before (`makeInvoice: false`).
+- `kiotVietCurrency` ("Tiền tệ của giá trên KiotViet"), required to invoice. It must equal the Shopify order `currency`. KiotViet amounts carry no currency and nothing is converted.
+
+**New orders.** Auto Invoice is decided in the same claim transaction as order creation, so orders that already existed when the setting was enabled are never invoiced automatically. An eligible order is created with the documented `makeInvoice: true` (KiotViet creates the invoice and its receipt and deducts stock in one request). The app then finds the invoice (`GET /invoices`, matched on `orderCode`), checks its total and payment, and records stock before and after. All of this is saved in `invoice_mappings`.
+
+An order that is not eligible is still created, without an invoice; its `invoice_mappings.status` is `blocked`, with the reasons in `last_error`. These cases block invoicing:
+- the order is cancelled, or not `paid`/`partially_refunded`;
+- `kiotVietCurrency` is missing or differs from the order currency;
+- product-line discounts, shipping, tax added on top of prices, or tips;
+- Shopify total − processing fees ≠ Σ price × quantity;
+- refunds that touch products, or a refund that is not tied to the processing fee;
+- the KiotViet branch has no enabled Shopify location mapping.
+
+**State and idempotency (`invoice_mappings`).**
+- Each Shopify order, KiotViet order and KiotViet invoice can appear in at most one row (`UNIQUE` constraints). Claims use the order's advisory lock in a short transaction; HTTP calls never run inside a transaction.
+- Statuses: `pending` (claimed), `creating` (request sent or outcome unknown), `created` (verified), `needs_review`, `failed` (definitely not created), `blocked` (not eligible).
+- Invoice requests are never resent automatically. A timeout or crash leaves `creating`. The next webhook or the recovery script looks the invoice up in KiotViet. If it is found, it is linked; if it is still missing after 5 minutes, or two invoices exist, the row becomes `needs_review`.
+- Invoices created by this app do not fulfill the Shopify order through the KiotViet → Shopify status sync. That happens only when staff add a delivery tracking number.
+
+**Inventory.** KiotViet stays the authority and Shopify `available` is set to the absolute KiotViet value. Shopify already deducted the sale, and the invoice deducts KiotViet by the same amount, so the next sync finds equal values and writes nothing. Stock webhooks re-read the current KiotViet on-hand before writing (`inventory_event_superseded` in `sync_logs`), so an event that arrives late cannot restore sold stock.
+
+### Enabling Auto Invoice
+1. Deploy and run migration 007.
+2. Find out which currency KiotViet prices are recorded in. Existing synced orders contain the Shopify amounts unconverted; compare one KiotViet order with its Shopify order.
+3. Admin → Settings → "Chiều đồng bộ": enter that currency, tick "Tự động tạo hóa đơn KiotViet", then click "Lưu cài đặt".
+4. Watch the first orders with `SELECT shopify_order_id,status,kiotviet_invoice_code,last_error,reconciliation FROM invoice_mappings ORDER BY created_at DESC LIMIT 20;`.
+
+### Invoicing an existing order (#1072)
+```bash
+npx tsx --env-file=.env.production scripts/recover-kiotviet-invoice.ts --list
+npx tsx --env-file=.env.production scripts/recover-kiotviet-invoice.ts 7108106289336          # dry run, read-only
+npx tsx --env-file=.env.production scripts/recover-kiotviet-invoice.ts 7108106289336 --apply  # only after reviewing the plan
+```
+The dry run only reads.
+- It uses the KiotViet order ID from `order_mappings` and never creates an order.
+- It compares the stored webhook with Shopify's live status, currency, refunds and total.
+- It applies the fee exclusion and financial rules above.
+- It checks the KiotViet order's status, branch, location mapping, products, quantities, prices and total against Shopify.
+- It reads the order's prepayment, so the invoice payment = expected total − prepayment (recorded once).
+- It shows current stock, and proves no invoice exists yet. An existing invoice is linked instead of creating another.
+
+`--apply` runs a final invoice lookup and records stock before sending one `POST /invoices` with `orderId`. It then verifies the invoice and the stock movement. If the result is uncertain, nothing is resent. Run the dry run again after 5 minutes: it links the invoice, or tells you to check KiotViet and use `--reset-uncertain --apply`.
+
+### Verifying an invoice and its stock
+- KiotViet: open the order (`kiotviet_order_code`). It should be completed and linked to the invoice (`kiotviet_invoice_code`), whose total and paid amount equal `expected_total`.
+- `SELECT status,kiotviet_invoice_code,expected_total,reconciliation->'checks',reconciliation->'stockBefore',reconciliation->'stockAfter',reconciliation->'stockVerified' FROM invoice_mappings WHERE shopify_order_id='7108106289336';` (`stockVerified=false` can also mean another sale happened in between; check KiotViet stock history.)
+- Shopify: after the stock webhook, `SELECT * FROM inventory_snapshots WHERE sku IN ('377','711','1045','1030') ORDER BY created_at DESC LIMIT 8;` should show `shopify_quantity = expected_shopify_quantity`, with no second decrease.
 
 ## Production deployment
 

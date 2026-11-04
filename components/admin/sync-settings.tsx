@@ -49,6 +49,8 @@ export function SyncSettingsCard({
   const router = useRouter();
   const [settings, setSettings] = useState(() => parseSyncSettings(stored));
   const [syncCustomers, setSyncCustomers] = useState(orders?.syncCustomers !== false);
+  const [autoInvoice, setAutoInvoice] = useState(orders?.autoInvoice === true);
+  const [kiotVietCurrency, setKiotVietCurrency] = useState(typeof orders?.kiotVietCurrency === "string" ? orders.kiotVietCurrency : "");
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -68,8 +70,13 @@ export function SyncSettingsCard({
     setSaving(true);
     try {
       await put(SYNC_SETTINGS_KEY, settings);
-      if (syncCustomers !== (orders?.syncCustomers !== false))
-        await put("orders", { ...(orders ?? {}), syncCustomers });
+      const currency = kiotVietCurrency.trim().toUpperCase();
+      if (autoInvoice && !/^[A-Z]{3}$/.test(currency))
+        throw new Error("Nhập mã tiền tệ 3 chữ cái (ví dụ USD hoặc VND) trước khi bật tự động tạo hóa đơn");
+      const nextOrders: Record<string, unknown> = { ...(orders ?? {}), syncCustomers, autoInvoice };
+      if (currency) nextOrders.kiotVietCurrency = currency;
+      else delete nextOrders.kiotVietCurrency;
+      if (JSON.stringify(nextOrders) !== JSON.stringify(orders ?? {})) await put("orders", nextOrders);
       setMessage("Đã lưu. Áp dụng cho cả các job đang chờ trong hàng đợi.");
       router.refresh();
     } catch (error) {
@@ -107,6 +114,27 @@ export function SyncSettingsCard({
           <small>
             Lưu tại orders.syncCustomers. Khi tắt, đơn hàng vẫn được tạo với khách lẻ; khách hàng KiotViet đã có không bao giờ bị ghi đè.
           </small>
+        </label>
+        <label style={{ display: "block", marginBottom: 12 }}>
+          <input type="checkbox" checked={autoInvoice} onChange={(event) => setAutoInvoice(event.target.checked)} />{" "}
+          <strong>Tự động tạo hóa đơn KiotViet</strong>
+          <br />
+          <small>
+            Lưu tại orders.autoInvoice (mặc định tắt). Chỉ áp dụng cho đơn Shopify mới đã thanh toán đủ; đơn đã đồng bộ trước đó không bị tạo hóa đơn.
+            Hóa đơn trừ tồn kho KiotViet. Đơn có giảm giá, phí vận chuyển, thuế cộng thêm, tiền tip, hoàn tiền sản phẩm hoặc khác tiền tệ sẽ chỉ tạo đơn đặt hàng và cần xử lý thủ công.
+          </small>
+        </label>
+        <label style={{ display: "block", marginBottom: 12 }}>
+          <strong>Tiền tệ của giá trên KiotViet</strong>{" "}
+          <input
+            value={kiotVietCurrency}
+            maxLength={3}
+            placeholder="USD"
+            style={{ width: 80 }}
+            onChange={(event) => setKiotVietCurrency(event.target.value.toUpperCase())}
+          />
+          <br />
+          <small>Lưu tại orders.kiotVietCurrency. Phải trùng tiền tệ của đơn Shopify; hệ thống không quy đổi tiền tệ.</small>
         </label>
         <label style={{ display: "block" }}>
           <strong>Khi Shopify đã trừ tồn (đơn bán) nhưng KiotViet chưa phản ánh</strong>

@@ -80,3 +80,6 @@ export async function createShopifyReturnRefund(orderId:string,lines:Array<{line
   if(data.refundCreate.userErrors.length||!data.refundCreate.refund)throw new Error(data.refundCreate.userErrors.map(error=>error.message).join("; ")||"Shopify did not create the refund");
   return data.refundCreate.refund;
 }
+export interface ShopifyOrderPaymentState{cancelledAt:string|null;displayFinancialStatus:string;currencyCode:string;totalPriceSet:{shopMoney:{amount:string}};refunds:Array<{id:string}>}
+/** Live payment state, used to reject stale stored webhook payloads before invoicing. */
+export async function getShopifyOrderPaymentState(orderId:string){const data=await shopifyGraphql<{order:ShopifyOrderPaymentState|null}>(`query OrderPaymentState($id:ID!){order(id:$id){cancelledAt displayFinancialStatus currencyCode totalPriceSet{shopMoney{amount}} refunds{id}}}`,{id:`gid://shopify/Order/${orderId}`});return data.order;}

@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   setInventory: vi.fn(),
   log: vi.fn(),
   lastSynced: null as string | null,
+  kiotVietOnHand: 0,
   locations: [] as Array<Record<string, unknown>>,
 }));
 
@@ -21,6 +22,9 @@ vi.mock("@/lib/shopify/inventory", () => ({
   setShopifyInventory: mocks.setInventory,
 }));
 vi.mock("@/lib/logger", () => ({ log: mocks.log }));
+vi.mock("@/lib/kiotviet/products", () => ({
+  getKiotVietProduct: async (id: number) => ({ id, inventories: [{ branchId: 10, onHand: mocks.kiotVietOnHand, reserved: 0 }] }),
+}));
 
 import {
   detectUnreflectedShopifyDeduction,
@@ -140,5 +144,45 @@ describe("inventory mapping failures", () => {
     mocks.getActiveLocations.mockResolvedValue([{ id: "a" }, { id: "b" }]);
     await expect(syncInventoryNotification(notification)).rejects.toThrow("must be mapped manually");
     expect(mocks.setInventory).not.toHaveBeenCalled();
+  });
+});
+
+describe("KiotViet invoices and Shopify sales (no double deduction)", () => {
+  it("does not subtract the sold quantity again when the invoice lowers KiotViet stock", async () => {
+    mocks.lastSynced = "10";
+    mocks.available = 9; // Shopify already deducted the order (10 → 9)
+    mocks.kiotVietOnHand = 9; // the KiotViet invoice deducted the same unit (10 → 9)
+    await expect(syncInventoryNotification({ ...notification, OnHand: 9 }, "job", { refreshFromKiotViet: true }))
+      .resolves.toEqual({ status: "synced" });
+    expect(mocks.setInventory).not.toHaveBeenCalled();
+    expect(mocks.available).toBe(9);
+    expect(sqlCalls("UPDATE sync_conflicts SET resolution_status='resolved'")).toHaveLength(1);
+  });
+
+  it("ignores a stale higher stock event that arrives after the invoice (out of order)", async () => {
+    mocks.lastSynced = "9";
+    mocks.available = 9;
+    mocks.kiotVietOnHand = 9;
+    await syncInventoryNotification({ ...notification, OnHand: 10 }, "job", { refreshFromKiotViet: true });
+    expect(mocks.setInventory).not.toHaveBeenCalled();
+    expect(sqlCalls("INSERT INTO sync_conflicts")).toHaveLength(0);
+    expect(mocks.log).toHaveBeenCalledWith("info", expect.any(String), expect.objectContaining({ action: "inventory_event_superseded", eventOnHand: 10, currentOnHand: 9 }));
+  });
+
+  it("ignores a stale lower stock event and keeps the current absolute KiotViet value", async () => {
+    mocks.lastSynced = "9";
+    mocks.available = 9;
+    mocks.kiotVietOnHand = 9;
+    await syncInventoryNotification({ ...notification, OnHand: 7 }, "job", { refreshFromKiotViet: true });
+    expect(mocks.setInventory).not.toHaveBeenCalled();
+  });
+
+  it("applies the current KiotViet value with compare-and-set and verifies it by readback", async () => {
+    mocks.lastSynced = "12";
+    mocks.available = 12;
+    mocks.kiotVietOnHand = 9; // in-store sale and invoice reduced KiotViet
+    await syncInventoryNotification({ ...notification, OnHand: 11 }, "job", { refreshFromKiotViet: true });
+    expect(mocks.setInventory).toHaveBeenCalledWith("item-1", "location-1", 9, 12);
+    expect(sqlCalls("INSERT INTO inventory_snapshots")[0][1]).toEqual(["SKU-1", 10, "location-1", 9, 9, 9, 0]);
   });
 });

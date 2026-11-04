@@ -10,6 +10,10 @@ export interface OrderSettings {
   syncCancellation?: boolean;
   syncRefunds?: boolean;
   defaultBranchId?: number | string | null;
+  /** Create the KiotViet invoice together with new orders (makeInvoice). Default false. */
+  autoInvoice?: boolean;
+  /** Currency that KiotViet prices are recorded in; must equal the Shopify order currency to invoice. */
+  kiotVietCurrency?: string;
   /** Shopify line items that are payment-processing fees, never KiotViet products. See lib/sync/order-line-items.ts. */
   processingFeeVariantIds?: Array<number | string>;
   processingFeeProductIds?: Array<number | string>;

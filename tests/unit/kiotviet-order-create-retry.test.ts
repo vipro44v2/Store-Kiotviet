@@ -10,6 +10,7 @@ vi.mock("@/lib/env", () => ({ getEnv: () => ({ KIOTVIET_RETAILER: "shop" }) }));
 
 import { createKiotVietOrder } from "@/lib/kiotviet/orders";
 import { kiotVietClient } from "@/lib/kiotviet/client";
+import { createKiotVietInvoice, findKiotVietInvoicesForOrder } from "@/lib/kiotviet/invoices";
 import { ApiError, RetryableError, UncertainResultError } from "@/lib/errors";
 
 const input = {
@@ -79,5 +80,53 @@ describe("006 sync direction migration", () => {
     expect(sql).toContain("'kiotVietOrderStatusToShopify', existing_installation");
     expect(sql).toContain("'shopifyOrdersToKiotViet', true");
     expect(sql).toContain("'kiotVietInventoryToShopify', true");
+  });
+});
+
+describe("KiotViet invoice API", () => {
+  const invoiceInput = {
+    branchId: 10, orderId: 5555, discount: 0, totalPayment: 0, method: "Transfer",
+    invoiceDetails: [{ productId: 1, productCode: "377", productName: "377", quantity: 1, price: 20, discount: 0 }],
+  };
+
+  it("never resends POST /invoices after a timeout", async () => {
+    fetchMock.mockRejectedValue(new DOMException("timeout", "TimeoutError"));
+    await expect(createKiotVietInvoice(invoiceInput)).rejects.toBeInstanceOf(UncertainResultError);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/invoices");
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).toMatchObject({ orderId: 5555, branchId: 10 });
+  });
+
+  it("matches invoices by orderCode and confirms absence only after a full scan", async () => {
+    fetchMock
+      .mockResolvedValueOnce(json(200, { total: 1, pageSize: 100, data: [{ id: 1, code: "HD1", orderCode: "OTHER", status: 1 }] }))
+      .mockResolvedValueOnce(json(200, { total: 2, pageSize: 100, data: [
+        { id: 2, code: "HD2", orderCode: "DH1072", status: 1 }, { id: 3, code: "HD3", orderCode: "DH9", status: 1 },
+      ] }));
+    await expect(findKiotVietInvoicesForOrder({ id: 5555, code: "DH1072" }, new Date("2026-10-29T00:00:00Z")))
+      .resolves.toEqual({ invoices: [{ id: 2, code: "HD2", orderCode: "DH1072", status: 1 }], complete: true });
+    expect(String(fetchMock.mock.calls[0][0])).toContain("orderId=5555");
+    expect(String(fetchMock.mock.calls[1][0])).toContain("fromPurchaseDate=2026-10-29");
+  });
+
+  it("reports an incomplete lookup when the scan cannot finish", async () => {
+    fetchMock
+      .mockResolvedValueOnce(json(200, { total: 0, pageSize: 100, data: [] }))
+      .mockResolvedValueOnce(json(200, { total: 500, pageSize: 100, data: [] }));
+    await expect(findKiotVietInvoicesForOrder({ id: 5555, code: "DH1072" }, new Date())).resolves.toMatchObject({ complete: false });
+  });
+});
+
+describe("007 invoice migration", () => {
+  const sql = readFileSync(path.join(process.cwd(), "database/migrations/007_kiotviet_invoices.sql"), "utf8");
+  it("is additive and keeps one invoice per Shopify order, KiotViet order and KiotViet invoice", () => {
+    expect(sql).not.toMatch(/DELETE FROM|DROP TABLE|DROP COLUMN|TRUNCATE/i);
+    expect(sql).toMatch(/shopify_order_id text NOT NULL UNIQUE/);
+    expect(sql).toMatch(/kiotviet_order_id bigint UNIQUE/);
+    expect(sql).toMatch(/kiotviet_invoice_id bigint UNIQUE/);
+  });
+  it("defaults Auto Invoice to off without overwriting a stored value", () => {
+    expect(sql).toContain("jsonb_build_object('autoInvoice', false) || value");
+    expect(sql).toContain("NOT (value ? 'autoInvoice')");
   });
 });
