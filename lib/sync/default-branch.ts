@@ -10,6 +10,11 @@ export interface OrderSettings {
   syncCancellation?: boolean;
   syncRefunds?: boolean;
   defaultBranchId?: number | string | null;
+  /** Shopify line items that are payment-processing fees, never KiotViet products. See lib/sync/order-line-items.ts. */
+  processingFeeVariantIds?: Array<number | string>;
+  processingFeeProductIds?: Array<number | string>;
+  /** Exact titles; applied only to lines without a SKU. Defaults to DEFAULT_PROCESSING_FEE_TITLES. */
+  processingFeeTitles?: string[];
   [key: string]: unknown;
 }
 

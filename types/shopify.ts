@@ -50,15 +50,28 @@ export interface ShopifyOrderWebhookCustomer {
   default_address?: ShopifyWebhookAddress | null;
   addresses?: ShopifyWebhookAddress[] | null;
 }
+export interface ShopifyTaxLine {
+  price?: string | null;
+}
 export interface ShopifyOrderLineItem {
   id: number;
   sku?: string | null;
   quantity: number;
+  /** Unit price before discounts. */
   price: string;
   name?: string | null;
   title?: string | null;
   variant_id?: number | null;
   product_id?: number | null;
+  /** Deprecated by Shopify in favor of discount_allocations; used only as a fallback. */
+  total_discount?: string | null;
+  discount_allocations?: Array<{ amount?: string | null }> | null;
+  tax_lines?: ShopifyTaxLine[] | null;
+}
+export interface ShopifyShippingLine {
+  price?: string | null;
+  discounted_price?: string | null;
+  tax_lines?: ShopifyTaxLine[] | null;
 }
 export interface ShopifyOrderWebhook {
   id: number;
@@ -68,6 +81,9 @@ export interface ShopifyOrderWebhook {
   financial_status?: string | null;
   fulfillment_status?: string | null;
   total_price: string;
+  taxes_included?: boolean | null;
+  total_tip_received?: string | null;
+  shipping_lines?: ShopifyShippingLine[] | null;
   email?: string | null;
   phone?: string | null;
   customer?: ShopifyOrderWebhookCustomer | null;

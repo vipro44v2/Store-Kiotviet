@@ -34,6 +34,12 @@ import {
 } from "./default-branch";
 import { ensureProductMapping } from "./ensure-product-mapping";
 import { log } from "@/lib/logger";
+import {
+  computeOrderAmounts,
+  partitionOrderLines,
+  type ExcludedFeeLine,
+  type OrderAmounts,
+} from "./order-line-items";
 
 /*
  * order_mappings.status while creating a KiotViet order from a Shopify order:
@@ -104,19 +110,29 @@ function orderLabel(order: ShopifyOrderWebhook) {
     : `Shopify order ${order.id}`;
 }
 
+export interface PreparedOrder {
+  lines: ValidatedOrderLine[];
+  /** Processing-fee lines left out of the KiotViet order and its payment. */
+  fees: ExcludedFeeLine[];
+  amounts: OrderAmounts;
+}
+
 /**
- * Every purchased line must map to a KiotViet product before anything is
- * claimed or sent, so an incomplete KiotViet order is never created.
+ * Removes recognized processing-fee lines, then requires every remaining
+ * purchased line to have a SKU, so an incomplete KiotViet order is never
+ * created. Shared by order sync and scripts/recover-shopify-order-sync.ts.
  */
-export function validateOrderLineItems(
+export function prepareOrderForKiotViet(
   order: ShopifyOrderWebhook,
-): ValidatedOrderLine[] {
+  settings: OrderSettings = {},
+): PreparedOrder {
   const shopifyOrderId = String(order.id);
   if (!order.line_items.length)
     throw new ValidationError(`${orderLabel(order)} has no line items`, {
       shopifyOrderId,
     });
-  return order.line_items.map((line, index) => {
+  const { purchased, fees } = partitionOrderLines(order, settings);
+  const lines = purchased.map(({ line, index }) => {
     const lineName = line?.name ?? line?.title ?? null;
     const lineLabel = `line item ${line?.id ?? `#${index + 1}`}${lineName ? ` "${lineName}"` : ""}`;
     const details = {
@@ -145,6 +161,33 @@ export function validateOrderLineItems(
       );
     return { line, sku, quantity, price };
   });
+  return {
+    lines,
+    fees,
+    amounts: computeOrderAmounts(order, lines.map(({ line }) => line), fees),
+  };
+}
+
+export function validateOrderLineItems(
+  order: ShopifyOrderWebhook,
+  settings: OrderSettings = {},
+): ValidatedOrderLine[] {
+  return prepareOrderForKiotViet(order, settings).lines;
+}
+
+function feeLogContext(prepared: PreparedOrder) {
+  return {
+    shopifyTotal: prepared.amounts.shopifyTotal,
+    excludedFeeTotal: prepared.amounts.excludedFeeTotal,
+    adjustedKiotVietTotal: prepared.amounts.adjustedTotal,
+    expectedAdjustedTotal: prepared.amounts.expectedAdjustedTotal,
+    excludedFeeLines: prepared.fees.map((fee) => ({
+      lineItemId: String(fee.line.id),
+      title: fee.line.title ?? fee.line.name ?? null,
+      reason: fee.reason,
+      amount: fee.chargedCents / 100,
+    })),
+  };
 }
 
 async function buildOrderDetails(
@@ -347,12 +390,15 @@ async function runShopifyOrderSync(
       return { kind: "skip", reason: "awaiting_payment" } as const;
     if (order.cancelled_at)
       return { kind: "skip", reason: "shopify_order_cancelled" } as const;
-    let lines: ValidatedOrderLine[];
+    let prepared: PreparedOrder;
     try {
-      lines = validateOrderLineItems(order);
+      prepared = prepareOrderForKiotViet(order, settings);
     } catch (error) {
       return { kind: "invalid", error } as const;
     }
+    // Never create an empty KiotViet order when only processing fees remain.
+    if (!prepared.lines.length)
+      return { kind: "skip", reason: "fee_only_order", prepared } as const;
     const token = randomUUID();
     if (mapping)
       await client.query(
@@ -364,7 +410,7 @@ async function runShopifyOrderSync(
         "INSERT INTO order_mappings(shopify_order_id,shopify_order_number,status,financial_status,fulfillment_status,sync_status,claim_token,claimed_at) VALUES($1,$2,'pending_create',$3,$4,'pending',$5,now())",
         [orderId, order.name ?? null, order.financial_status ?? null, order.fulfillment_status ?? null, token],
       );
-    return { kind: "create", settings, lines, token } as const;
+    return { kind: "create", settings, prepared, token } as const;
   });
 
   switch (decision.kind) {
@@ -379,6 +425,7 @@ async function runShopifyOrderSync(
         entityType: "order",
         entityId: orderId,
         reason: decision.reason,
+        ...("prepared" in decision && decision.prepared ? feeLogContext(decision.prepared) : {}),
         jobId: context.jobId,
         jobType: context.jobType,
         eventId: context.eventId,
@@ -393,7 +440,7 @@ async function runShopifyOrderSync(
     case "verify":
       return verifyUncertainOrder(order, decision.mapping, progress);
     case "create":
-      return createMappedOrder(order, decision.settings, decision.lines, decision.token, context, progress);
+      return createMappedOrder(order, decision.settings, decision.prepared, decision.token, context, progress);
   }
 }
 
@@ -460,7 +507,7 @@ async function verifyUncertainOrder(
 async function createMappedOrder(
   order: ShopifyOrderWebhook,
   settings: OrderSettings,
-  lines: ValidatedOrderLine[],
+  prepared: PreparedOrder,
   token: string,
   context: OrderSyncContext,
   progress: { stage: string },
@@ -473,15 +520,17 @@ async function createMappedOrder(
     progress.stage = "sync_customer";
     const customerId = await resolveOrderCustomerId(order, settings, branchId);
     progress.stage = "product_mapping";
-    const orderDetails = await buildOrderDetails(order, lines, context.jobId);
+    const orderDetails = await buildOrderDetails(order, prepared.lines, context.jobId);
     input = {
       branchId,
       customer: customerId ? { id: customerId } : undefined,
       description: `Shopify ${order.name} (${order.id})`,
       discount: 0,
       method: "Transfer",
+      // Processing fees are not KiotViet products, so their charged amount is
+      // excluded from the payment as well (see lib/sync/order-line-items.ts).
       totalPayment:
-        order.financial_status === "paid" ? Number(order.total_price) : 0,
+        order.financial_status === "paid" ? prepared.amounts.adjustedTotal : 0,
       makeInvoice: false,
       orderDetails,
     };
@@ -493,6 +542,20 @@ async function createMappedOrder(
     ).catch(() => undefined);
     throw error;
   }
+
+  if (prepared.fees.length || !prepared.amounts.consistent)
+    await log(prepared.amounts.consistent ? "info" : "warn", "Shopify order amounts adjusted for KiotViet", {
+      action: prepared.amounts.consistent ? "order_fees_excluded" : "order_amount_mismatch",
+      provider: "kiotviet",
+      entityType: "order",
+      entityId: orderId,
+      kiotVietLineTotal: input.orderDetails.reduce((sum, detail) => sum + Math.round(detail.price * 100) * detail.quantity, 0) / 100,
+      totalPayment: input.totalPayment,
+      ...feeLogContext(prepared),
+      jobId: context.jobId,
+      jobType: context.jobType,
+      eventId: context.eventId,
+    });
 
   progress.stage = "mark_creating";
   const marked = await query(

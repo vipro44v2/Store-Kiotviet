@@ -442,3 +442,80 @@ describe("Shopify cancellation → KiotViet", () => {
     await expect(cancelShopifyOrder(order())).rejects.toBeInstanceOf(MappingError);
   });
 });
+
+describe("processing fees (Shopify #1081)", () => {
+  const fee = {
+    id: 15977877143736, sku: null, quantity: 1, price: "9000.00",
+    title: "SVC Fee - Credit Card Processing Fee", name: "SVC Fee - Credit Card Processing Fee",
+  };
+  const product = { id: 11, sku: "NU012", quantity: 2, price: "150000.00", name: "Áo thun", title: "Áo thun" };
+  const feeOrder = (overrides: Partial<ShopifyOrderWebhook> = {}) =>
+    order({ id: 7128306221240, name: "#1081", total_price: "309000.00", line_items: [product, fee], ...overrides });
+
+  it("excludes the fee line from the KiotViet order and from the payment", async () => {
+    await expect(syncShopifyOrder(feeOrder())).resolves.toMatchObject({ action: "created" });
+    const input = mocks.createOrder.mock.calls[0][0];
+    expect(input.orderDetails).toHaveLength(1);
+    expect(input.orderDetails[0]).toMatchObject({ productCode: "NU012", quantity: 2, price: 150000 });
+    expect(input.totalPayment).toBe(300000);
+    expect(mocks.ensureMapping).toHaveBeenCalledTimes(1);
+    expect(mocks.log).toHaveBeenCalledWith("info", "Shopify order amounts adjusted for KiotViet", expect.objectContaining({
+      action: "order_fees_excluded",
+      shopifyTotal: 309000, excludedFeeTotal: 9000, adjustedKiotVietTotal: 300000, kiotVietLineTotal: 300000, totalPayment: 300000,
+      excludedFeeLines: [expect.objectContaining({ lineItemId: "15977877143736", reason: "exact_title_without_sku", amount: 9000 })],
+    }));
+  });
+
+  it("excludes only the fee's charged amount when the fee is discounted", async () => {
+    await syncShopifyOrder(feeOrder({
+      total_price: "306000.00",
+      line_items: [product, { ...fee, discount_allocations: [{ amount: "3000.00" }] }],
+    }));
+    expect(mocks.createOrder.mock.calls[0][0].totalPayment).toBe(300000);
+  });
+
+  it("accounts for taxes added on top of the fee and shipping", async () => {
+    await syncShopifyOrder(feeOrder({
+      taxes_included: false,
+      total_price: "339900.00",
+      shipping_lines: [{ price: "30000.00", discounted_price: "30000.00" }],
+      line_items: [product, { ...fee, tax_lines: [{ price: "900.00" }] }],
+    }));
+    expect(mocks.createOrder.mock.calls[0][0].totalPayment).toBe(330000);
+    expect(mocks.log).toHaveBeenCalledWith("info", expect.any(String), expect.objectContaining({ excludedFeeTotal: 9900, expectedAdjustedTotal: 330000 }));
+  });
+
+  it("never creates an empty KiotViet order for a fee-only order", async () => {
+    await expect(syncShopifyOrder(feeOrder({ total_price: "9000.00", line_items: [fee] })))
+      .resolves.toEqual({ action: "skipped", reason: "fee_only_order" });
+    expect(mocks.createOrder).not.toHaveBeenCalled();
+    expect(mocks.db.rows.has("7128306221240")).toBe(false);
+  });
+
+  it("still rejects a genuine product without SKU next to a fee", async () => {
+    const error = await syncShopifyOrder(feeOrder({
+      line_items: [product, fee, { id: 77, sku: null, quantity: 1, price: "50000", title: "Custom item", name: "Custom item" }],
+    })).catch((e) => e);
+    expect(error).toBeInstanceOf(MappingError);
+    expect(error.details).toMatchObject({ lineItemId: "77", mappingStatus: "missing_sku" });
+    expect(mocks.createOrder).not.toHaveBeenCalled();
+  });
+
+  it("does not treat a product with a SKU as a fee just because its title matches", async () => {
+    await syncShopifyOrder(feeOrder({ total_price: "9000.00", line_items: [{ ...fee, sku: "FEE-SKU" }] }));
+    expect(mocks.ensureMapping).toHaveBeenCalledWith("FEE-SKU", undefined);
+    expect(mocks.createOrder.mock.calls[0][0].orderDetails).toHaveLength(1);
+  });
+
+  it("uses configured fee variant IDs and leaves the title fallback off when titles are configured empty", async () => {
+    mocks.db.orders = { ...mocks.db.orders, processingFeeVariantIds: [555], processingFeeTitles: [] };
+    await syncShopifyOrder(feeOrder({
+      total_price: "305000.00",
+      line_items: [product, { id: 90, sku: "CARD-FEE", quantity: 1, price: "5000", title: "Phí cà thẻ", variant_id: 555 }],
+    }));
+    expect(mocks.createOrder.mock.calls[0][0]).toMatchObject({ totalPayment: 300000, orderDetails: [expect.objectContaining({ productCode: "NU012" })] });
+    mocks.createOrder.mockClear();
+    mocks.db.rows.clear();
+    await expect(syncShopifyOrder(feeOrder())).rejects.toBeInstanceOf(MappingError);
+  });
+});

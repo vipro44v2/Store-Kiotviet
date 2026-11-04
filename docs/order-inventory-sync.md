@@ -57,6 +57,22 @@ If the `synchronization` row does not exist (code deployed before the migration 
 - Orders with `cancelled_at` set are not created in KiotViet.
 - `order_mappings.last_error` / `failure_stage` record the latest failure. `sync_logs` gets `action = 'order_sync_failed'` with the Shopify order ID and name, job type, event ID, error class, stage, SKU, line item ID, mapping status and whether it is retryable. Customer email, phone and address are never logged.
 
+## Processing fees
+
+Payment-processing fee line items (for example `SVC Fee - Credit Card Processing Fee`, which has no SKU) are not KiotViet products. They are removed before SKU validation (`lib/sync/order-line-items.ts`):
+
+- A line is a fee when its `variant_id` is in `orders.processingFeeVariantIds` or its `product_id` is in `orders.processingFeeProductIds` (preferred; set these in the `orders` setting).
+- Fallback: the line has **no SKU** and its title or name **exactly** equals an entry of `orders.processingFeeTitles` (default: `["SVC Fee - Credit Card Processing Fee"]`; set `[]` to disable). Any other line without a SKU still goes to manual review.
+- The fee's charged amount (price × quantity − discount allocations, + tax lines when prices exclude tax) is subtracted from Shopify `total_price` to get the KiotViet `totalPayment`. Amounts are summed in integer minor units.
+- An order that contains only fees is skipped (`fee_only_order`); no empty KiotViet order is created.
+- `sync_logs` action `order_fees_excluded` records the Shopify total, the excluded fee total, the adjusted KiotViet amount and the KiotViet line total. `order_amount_mismatch` (warn) is logged when the adjusted total differs from non-fee lines + shipping + tips.
+
+The KiotViet order lines keep the existing payload (unit price, `discount: 0`, no shipping line). For orders with discounts or shipping, the KiotViet line total therefore still differs from the payment, exactly as before. The mismatch log makes these orders visible.
+
+## Customer phone conflicts
+
+When KiotViet rejects a new customer with HTTP 420 "phone number already exists", the app looks the phone up in KiotViet (`+84…` and `0…` are treated as the same number). It links the existing customer only when exactly one KiotViet customer has that phone **and** either both emails are present and equal, or one side has no email and the full names match (case and diacritics ignored). The KiotViet customer is never modified. Every other case (different email, different name, several matches, the KiotViet customer is already linked to another Shopify customer) is a `ConflictError` for manual review. Duplicates and merges never happen automatically.
+
 ## Inventory guard for Shopify sales
 
 Before writing, the app compares three numbers:
@@ -121,20 +137,23 @@ pm2 start shopify-kiotviet-worker shopify-kiotviet-scheduler
 
 The rollback deletes nothing. It converts unfinished `pending_create`/`create_failed` rows to `creating`, which the old code understands. It keeps the added columns and the `synchronization` row (both ignored by the old code), so a later redeploy keeps admin choices. The old code returns to its previous behavior, including retrying `creating` orders after the 5-minute recovery window. Restoring the backup is needed only if the database itself is damaged.
 
-## Recovering failed `shopify_order_update` jobs
+## Recovering failed or stuck orders
 
-The `Cannot read properties of null (reading 'trim')` failures left those orders in `order_mappings.status = 'creating'` without a KiotViet order. After deploying the fix:
+`scripts/recover-shopify-order-sync.ts` (logic in `lib/recovery/shopify-order-recovery.ts`). Positional arguments are always Shopify order IDs. A KiotViet order ID is accepted only after `--link-kiotviet-order`. Without `--apply` it only runs SELECTs and KiotViet GETs.
 
-1. Find the affected orders (read-only):
-   `npx tsx --env-file=.env.production scripts/recover-shopify-order-sync.ts --list`
-2. For each order, run a dry run first:
-   `npx tsx --env-file=.env.production scripts/recover-shopify-order-sync.ts <shopifyOrderId>`
-   It prints one of these plans:
-   - **KiotViet order found**: re-run with `--apply` to link it (no new order).
-   - **Stored payload has a line without SKU**: Shopify keeps a line item's SKU as it was at purchase, so fixing the product afterwards does not fix the order. Create the order in KiotViet manually with the description `Shopify <#name> (<shopifyOrderId>)`, then run
-     `... <shopifyOrderId> --link-kiotviet-order <kiotVietOrderId> --apply`.
-   - **Payload is valid**: `--apply` confirms that no KiotViet order references the Shopify order, resets the row to `create_failed`, and enqueues **one** `shopify_order_update` job from the latest stored webhook.
-3. Do not bulk-retry old failed jobs from the admin page. A retried job for a `creating` row goes to manual review (safe, but noisy). Old `sync_jobs` and webhook events are history and are not deleted.
+For every order, the dry run:
+1. stops if the order is already linked;
+2. **looks for an existing KiotViet order first** (description containing `(<shopifyOrderId>)`). If one exists, the plan is to relink it, never to create another;
+3. applies the same fee exclusion and SKU checks as the worker to the latest stored `orders/updated`/`orders/create` payload, and prints the skipped fee lines and amounts;
+4. blocks when a job for the order may still run, a worker holds the claim, a create request may still be in flight (`creating` for under 5 minutes), or order sync is disabled.
+
+`--apply` performs only the printed action, under the order's advisory lock, and only if the mapping is unchanged since the plan was made. The job ID is deterministic, so concurrent or repeated runs recover an order at most once.
+
+`--link-kiotviet-order` links only a KiotViet order that exists and is not cancelled, whose description mentions the Shopify order ID, that is not linked to another Shopify order, and when no other KiotViet order references this Shopify order.
+
+Shopify keeps a line item's SKU as it was at purchase. If a real product line has no SKU, create the order in KiotViet by hand with the description `Shopify <#name> (<shopifyOrderId>)` and link it.
+
+Old failed `sync_jobs` and webhook events stay as history. Do not bulk-retry them from the admin page.
 
 ## Known limitations
 
