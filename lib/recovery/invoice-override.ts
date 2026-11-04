@@ -6,7 +6,7 @@ import { ConflictError, ValidationError } from "@/lib/errors";
 import { log } from "@/lib/logger";
 import type { KiotVietInvoiceInput } from "@/lib/kiotviet/invoices";
 import { classifyInvoiceReasons } from "@/lib/sync/invoice-override-rules";
-import { applyInvoiceRecovery, planInvoiceRecovery, type InvoiceRecoveryPlan } from "./kiotviet-invoice-recovery";
+import { applyInvoiceRecovery, planInvoiceRecovery, type InvoiceProposal, type InvoiceRecoveryPlan } from "./kiotviet-invoice-recovery";
 
 /**
  * Admin override: invoice an existing KiotViet order although selected
@@ -24,18 +24,10 @@ export interface InvoiceOverridePreview {
   shopifyOrderId: string;
   shopifyOrderName: string | null;
   kiotVietOrder: { id: number; code: string } | null;
-  amounts: {
-    merchandiseSubtotal: number;
-    shopifyShipping: number;
-    orderSurcharges: number;
-    excludedFees: number;
-    prepaid: number;
-    invoiceTotal: number;
-    shopifyPaidForGoods: number;
-    additionalPayment: number;
-    balanceAfterInvoice: number;
-    currency: string | null;
-  } | null;
+  amounts: (Pick<InvoiceProposal, "shopify" | "invoice" | "payment"> & { currency: string | null }) | null;
+  /** Differences that remain after invoicing; the invoice is "reconciled" only when empty. */
+  remainingDifferences: InvoiceProposal["remainingDifferences"];
+  reconciled: boolean;
   lines: Array<{ productId: number; productCode: string; productName: string; quantity: number; price: number }>;
   warnings: Array<{ code: string; message: string }>;
   blockers: Array<{ code: string; message: string }>;
@@ -64,12 +56,11 @@ export async function buildOverridePreview(orderId: string) {
     shopifyOrderName: plan.shopifySnapshot?.name ?? plan.mapping?.shopify_order_number ?? null,
     kiotVietOrder: plan.kiotVietOrder ? { id: plan.kiotVietOrder.id, code: plan.kiotVietOrder.code } : null,
     amounts: proposal ? {
-      merchandiseSubtotal: proposal.merchandiseSubtotal, shopifyShipping: proposal.shopifyShipping,
-      orderSurcharges: proposal.orderSurcharges, excludedFees: proposal.excludedFees, prepaid: proposal.prepaid,
-      invoiceTotal: proposal.invoiceTotal, shopifyPaidForGoods: proposal.shopifyPaidForGoods,
-      additionalPayment: proposal.additionalPayment, balanceAfterInvoice: proposal.balanceAfterInvoice,
+      shopify: proposal.shopify, invoice: proposal.invoice, payment: proposal.payment,
       currency: plan.shopifySnapshot?.currency ?? null,
     } : null,
+    remainingDifferences: proposal?.remainingDifferences ?? [],
+    reconciled: proposal?.reconciled ?? false,
     lines: proposal?.input.invoiceDetails ?? [],
     warnings,
     blockers,
@@ -158,8 +149,8 @@ export async function submitInvoiceOverride(submission: OverrideSubmission) {
   const proposal = plan.proposal;
   const payloadSummary = {
     kiotVietOrderId: preview.kiotVietOrder?.id, kiotVietOrderCode: preview.kiotVietOrder?.code,
-    invoiceTotal: proposal.invoiceTotal, prepaid: proposal.prepaid, additionalPayment: proposal.additionalPayment,
-    balanceAfterInvoice: proposal.balanceAfterInvoice,
+    invoiceTotal: proposal.invoice.total, prepaid: proposal.payment.existingPrepayment,
+    additionalPayment: proposal.payment.additionalPayment, remainingDifferences: proposal.remainingDifferences,
     lines: proposal.input.invoiceDetails.map(({ productId, productCode, quantity, price }) => ({ productId, productCode, quantity, price })),
   };
   const at = new Date().toISOString();
@@ -169,8 +160,11 @@ export async function submitInvoiceOverride(submission: OverrideSubmission) {
   let result: Awaited<ReturnType<typeof applyInvoiceRecovery>>;
   try {
     result = await applyInvoiceRecovery(
-      { ...plan, expectedTotal: proposal.invoiceTotal, action: { kind: "create_invoice", input: proposal.input } },
-      { reconciliation: { approvedWarnings: approved, expectedPaymentTotal: proposal.prepaid + proposal.additionalPayment, manualOverride } },
+      { ...plan, expectedTotal: proposal.invoice.total, action: { kind: "create_invoice", input: proposal.input } },
+      { reconciliation: {
+        approvedWarnings: approved, expectedPaymentTotal: proposal.payment.totalRecorded, manualOverride,
+        remainingDifferences: proposal.remainingDifferences,
+      } },
     );
   } catch (error) {
     await audit("kiotviet_invoice_override_result", admin, orderId, manualOverride,

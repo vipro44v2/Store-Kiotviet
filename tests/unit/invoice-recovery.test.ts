@@ -4,6 +4,7 @@ import type { ShopifyOrderWebhook } from "@/types/shopify";
 
 const ORDER_ID = "7108106289336";
 const mocks = vi.hoisted(() => ({
+  evidence: undefined as Record<string, unknown> | undefined,
   audit: [] as Array<{ actor: unknown; action: unknown; entityId: unknown; before: Record<string, unknown>; after: Record<string, unknown> | null }>,
   invoice: undefined as Record<string, unknown> | undefined,
   orderSettings: {} as Record<string, unknown>,
@@ -27,15 +28,17 @@ function run(sql: string, params: unknown[]): Record<string, unknown>[] {
   if (sql.startsWith("INSERT INTO audit_logs")) { mocks.audit.push({ actor: params[0], action: params[1], entityId: params[2], before: JSON.parse(String(params[3])), after: JSON.parse(String(params[4])) }); return []; }
   if (sql.includes("FROM order_mappings"))
     return [{ shopify_order_id: ORDER_ID, shopify_order_number: "#1072", kiotviet_order_id: "5555", kiotviet_order_code: "DH1072", status: "created" }];
-  if (sql.includes("FROM system_settings")) return [{ value: mocks.orderSettings }];
+  if (sql.includes("FROM system_settings"))
+    return params[0] === "kiotviet_prepayment_evidence" ? (mocks.evidence ? [{ value: mocks.evidence }] : []) : [{ value: mocks.orderSettings }];
   if (sql.includes("FROM webhook_events")) return mocks.event ? [mocks.event] : [];
   if (sql.includes("FROM branch_location_mappings")) return mocks.locationMapped ? [{}] : [];
   if (sql.startsWith("SELECT") && sql.includes("FROM invoice_mappings")) return mocks.invoice ? [{ ...mocks.invoice }] : [];
   const row = mocks.invoice;
   if (sql.startsWith("INSERT INTO invoice_mappings")) {
     if (row) {
+      const stalePending = row.status === "pending" && Date.parse(String(row.claimed_at)) < Date.now() - 5 * 60_000;
       const allowed = !row.kiotviet_invoice_id && params[8] !== null && row.updated_at === params[8] &&
-        (["failed", "blocked"].includes(String(row.status)) || params[3] === "linked");
+        (["failed", "blocked"].includes(String(row.status)) || params[3] === "linked" || stalePending);
       if (!allowed) return [];
     }
     mocks.invoice = {
@@ -59,6 +62,11 @@ function run(sql: string, params: unknown[]): Record<string, unknown>[] {
   }
   if (sql.startsWith("UPDATE invoice_mappings SET status='failed'")) {
     if (row.claim_token === params[1]) Object.assign(row, { status: "failed", updated_at: now() });
+    return [];
+  }
+  if (sql.startsWith("UPDATE invoice_mappings SET status=$4")) {
+    if (row.claim_token !== params[1] || row.status !== "pending") return [];
+    Object.assign(row, { status: params[3], claim_token: null, last_error: params[2], failure_stage: params[4], updated_at: now() });
     return [];
   }
   if (sql.startsWith("UPDATE invoice_mappings SET last_error")) { Object.assign(row, { last_error: params[2], updated_at: now() }); return []; }
@@ -132,6 +140,12 @@ const kiotVietOrder = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 const noInvoices = { invoices: [], complete: true };
+const carriedEvidence = {
+  retailer: "sandbox-shop", testedAt: "2026-11-04T08:00:00.000Z",
+  order: { id: 1, code: "DH-TEST", total: 100, prepaid: 100 },
+  invoice: { id: 2, code: "HD-TEST", requestedTotalPayment: 0, total: 100, totalPayment: 100, paymentRows: [{ amount: 100 }] },
+  orderAfter: { status: 3, totalPayment: 100 }, result: "carried",
+};
 
 it("retains the invoice ID but requires review when inventory did not move", async () => {
   mocks.createInvoice.mockResolvedValue({ id: 8001, code: "HD8001" });
@@ -159,7 +173,9 @@ it("blocks the reported 80 product / 90 prepaid discrepancy", async () => {
 it("does not send an invoice if the live order changes after planning", async () => {
   const plan = await planInvoiceRecovery(ORDER_ID);
   mocks.event = { id: "new", payload: order1072({ cancelled_at: "2026-11-04" }) };
-  await expect(applyInvoiceRecovery(plan)).resolves.toMatchObject({ applied: false, message: expect.stringContaining("Order changed") });
+  await expect(applyInvoiceRecovery(plan)).resolves.toMatchObject({ applied: false, message: expect.stringContaining("order changed during validation") });
+  // Nothing was sent, so the claim is released as safely retryable, not left pending.
+  expect(mocks.invoice).toMatchObject({ status: "failed", claim_token: null });
   expect(mocks.createInvoice).not.toHaveBeenCalled();
 });
 
@@ -171,6 +187,9 @@ beforeEach(() => {
   mocks.locationMapped = true;
   mocks.sql = [];
   mocks.audit = [];
+  // Sandbox evidence that invoices inherit the order prepayment, plus accounting sign-off.
+  mocks.evidence = carriedEvidence;
+  mocks.orderSettings.invoicePrepaymentVerified = true;
   mocks.transactions = 0;
   for (const product of products) mocks.stock[String(product.productId)] = 5;
   mocks.kiotVietOrder.mockResolvedValue(kiotVietOrder());
@@ -184,7 +203,8 @@ beforeEach(() => {
     for (const product of products) mocks.stock[String(product.productId)] -= 1;
     return { id: 8001, code: "HD8001" };
   });
-  mocks.invoiceDetail.mockResolvedValue({ id: 8001, code: "HD8001", orderCode: "DH1072", status: 1, branchId: 10, invoiceDetails: kiotVietOrder().orderDetails, total: 90, totalPayment: 0 });
+  // "Khách đã trả" includes the inherited prepayment (as the sandbox evidence shows).
+  mocks.invoiceDetail.mockResolvedValue({ id: 8001, code: "HD8001", orderCode: "DH1072", status: 1, branchId: 10, invoiceDetails: kiotVietOrder().orderDetails, total: 90, totalPayment: 90 });
 });
 
 describe("invoice recovery CLI arguments", () => {
@@ -348,7 +368,7 @@ describe("shipping via KiotViet surcharge and existing prepayments", () => {
     withShipping();
     mocks.orderSettings.shippingSurcharge = surcharge;
     mocks.kiotVietOrder.mockResolvedValue(kiotVietOrder({ total: 100, totalPayment: 100, invoiceOrderSurcharges: [{ surchargeId: 3, price: 10 }] }));
-    mocks.invoiceDetail.mockResolvedValue({ id: 8001, code: "HD8001", orderCode: "DH1072", status: 1, branchId: 10, invoiceDetails: kiotVietOrder().orderDetails, total: 100, totalPayment: 0, invoiceOrderSurcharges: [{ surchargeId: 3, price: 10 }] });
+    mocks.invoiceDetail.mockResolvedValue({ id: 8001, code: "HD8001", orderCode: "DH1072", status: 1, branchId: 10, invoiceDetails: kiotVietOrder().orderDetails, total: 100, totalPayment: 100, invoiceOrderSurcharges: [{ surchargeId: 3, price: 10 }] });
     const plan = await planInvoiceRecovery(ORDER_ID);
     expect(plan.expectedTotal).toBe(100);
     expect(plan.action).toMatchObject({ kind: "create_invoice", input: { totalPayment: 0 } });
@@ -421,10 +441,20 @@ describe("admin invoice override (Bỏ qua cảnh báo & tạo hóa đơn)", () 
     const { preview, previewToken } = await previewInvoiceOverride(ORDER_ID, "admin");
     expect(preview).toMatchObject({
       shopifyOrderId: ORDER_ID, kiotVietOrder: { id: 5555, code: "DH1072" }, submitAllowed: true, blockers: [],
-      amounts: { merchandiseSubtotal: 90, shopifyShipping: 10, orderSurcharges: 0, excludedFees: 3.33, prepaid: 100,
-        invoiceTotal: 90, shopifyPaidForGoods: 100, additionalPayment: 0, balanceAfterInvoice: -10, currency: "USD" },
+      amounts: {
+        currency: "USD",
+        shopify: { merchandise: 90, shipping: 10, excludedFees: 3.33, total: 103.33, paidForGoods: 100 },
+        invoice: { merchandise: 90, surcharges: 0, total: 90 },
+        payment: { existingPrepayment: 100, additionalPayment: 0, totalRecorded: 100, overpayment: 10, remainingBalance: 0 },
+      },
+      reconciled: false,
       payload: { orderId: 5555, branchId: 10, totalPayment: 0, discount: 0 },
     });
+    // Differences that remain after invoicing are shown explicitly.
+    expect(preview.remainingDifferences).toEqual([
+      expect.objectContaining({ code: "shipping_unrecorded", amount: 10 }),
+      expect.objectContaining({ code: "overpayment", amount: 10 }),
+    ]);
     expect(preview.warnings.map((warning) => warning.code).sort()).toEqual(codes);
     // Product prices untouched, no invented shipping line or surcharge.
     expect(preview.lines.map((line) => [line.productCode, line.quantity, line.price])).toEqual([["377", 1, 20], ["711", 1, 25], ["1045", 1, 30], ["1030", 1, 15]]);
@@ -436,12 +466,19 @@ describe("admin invoice override (Bỏ qua cảnh báo & tạo hóa đơn)", () 
 
   it("creates exactly the previewed invoice for an authorized, confirmed and justified override, and audits it", async () => {
     const { previewToken } = await previewInvoiceOverride(ORDER_ID, "admin");
+    // KiotViet reports the inherited 100 as paid on the 90 invoice.
+    mocks.invoiceDetail.mockResolvedValue({ id: 8001, code: "HD8001", orderCode: "DH1072", status: 1, branchId: 10, invoiceDetails: kiotVietOrder().orderDetails, total: 90, totalPayment: 100 });
     const result = await submit(previewToken);
-    expect(result).toMatchObject({ applied: true, invoiceCode: "HD8001", status: "created" });
+    // Created and linked, but never labelled reconciled while shipping/payment differences remain.
+    expect(result).toMatchObject({ applied: true, invoiceCode: "HD8001", status: "needs_review" });
     expect(mocks.createInvoice).toHaveBeenCalledOnce();
     expect(mocks.createInvoice.mock.calls[0][0]).toMatchObject({ orderId: 5555, totalPayment: 0 });
-    expect(mocks.invoice).toMatchObject({ status: "created", kiotviet_invoice_id: "8001", expected_total: "90",
-      reconciliation: expect.objectContaining({ approvedWarnings: codes, manualOverride: expect.objectContaining({ admin: "admin", approvedWarnings: codes }) }) });
+    expect(mocks.invoice).toMatchObject({ status: "needs_review", kiotviet_invoice_id: "8001", expected_total: "90",
+      reconciliation: expect.objectContaining({
+        approvedWarnings: codes, manualOverride: expect.objectContaining({ admin: "admin", approvedWarnings: codes }),
+        remainingDifferences: [expect.objectContaining({ code: "shipping_unrecorded" }), expect.objectContaining({ code: "overpayment" })],
+        checks: expect.objectContaining({ financialValidation: true, payment: true, financiallyReconciled: false }),
+      }) });
     expect(mocks.audit.map((entry) => entry.action)).toEqual(["kiotviet_invoice_override_requested", "kiotviet_invoice_override_result"]);
     expect(mocks.audit[0]).toMatchObject({ actor: "admin", entityId: ORDER_ID,
       before: expect.objectContaining({ reason: expect.stringContaining("kế toán"), approvedWarnings: codes, payloadSummary: expect.objectContaining({ invoiceTotal: 90, additionalPayment: 0 }) }) });
@@ -452,12 +489,17 @@ describe("admin invoice override (Bỏ qua cảnh báo & tạo hóa đơn)", () 
     expect((await planInvoiceRecovery(ORDER_ID)).action.kind).toBe("blocked");
   });
 
-  it("disables submission for prepaid orders until accounting verified prepayment handling", async () => {
-    mocks.orderSettings.invoicePrepaymentVerified = false;
+  it.each([
+    ["accounting has not signed off", () => { mocks.orderSettings.invoicePrepaymentVerified = false; }],
+    ["no sandbox evidence exists", () => { mocks.evidence = undefined; }],
+    ["the sandbox showed the prepayment is not carried", () => { mocks.evidence = { ...carriedEvidence, result: "not_carried" }; }],
+  ])("blocks prepaid orders (override and automatic) when %s", async (_label, setup) => {
+    setup();
     const { preview, previewToken } = await previewInvoiceOverride(ORDER_ID, "admin");
     expect(preview.submitAllowed).toBe(false);
-    expect(preview.blockers.map((item) => item.code)).toContain("prepayment_behavior_unverified");
+    expect(preview.blockers.map((item) => item.code)).toContain("prepayment_inheritance_unverified");
     await expect(submit(previewToken)).rejects.toBeInstanceOf(ConflictError);
+    expect((await planInvoiceRecovery(ORDER_ID)).action).toMatchObject({ kind: "blocked", reasons: expect.arrayContaining([expect.stringContaining("prepayment_inheritance_unverified")]) });
     expect(mocks.createInvoice).not.toHaveBeenCalled();
   });
 
@@ -545,6 +587,84 @@ describe("admin invoice override (Bỏ qua cảnh báo & tạo hóa đơn)", () 
     mocks.invoice!.claimed_at = new Date(Date.now() - 10 * 60_000);
     const later = await previewInvoiceOverride(ORDER_ID, "admin");
     expect(later.preview.blockers.map((item) => item.code)).toContain("invoice_outcome_unknown");
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+  });
+});
+
+describe("invoice state machine before the POST (fix for 94da81c)", () => {
+  it("releases the claim as safely retryable when the pre-POST lookup is incomplete, then succeeds once the index is complete", async () => {
+    mocks.findInvoices
+      .mockResolvedValueOnce(noInvoices)
+      .mockResolvedValueOnce({ invoices: [], complete: false, indexError: "invoice index not current (4000/13215 indexed)" });
+    await expect(applyInvoiceRecovery(await planInvoiceRecovery(ORDER_ID)))
+      .resolves.toMatchObject({ applied: false, message: expect.stringContaining("nothing sent, safe to retry") });
+    expect(mocks.createInvoice).not.toHaveBeenCalled();
+    expect(mocks.invoice).toMatchObject({ status: "failed", failure_stage: "pre_post_lookup", claim_token: null });
+    // Not an unknown outcome: the next dry run (index now complete) plans and creates the invoice.
+    const retry = await planInvoiceRecovery(ORDER_ID);
+    expect(retry.action.kind).toBe("create_invoice");
+    await expect(applyInvoiceRecovery(retry)).resolves.toMatchObject({ applied: true, status: "created" });
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+  });
+
+  it("releases the claim when a pre-POST request throws (nothing sent)", async () => {
+    mocks.findInvoices.mockResolvedValueOnce(noInvoices).mockRejectedValueOnce(new Error("KiotViet 503 on GET /invoices"));
+    await expect(applyInvoiceRecovery(await planInvoiceRecovery(ORDER_ID))).rejects.toThrow("503");
+    expect(mocks.invoice).toMatchObject({ status: "failed", failure_stage: "pre_post", claim_token: null });
+    expect((await planInvoiceRecovery(ORDER_ID)).action.kind).toBe("create_invoice");
+    expect(mocks.createInvoice).not.toHaveBeenCalled();
+  });
+
+  it("marks a duplicate that appeared before the POST as blocked, never as an unknown outcome", async () => {
+    mocks.findInvoices.mockResolvedValueOnce(noInvoices).mockResolvedValueOnce({ invoices: [
+      { id: 1, code: "HD1", orderCode: "DH1072", status: 1 }, { id: 2, code: "HD2", orderCode: "DH1072", status: 1 },
+    ], complete: true });
+    await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_ID));
+    expect(mocks.invoice).toMatchObject({ status: "blocked", last_error: expect.stringContaining("duplicate_invoices") });
+    expect(mocks.createInvoice).not.toHaveBeenCalled();
+  });
+
+  it("treats a stale unsent 'pending' claim as reclaimable, but a fresh one as in flight", async () => {
+    const pending = (minutesAgo: number) => ({
+      shopify_order_id: ORDER_ID, kiotviet_invoice_id: null, status: "pending", source: "recovery", claim_token: "crashed-worker",
+      claimed_at: new Date(Date.now() - minutesAgo * 60_000), created_at: new Date(Date.now() - minutesAgo * 60_000),
+      updated_at: "2026-11-04T01:00:00.000Z", expected_total: "90", reconciliation: {},
+    });
+    mocks.invoice = pending(1);
+    expect((await planInvoiceRecovery(ORDER_ID)).action).toMatchObject({ kind: "blocked", reasons: [expect.stringContaining("invoice_in_flight")] });
+    mocks.invoice = pending(10);
+    const plan = await planInvoiceRecovery(ORDER_ID);
+    expect(plan.action.kind).toBe("create_invoice");
+    await expect(applyInvoiceRecovery(plan)).resolves.toMatchObject({ applied: true });
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+  });
+
+  it("keeps 'creating' (POST may have been sent) as an unknown outcome", async () => {
+    mocks.invoice = {
+      shopify_order_id: ORDER_ID, kiotviet_invoice_id: null, status: "creating", source: "recovery", claim_token: "t",
+      claimed_at: new Date(Date.now() - 10 * 60_000), created_at: new Date(Date.now() - 10 * 60_000), updated_at: "2026-11-04T01:00:00.000Z", reconciliation: {},
+    };
+    expect((await planInvoiceRecovery(ORDER_ID)).action).toMatchObject({ kind: "blocked", reasons: [expect.stringContaining("invoice_outcome_unknown")] });
+  });
+
+  it("flags the invoice when KiotViet did not actually inherit the order prepayment", async () => {
+    // Full prepayment of 90: the payload records nothing new (totalPayment 0)...
+    const plan = await planInvoiceRecovery(ORDER_ID);
+    expect(plan.action).toMatchObject({ kind: "create_invoice", input: { totalPayment: 0 } });
+    // ...but the created invoice reports 0 paid instead of the inherited 90.
+    mocks.invoiceDetail.mockResolvedValue({ id: 8001, code: "HD8001", orderCode: "DH1072", status: 1, branchId: 10, invoiceDetails: kiotVietOrder().orderDetails, total: 90, totalPayment: 0 });
+    await applyInvoiceRecovery(plan);
+    expect(mocks.invoice).toMatchObject({ status: "needs_review", kiotviet_invoice_id: "8001", reconciliation: expect.objectContaining({ checks: expect.objectContaining({ payment: false }) }) });
+  });
+});
+
+describe("override: duplicate submission", () => {
+  it("rejects re-submitting a preview after the invoice was created", async () => {
+    const { previewToken } = await previewInvoiceOverride(ORDER_ID, "admin");
+    await expect(submitInvoiceOverride({ orderId: ORDER_ID, admin: "admin", previewToken, approvedWarnings: [], confirm: true, reason: "Duyệt tạo hóa đơn theo đối soát" }))
+      .resolves.toMatchObject({ applied: true });
+    await expect(submitInvoiceOverride({ orderId: ORDER_ID, admin: "admin", previewToken, approvedWarnings: [], confirm: true, reason: "Duyệt tạo hóa đơn theo đối soát" }))
+      .rejects.toBeInstanceOf(ConflictError);
     expect(mocks.createInvoice).toHaveBeenCalledOnce();
   });
 });

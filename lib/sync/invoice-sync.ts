@@ -166,7 +166,6 @@ export async function finalizeInvoice(
   const detail = await getKiotVietInvoiceDetail(invoiceId);
   const reconciliation: InvoiceReconciliation = { ...(row.reconciliation ?? {}) };
   const expected = cents(row.expected_total);
-  const prepaid = cents(options.prepaid ?? reconciliation.prepaid ?? 0);
   // An approved override may leave a balance (payment capped at what Shopify received).
   const expectedPayment = typeof reconciliation.expectedPaymentTotal === "number" ? cents(reconciliation.expectedPaymentTotal) : expected;
   const checks = {
@@ -187,8 +186,12 @@ export async function finalizeInvoice(
       (cents(reconciliation.shippingTotal) > 0 && cents(detail.total) === expected - cents(reconciliation.shippingTotal) &&
         (detail.invoiceOrderSurcharges ?? []).reduce((sum, surcharge) => sum + cents(surcharge?.price), 0) === cents(reconciliation.shippingTotal))),
     // KiotViet may report the invoice payment alone or including the order's prepayment.
-    payment: row.expected_total !== null &&
-      (cents(detail.totalPayment) === expectedPayment || cents(detail.totalPayment) + prepaid === expectedPayment),
+    // "Khách đã trả" must equal prepayment + new payment. A prepaid order is only invoiced
+    // after sandbox evidence showed the invoice inherits the prepayment, so a value that
+    // equals only the new payment means it was not inherited.
+    payment: row.expected_total !== null && cents(detail.totalPayment) === expectedPayment,
+    // Approved override differences (shipping, payment) are never reported as reconciled.
+    financiallyReconciled: !(Array.isArray(reconciliation.remainingDifferences) && reconciliation.remainingDifferences.length > 0),
   };
   reconciliation.invoice = {
     id: detail.id, code: detail.code,

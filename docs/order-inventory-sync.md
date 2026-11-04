@@ -198,7 +198,34 @@ Recommended instead of the legacy `autoInvoice`. With `invoiceCreationTrigger = 
   - runs the dry run again and rejects the request if the payload, the Shopify or KiotViet order, or the local invoice state changed;
   - goes through the usual claim, which re-checks invoice existence and the live orders right before the `POST`.
   Timeouts leave `creating` and are never resent. Concurrent submissions produce at most one invoice.
-- **Prepaid orders**: submission stays disabled until accounting has checked, on a real invoice, how KiotViet carries an order's prepayment, and ticked "Kế toán đã xác nhận…" (`orders.invoicePrepaymentVerified`) in Settings.
+- **Preview groups**:
+  - Shopify: merchandise, shipping, excluded fees, amount paid.
+  - The actual KiotViet invoice: order lines, surcharges, total.
+  - KiotViet payment: prepayment, additional payment, total recorded, overpayment, remaining balance.
+  - **Differences that remain after invoicing**: `merchandise_difference`, `shipping_unrecorded`, `overpayment`, `remaining_balance`, `payment_not_recorded`.
+  An invoice created with any remaining difference is saved as `needs_review` (`checks.financiallyReconciled = false`), never as `created`/reconciled.
+- **Prepaid orders** (automatic and override): KiotViet does not document whether an invoice created with `orderId` inherits the order's prepayment. Invoicing any order with a prepayment is blocked (`prepayment_inheritance_unverified`, not overridable) until both conditions hold:
+  1. sandbox evidence with result `carried` is stored (see below);
+  2. accounting has ticked "Kế toán đã xác nhận…" (`orders.invoicePrepaymentVerified`).
+  After creation the invoice must report "Khách đã trả" = prepayment + new payment. Otherwise it is `needs_review`.
+- **State rules**: before the `POST` nothing has been sent. An incomplete or failing invoice lookup, a staleness change or any error releases the claim as `failed` (retryable), and duplicates or cancelled invoices release it as `blocked`. A stale `pending` claim (claimed, never sent) is reclaimable after 5 minutes. Only `creating`/`needs_review` without an invoice ID mean "a POST may have been sent" (`invoice_outcome_unknown`).
+
+### Verifying prepayment inheritance (sandbox)
+1. Prepare a **sandbox** KiotViet retailer with its own env file `.env.sandbox`, containing that retailer's `KIOTVIET_*` values only. Note one sandbox product ID and branch ID.
+2. Run a dry run first, then the real sandbox test (creates one sandbox order and one sandbox invoice):
+   ```bash
+   KIOTVIET_SANDBOX=1 KIOTVIET_PRODUCTION_RETAILER=<production retailer> npx tsx --env-file=.env.sandbox \
+     scripts/verify-kiotviet-prepayment-inheritance.ts --retailer <sandbox retailer> --product-id <id> --branch-id <id>
+   KIOTVIET_SANDBOX=1 KIOTVIET_PRODUCTION_RETAILER=<production retailer> npx tsx --env-file=.env.sandbox \
+     scripts/verify-kiotviet-prepayment-inheritance.ts --retailer <sandbox retailer> --product-id <id> --branch-id <id> --execute --out evidence.json
+   ```
+3. Check the printed invoice in the sandbox KiotViet UI with accounting, then clean up as printed.
+4. Store the evidence in production (dry run first):
+   ```bash
+   npx tsx --env-file=.env.production scripts/record-kiotviet-prepayment-evidence.ts --file evidence.json
+   npx tsx --env-file=.env.production scripts/record-kiotviet-prepayment-evidence.ts --file evidence.json --apply
+   ```
+   Only `result: "carried"` unlocks prepaid orders, and only together with the accounting checkbox. `not_carried` means prepaid orders must keep being invoiced by hand in KiotViet.
 - **Audit**: `audit_logs` gets `kiotviet_invoice_override_requested` and `kiotviet_invoice_override_result` (admin, order, approved warnings, reason, time, payload summary, result, client IP). `invoice_mappings.reconciliation.manualOverride` stores the same approval.
 
 ## Production deployment

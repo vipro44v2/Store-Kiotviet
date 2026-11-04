@@ -89,16 +89,31 @@ export function InvoiceOverride() {
             <tbody>
               <tr><th>Shopify Order ID</th><td>{preview.shopifyOrderId}{preview.shopifyOrderName ? ` (${preview.shopifyOrderName})` : ""}</td></tr>
               <tr><th>KiotViet order</th><td>{preview.kiotVietOrder ? `${preview.kiotVietOrder.code} (ID ${preview.kiotVietOrder.id})` : "—"}</td></tr>
-              <tr><th>Tiền hàng (theo dòng đơn KiotViet)</th><td>{money(preview.amounts?.merchandiseSubtotal, currency)}</td></tr>
-              <tr><th>Phí vận chuyển Shopify</th><td>{money(preview.amounts?.shopifyShipping, currency)}</td></tr>
-              <tr><th>Thu khác đã có trên đơn KiotViet</th><td>{money(preview.amounts?.orderSurcharges, currency)}</td></tr>
-              <tr><th>Phí xử lý thẻ đã loại trừ</th><td>{money(preview.amounts?.excludedFees, currency)}</td></tr>
-              <tr><th>Đã trả trước trên KiotViet</th><td>{money(preview.amounts?.prepaid, currency)}</td></tr>
-              <tr><th>Tổng hóa đơn dự kiến</th><td>{money(preview.amounts?.invoiceTotal, currency)}</td></tr>
-              <tr><th>Thanh toán ghi thêm khi tạo hóa đơn</th><td>{money(preview.amounts?.additionalPayment, currency)}</td></tr>
-              <tr><th>Chênh lệch còn lại (+ còn nợ / − trả thừa)</th><td>{money(preview.amounts?.balanceAfterInvoice, currency)}</td></tr>
+              <tr><th colSpan={2}>Shopify (khách đã bị tính)</th></tr>
+              <tr><th>Tiền hàng Shopify</th><td>{money(preview.amounts?.shopify.merchandise, currency)}</td></tr>
+              <tr><th>Phí vận chuyển Shopify</th><td>{money(preview.amounts?.shopify.shipping, currency)}</td></tr>
+              <tr><th>Phí xử lý thẻ đã loại trừ</th><td>{money(preview.amounts?.shopify.excludedFees, currency)}</td></tr>
+              <tr><th>Khách đã trả (trừ phí xử lý thẻ)</th><td>{money(preview.amounts?.shopify.paidForGoods, currency)}</td></tr>
+              <tr><th colSpan={2}>Hóa đơn KiotViet sẽ tạo (giữ nguyên dòng đơn KiotViet)</th></tr>
+              <tr><th>Tiền hàng trên hóa đơn</th><td>{money(preview.amounts?.invoice.merchandise, currency)}</td></tr>
+              <tr><th>Thu khác trên hóa đơn</th><td>{money(preview.amounts?.invoice.surcharges, currency)}</td></tr>
+              <tr><th>Tổng hóa đơn</th><td>{money(preview.amounts?.invoice.total, currency)}</td></tr>
+              <tr><th colSpan={2}>Thanh toán trên KiotViet</th></tr>
+              <tr><th>Đã trả trước trên đơn KiotViet</th><td>{money(preview.amounts?.payment.existingPrepayment, currency)}</td></tr>
+              <tr><th>Thanh toán ghi thêm khi tạo hóa đơn</th><td>{money(preview.amounts?.payment.additionalPayment, currency)}</td></tr>
+              <tr><th>Tổng đã ghi nhận sau hóa đơn</th><td>{money(preview.amounts?.payment.totalRecorded, currency)}</td></tr>
+              <tr><th>Trả thừa</th><td>{money(preview.amounts?.payment.overpayment, currency)}</td></tr>
+              <tr><th>Còn nợ trên hóa đơn</th><td>{money(preview.amounts?.payment.remainingBalance, currency)}</td></tr>
             </tbody>
           </table>
+          {preview.amounts && (preview.reconciled ? (
+            <p><strong>Sau khi tạo hóa đơn: số liệu khớp, không còn chênh lệch.</strong></p>
+          ) : (
+            <div className="error-banner">
+              <strong>Chênh lệch vẫn còn SAU khi tạo hóa đơn (hóa đơn sẽ được đánh dấu cần đối soát, không được coi là đã khớp):</strong>
+              <ul>{preview.remainingDifferences.map((item) => <li key={item.code}>{item.code}: {item.message} ({money(item.amount, currency)})</li>)}</ul>
+            </div>
+          ))}
           <h3>Sản phẩm</h3>
           <ul>
             {preview.lines.map((line) => (
