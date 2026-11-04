@@ -10,7 +10,10 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/lib/db/client", () => ({
   transaction: (callback: (client: { query: typeof mocks.query }) => unknown) =>
     callback({ query: mocks.query }),
+  query: async (sql: string) =>
+    sql.includes("RETURNING") ? [{ shopify_order_id: "100" }] : [],
 }));
+vi.mock("@/lib/logger", () => ({ log: vi.fn() }));
 vi.mock("@/lib/sync/ensure-product-mapping", () => ({
   ensureProductMapping: mocks.ensureMapping,
 }));
@@ -57,7 +60,7 @@ describe("Shopify order product auto-mapping", () => {
       ],
     });
 
-    expect(mocks.ensureMapping).toHaveBeenCalledWith("NU012");
+    expect(mocks.ensureMapping).toHaveBeenCalledWith("NU012", undefined);
     expect(mocks.createOrder).toHaveBeenCalledWith(
       expect.objectContaining({
         orderDetails: [expect.objectContaining({ productId: 501 })],

@@ -1,8 +1,7 @@
 import type { Job } from "bullmq";
 import {
+  isManualReviewError,
   PermanentError,
-  MappingError,
-  ConflictError,
   ValidationError,
 } from "@/lib/errors";
 import type { SyncJobPayload } from "./jobs";
@@ -40,6 +39,17 @@ import { normalizeSku } from "@/lib/sync/mappings";
 import { admitInventoryReconciliation } from "@/repositories/inventory-reconciliation";
 import { getEnv } from "@/lib/env";
 import { log } from "@/lib/logger";
+import {
+  disabledSyncForJob,
+  isSyncGatedJob,
+  type SynchronizationSettings,
+} from "@/lib/settings/sync-settings";
+import { getSyncSettings } from "@/lib/sync/sync-settings";
+
+export interface SkippedJobResult {
+  skipped: true;
+  reason: string;
+}
 
 function recordPayload(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object")
@@ -133,11 +143,48 @@ function productPriceOverrides(
   return prices;
 }
 
-export async function processSyncJob(job: Job<SyncJobPayload>) {
+/**
+ * Sync direction settings are checked here, when the job runs, so jobs queued
+ * before a direction was disabled cannot bypass it. Only the affected job type
+ * is skipped; the worker keeps processing everything else.
+ */
+async function skipDisabledJob(
+  job: Job<SyncJobPayload>,
+): Promise<{ settings?: SynchronizationSettings; skipped?: SkippedJobResult }> {
+  if (!isSyncGatedJob(job.name)) return {};
+  const settings = await getSyncSettings();
+  const disabled = disabledSyncForJob(job.name, settings);
+  if (!disabled) return { settings };
+  await log("info", "Synchronization direction disabled; job skipped", {
+    action: "sync_direction_disabled",
+    reason: disabled.reason,
+    setting: disabled.setting,
+    jobType: job.name,
+    eventId: job.data.eventId,
+    jobId: typeof job.data.auditJobId === "string" ? job.data.auditJobId : undefined,
+  });
+  if (job.data.eventId)
+    await webhooksRepository.markIgnored(job.data.eventId, disabled.reason);
+  return { settings, skipped: { skipped: true, reason: disabled.reason } };
+}
+
+export async function processSyncJob(
+  job: Job<SyncJobPayload>,
+): Promise<SkippedJobResult | undefined> {
+  const gate = await skipDisabledJob(job);
+  if (gate.skipped) return gate.skipped;
+  const inventoryOptions = {
+    conflictStrategy: gate.settings?.inventoryConflictStrategy,
+  };
   const event = job.data.eventId
     ? await webhooksRepository.get(job.data.eventId)
     : undefined;
   const payload = event?.payload;
+  const orderContext = {
+    jobType: job.name,
+    eventId: job.data.eventId,
+    jobId: typeof job.data.auditJobId === "string" ? job.data.auditJobId : undefined,
+  };
   switch (job.name) {
     case "kiotviet_inventory_to_shopify": {
       const body = payload as unknown as KiotVietWebhookPayload;
@@ -146,6 +193,7 @@ export async function processSyncJob(job: Job<SyncJobPayload>) {
           await syncInventoryNotification(
             item as KiotVietStockNotification,
             String(job.data.auditJobId),
+            inventoryOptions,
           );
         }
       break;
@@ -222,7 +270,14 @@ export async function processSyncJob(job: Job<SyncJobPayload>) {
     }
     case "shopify_order_create":
     case "shopify_order_update":
-      await syncShopifyOrder(payload as unknown as ShopifyOrderWebhook);
+      if (job.data.eventId && !event)
+        throw new ValidationError(
+          `Webhook event ${job.data.eventId} for ${job.name} no longer exists`,
+        );
+      await syncShopifyOrder(
+        payload as unknown as ShopifyOrderWebhook,
+        orderContext,
+      );
       break;
     case "shopify_order_cancel":
       await cancelShopifyOrder(payload as unknown as ShopifyOrderWebhook);
@@ -300,6 +355,7 @@ export async function processSyncJob(job: Job<SyncJobPayload>) {
         Number(job.data.currentItem ?? 0),
         String(job.data.auditJobId),
         admission.payload.reconciliationChainId,
+        inventoryOptions,
       );
       break;
     }
@@ -315,13 +371,9 @@ export async function processSyncJob(job: Job<SyncJobPayload>) {
   }
   if (job.data.eventId)
     await webhooksRepository.markProcessed(job.data.eventId);
+  return undefined;
 }
 
 export function isManualReview(error: unknown) {
-  return (
-    error instanceof PermanentError ||
-    error instanceof MappingError ||
-    error instanceof ConflictError ||
-    error instanceof ValidationError
-  );
+  return isManualReviewError(error);
 }

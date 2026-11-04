@@ -29,18 +29,18 @@ async function findExactKiotVietProducts(sku: string) {
 }
 
 export async function ensureProductMapping(
-  skuValue: string,
+  skuValue: string | null | undefined,
   jobId?: string,
 ): Promise<MappingRecord> {
   const sku = normalizeSku(skuValue);
-  if (!sku) throw new MappingError("Order line has an empty SKU");
+  if (!sku) throw new MappingError("Order line has an empty SKU", { mappingStatus: "missing_sku" });
 
   const existing = (await mappingsRepository.findBySku(sku)).filter((mapping) => mapping.sync_status !== "archived");
   if (existing.length > 1)
-    throw new MappingError(`Multiple product mappings exist for SKU ${sku}`);
+    throw new MappingError(`Multiple product mappings exist for SKU ${sku}`, { sku, mappingStatus: "duplicate_mapping" });
   if (existing.length === 1) {
     if (existing[0].kiotviet_product_id) return existing[0];
-    throw new MappingError(`Product mapping for SKU ${sku} is incomplete`);
+    throw new MappingError(`Product mapping for SKU ${sku} is incomplete`, { sku, mappingStatus: "incomplete_mapping" });
   }
 
   const [shopifyCandidates, kiotVietMatches] = await Promise.all([
@@ -53,6 +53,7 @@ export async function ensureProductMapping(
   if (shopifyMatches.length !== 1 || kiotVietMatches.length !== 1)
     throw new MappingError(
       `Cannot auto-map SKU ${sku}: expected exactly one exact match in Shopify and KiotViet, found Shopify=${shopifyMatches.length}, KiotViet=${kiotVietMatches.length}`,
+      { sku, mappingStatus: shopifyMatches.length > 1 || kiotVietMatches.length > 1 ? "duplicate_product" : "unmapped" },
     );
 
   const shopify = shopifyMatches[0];
@@ -72,6 +73,7 @@ export async function ensureProductMapping(
   if (reconciled.length !== 1 || !reconciled[0].kiotviet_product_id)
     throw new MappingError(
       `Product mapping for SKU ${sku} could not be reconciled after concurrent auto-map`,
+      { sku, mappingStatus: "auto_map_conflict" },
     );
   await log("info", "Product mapping automatically created for order", {
     action: "auto_map_order_product",

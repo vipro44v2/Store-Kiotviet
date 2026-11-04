@@ -149,7 +149,7 @@ async function saveMapping(
 
 async function checkpointFamily(
   products: KiotVietProduct[],
-  saved: { productId: string; variants: Array<{ id: string; sku: string; product: { id: string }; inventoryItem: { id: string } }> },
+  saved: { productId: string; variants: Array<{ id: string; sku: string | null; product: { id: string }; inventoryItem: { id: string } }> },
 ) {
   // Persist each identity before media. A partially written family is still
   // recoverable through any committed sibling's common Shopify product ID.

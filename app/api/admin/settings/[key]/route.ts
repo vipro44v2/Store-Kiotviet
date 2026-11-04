@@ -3,6 +3,7 @@ import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
 import { query } from "@/lib/db/client";
 import { getAllKiotVietCategories } from "@/lib/kiotviet/products";
+import { SYNC_SETTINGS_KEY, synchronizationSettingsSchema } from "@/lib/settings/sync-settings";
 
 const allowed = new Set([
   "inventory", "products", "orders", "retention", "customers",
@@ -34,6 +35,7 @@ export async function PUT(
       }
       value = { categoryIds };
     }
+    if (key === SYNC_SETTINGS_KEY) value = synchronizationSettingsSchema.parse(value);
     await query(
       "INSERT INTO system_settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",
       [key, JSON.stringify(value)],

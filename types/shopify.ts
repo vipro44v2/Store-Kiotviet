@@ -15,8 +15,9 @@ export interface ShopifyGraphqlResponse<T> {
 }
 export interface ShopifyVariant {
   id: string;
-  sku: string;
-  barcode?: string;
+  /** Admin GraphQL `ProductVariant.sku` is nullable. */
+  sku: string | null;
+  barcode?: string | null;
   product: { id: string; title: string };
   inventoryItem: { id: string; tracked: boolean };
 }
@@ -25,35 +26,50 @@ export interface ShopifyLocation {
   name: string;
   isActive: boolean;
 }
+export interface ShopifyWebhookAddress {
+  address1?: string | null;
+  address2?: string | null;
+  city?: string | null;
+  province?: string | null;
+  zip?: string | null;
+  country?: string | null;
+  phone?: string | null;
+}
+/**
+ * Shopify REST order webhook payload. Shopify sends `null` (not an absent key)
+ * for many fields: guest checkouts have `customer: null`, custom/deleted items
+ * have `sku: null` or `""`, and unfulfilled orders have `fulfillment_status: null`.
+ */
+export interface ShopifyOrderWebhookCustomer {
+  id?: number | null;
+  first_name?: string | null;
+  last_name?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  note?: string | null;
+  default_address?: ShopifyWebhookAddress | null;
+  addresses?: ShopifyWebhookAddress[] | null;
+}
+export interface ShopifyOrderLineItem {
+  id: number;
+  sku?: string | null;
+  quantity: number;
+  price: string;
+  name?: string | null;
+  title?: string | null;
+  variant_id?: number | null;
+  product_id?: number | null;
+}
 export interface ShopifyOrderWebhook {
   id: number;
   name: string;
-  created_at: string;
-  cancelled_at?: string;
-  financial_status: string;
-  fulfillment_status?: string;
+  created_at?: string | null;
+  cancelled_at?: string | null;
+  financial_status?: string | null;
+  fulfillment_status?: string | null;
   total_price: string;
-  email?: string;
-  phone?: string;
-  customer?: {
-    id: number;
-    first_name?: string;
-    last_name?: string;
-    email?: string;
-    phone?: string;
-    addresses?: Array<{
-      address1?: string;
-      city?: string;
-      province?: string;
-      zip?: string;
-      country?: string;
-    }>;
-  };
-  line_items: Array<{
-    id: number;
-    sku: string;
-    quantity: number;
-    price: string;
-    name: string;
-  }>;
+  email?: string | null;
+  phone?: string | null;
+  customer?: ShopifyOrderWebhookCustomer | null;
+  line_items: ShopifyOrderLineItem[];
 }

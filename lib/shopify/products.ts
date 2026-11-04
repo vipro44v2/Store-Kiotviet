@@ -273,7 +273,7 @@ export async function setShopifyVariantGroup(
     : undefined;
   const existingBySku = new Map(
     (existing?.product?.variants.nodes ?? []).map((variant) => [
-      variant.sku.trim().toUpperCase(),
+      (variant.sku ?? "").trim().toUpperCase(),
       variant.id,
     ]),
   );

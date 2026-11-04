@@ -6,6 +6,10 @@ vi.mock("@/repositories/webhooks", () => ({ webhooksRepository: { get: mocks.get
 vi.mock("@/repositories/inventory-reconciliation", () => ({ admitInventoryReconciliation: mocks.admit }));
 vi.mock("@/lib/sync/reconciliation", () => ({ reconcileInventoryPage: mocks.page, cleanupOldData: vi.fn() }));
 vi.mock("@/lib/logger", () => ({ log: mocks.log }));
+vi.mock("@/lib/sync/sync-settings", async () => {
+  const { DEFAULT_SYNC_SETTINGS } = await import("@/lib/settings/sync-settings");
+  return { getSyncSettings: async () => DEFAULT_SYNC_SETTINGS };
+});
 import { processSyncJob } from "@/lib/queue/worker";
 const job = (data: SyncJobPayload) => ({ name: "inventory_reconciliation", data }) as Job<SyncJobPayload>;
 beforeEach(() => vi.resetAllMocks());
@@ -27,5 +31,5 @@ it("skips an overlapping scheduler root", async () => {
 it("passes the same chain to pagination", async () => {
   mocks.admit.mockResolvedValue({ deduplicated: false, payload: { reconciliationChainId: "chain" } });
   await processSyncJob(job({ currentItem: 100, auditJobId: "page", reconciliationChainId: "chain" }));
-  expect(mocks.page).toHaveBeenCalledWith(100, "page", "chain");
+  expect(mocks.page).toHaveBeenCalledWith(100, "page", "chain", { conflictStrategy: "hold" });
 });

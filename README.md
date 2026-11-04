@@ -23,6 +23,7 @@ KiotViet mặc định là nguồn SKU/tồn kho; Shopify là storefront và ngu
 - Shopify GraphQL client có timeout, throttling/cost awareness và retry lỗi tạm thời.
 - Mapping engine, inventory absolute sync, safety stock, branch → location mapping, compare-and-set.
 - Shopify orders/customers → KiotViet; đơn thiếu mapping chuyển manual review.
+- Bật/tắt độc lập từng chiều đồng bộ (đơn hàng, trạng thái đơn, tồn kho), state machine tạo đơn và bảo vệ tồn kho khi Shopify đã trừ tồn: xem [docs/order-inventory-sync.md](docs/order-inventory-sync.md).
 - Refund, fulfillment hoặc chiều sync không đủ dữ liệu/mapping an toàn được giữ manual review, không bị bỏ qua.
 - Admin login bằng signed HTTP-only SameSite cookie; CSRF origin checks và Redis login rate limit.
 - Dashboard: products, mappings, inventory, orders, customers, jobs, conflicts, webhooks, logs, notifications, settings.

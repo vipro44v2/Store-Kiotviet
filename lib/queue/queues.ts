@@ -45,8 +45,9 @@ export async function enqueueJob(
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       await jobsRepository.start(auditId, attempt);
       try {
-        await processSyncJob({ name: type, data: { ...payload, auditJobId: auditId } } as never);
-        await jobsRepository.complete(auditId);
+        const result = await processSyncJob({ name: type, data: { ...payload, auditJobId: auditId } } as never);
+        if (result?.skipped) await jobsRepository.skip(auditId, result.reason);
+        else await jobsRepository.complete(auditId);
         break;
       } catch (error) {
         const failure = error instanceof Error ? error : new Error(String(error));

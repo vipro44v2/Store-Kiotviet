@@ -1,3 +1,4 @@
+import { UncertainResultError } from "@/lib/errors";
 import { kiotVietClient } from "./client";
 export interface KiotVietOrderInput {
   branchId: number;
@@ -22,8 +23,22 @@ export interface KiotVietOrderSummary {
   code: string;
   description?: string;
 }
-export function createKiotVietOrder(input: KiotVietOrderInput) {
-  return kiotVietClient.post<{ id: number; code: string }>("/orders", input);
+/**
+ * Creating an order is not idempotent: a timeout or 5xx may still have created
+ * it. Never resend automatically; callers verify with
+ * findKiotVietOrderByShopifyReference before trying again.
+ */
+export async function createKiotVietOrder(input: KiotVietOrderInput) {
+  const created = await kiotVietClient.post<{ id: number; code: string }>(
+    "/orders",
+    input,
+    { nonIdempotent: true },
+  );
+  if (!created || !Number.isSafeInteger(Number(created.id)) || Number(created.id) <= 0)
+    throw new UncertainResultError(
+      "KiotViet order creation returned no order ID; the order may have been created",
+    );
+  return created;
 }
 export function matchKiotVietOrderByShopifyReference(
   orders: KiotVietOrderSummary[],

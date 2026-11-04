@@ -37,6 +37,12 @@ export const webhooksRepository = {
       [id],
     );
   },
+  async markIgnored(id: string, reason: string) {
+    await query(
+      "UPDATE webhook_events SET status='ignored',processed_at=now(),error=$2 WHERE id=$1",
+      [id, reason],
+    );
+  },
   async markFailed(id: string, error: string) {
     await query(
       "UPDATE webhook_events SET status='failed',error=$2 WHERE id=$1",

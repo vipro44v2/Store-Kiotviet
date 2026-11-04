@@ -3,6 +3,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { DraftCategorySetting } from "./draft-category-setting";
 import { parseDraftCategoryIds } from "@/lib/settings/draft-categories";
+import { SYNC_SETTINGS_KEY } from "@/lib/settings/sync-settings";
 export function SettingsEditor({
   settings,
 }: {
@@ -12,7 +13,7 @@ export function SettingsEditor({
   return (
     <div className="settings-grid">
       <DraftCategorySetting initial={parseDraftCategoryIds(settings.find((setting) => setting.key === "draft_product_categories")?.value)} />
-      {settings.filter((setting) => setting.key !== "draft_product_categories").map((setting) => (
+      {settings.filter((setting) => setting.key !== "draft_product_categories" && setting.key !== SYNC_SETTINGS_KEY).map((setting) => (
         <Setting
           key={setting.key}
           name={setting.key}

@@ -10,6 +10,50 @@ import {
 import { getActiveShopifyLocations } from "@/lib/shopify/locations";
 import { log } from "@/lib/logger";
 import type { KiotVietStockNotification } from "@/lib/kiotviet/types";
+import type { InventoryConflictStrategy } from "@/lib/settings/sync-settings";
+
+export interface InventorySyncOptions {
+  /** Defaults to "hold". */
+  conflictStrategy?: InventoryConflictStrategy;
+}
+export const SHOPIFY_DEDUCTION_CONFLICT = "inventory_shopify_deduction";
+
+/**
+ * KiotViet owns stock, but Shopify deducts `available` itself when an order is
+ * placed. If Shopify is now below the last value this app verified, and the
+ * KiotViet value would raise it again, KiotViet does not reflect that deduction
+ * yet (order not synced, or synced as a KiotViet order that only reserves
+ * stock). Writing would restore stock that was already sold.
+ */
+export function detectUnreflectedShopifyDeduction(
+  lastSynced: number | null,
+  currentShopify: number,
+  expected: number,
+) {
+  if (lastSynced === null) return null;
+  const shopifyDeduction = lastSynced - currentShopify;
+  if (shopifyDeduction <= 0 || expected <= currentShopify) return null;
+  return {
+    lastSynced,
+    currentShopify,
+    expected,
+    shopifyDeduction,
+    wouldRestore: Math.min(shopifyDeduction, expected - currentShopify),
+  };
+}
+
+/** Last quantity this app wrote or verified, ignoring held, failed and unverified snapshots. */
+async function lastSyncedShopifyQuantity(sku: string, locationId: string) {
+  const rows = await query<{ shopify_quantity: string | null }>(
+    "SELECT shopify_quantity::text FROM inventory_snapshots WHERE sku=$1 AND shopify_location_id=$2 AND (status IS NULL OR status='baseline') AND shopify_quantity=expected_shopify_quantity ORDER BY created_at DESC LIMIT 1",
+    [sku, locationId],
+  );
+  const value = rows?.[0]?.shopify_quantity;
+  return value === null || value === undefined || !Number.isFinite(Number(value))
+    ? null
+    : Number(value);
+}
+
 export function calculateInventory(
   onHand: number,
   _reserved?: number,
@@ -23,6 +67,7 @@ export function calculateInventory(
 export async function syncInventoryNotification(
   notification: KiotVietStockNotification,
   jobId?: string,
+  options: InventorySyncOptions = {},
 ) {
   const sku = normalizeSku(notification.ProductCode);
   if (!sku) throw new MappingError("Inventory event has an empty SKU");
@@ -127,6 +172,35 @@ export async function syncInventoryNotification(
     const active = await ensureShopifyInventoryActive(inventoryItemId, locationId, { ...context, before, after });
     if (!active.isActive || active.available === null)
       throw new RetryableError("Inventory activation unverified for " + inventoryItemId + " at " + locationId);
+    const lastSynced = await lastSyncedShopifyQuantity(sku, locationId);
+    const deduction = detectUnreflectedShopifyDeduction(lastSynced, active.available, expected);
+    const conflictKey = `${sku}@${locationId}`;
+    if (deduction) {
+      const strategy = options.conflictStrategy ?? "hold";
+      // One open conflict per SKU/location; hourly reconciliation must not pile up duplicates.
+      await query(
+        `INSERT INTO sync_conflicts(entity_type,entity_key,conflict_type,shopify_value,kiotviet_value)
+        SELECT 'inventory',$1,$2,$3,$4
+        WHERE NOT EXISTS (SELECT 1 FROM sync_conflicts WHERE entity_type='inventory' AND entity_key=$1 AND conflict_type=$2 AND resolution_status='open')`,
+        [
+          conflictKey,
+          SHOPIFY_DEDUCTION_CONFLICT,
+          JSON.stringify({ sku, inventoryItemId, locationId, available: active.available, lastSynced: deduction.lastSynced }),
+          JSON.stringify({ productId: notification.ProductId, branchId: notification.BranchId, onHand: notification.OnHand, reserved: notification.Reserved, expected, strategy }),
+        ],
+      );
+      await log("warn", "Shopify inventory deduction is not reflected in KiotViet", {
+        ...context, before, after, ...deduction, strategy, action: "inventory_shopify_deduction_detected",
+      });
+      if (strategy === "hold") {
+        await query(
+          "INSERT INTO inventory_snapshots(sku,branch_id,shopify_location_id,kiotviet_quantity,shopify_quantity,expected_shopify_quantity,difference,status) VALUES($1,$2,$3,$4,$5,$6,$7,'held')",
+          [sku, notification.BranchId, locationId, notification.OnHand, active.available, expected, active.available - expected],
+        );
+        await log("info", "inventory_set_held", { ...context, before, after: active.available, action: "inventory_set_held" });
+        return { status: "held" as const, ...deduction };
+      }
+    }
     if (active.available !== expected) {
       await log("info", "inventory_set_started", { ...context, before, after, changeFromQuantity: active.available, action: "inventory_set_started" });
       await setShopifyInventory(inventoryItemId, locationId, expected, active.available);
@@ -140,7 +214,14 @@ export async function syncInventoryNotification(
     );
     if (!verified.isActive || after !== expected)
       throw new RetryableError("Inventory verification failed: " + JSON.stringify({ ...context, before, after, active: verified.isActive }));
+    if (!deduction && lastSynced !== null && active.available < lastSynced)
+      // KiotViet now reflects the earlier Shopify deduction; close the held conflict.
+      await query(
+        "UPDATE sync_conflicts SET resolution_status='resolved',resolution=$3,resolved_at=now() WHERE entity_type='inventory' AND entity_key=$1 AND conflict_type=$2 AND resolution_status='open'",
+        [conflictKey, SHOPIFY_DEDUCTION_CONFLICT, JSON.stringify({ auto: "kiotviet_reflects_shopify_deduction", expected })],
+      );
     await log("info", "inventory_set_completed", { ...context, before, after, action: "inventory_set_completed" });
+    return { status: "synced" as const };
   } catch (error) {
     await log("error", "Shopify inventory sync failed", { ...context, before, after, action: "inventory_sync_failed", error: error instanceof Error ? error.message : String(error) });
     throw error;

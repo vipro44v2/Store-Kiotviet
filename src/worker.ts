@@ -36,7 +36,8 @@ const workers = QUEUE_NAMES.map(
         await jobsRepository.start(auditId, job.attemptsMade + 1);
         try {
           const result = await processSyncJob(job);
-          await jobsRepository.complete(auditId);
+          if (result?.skipped) await jobsRepository.skip(auditId, result.reason);
+          else await jobsRepository.complete(auditId);
           return result;
         } catch (error) {
           const e = error instanceof Error ? error : new Error(String(error)),

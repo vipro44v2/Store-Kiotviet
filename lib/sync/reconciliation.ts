@@ -1,11 +1,11 @@
 ﻿import { getKiotVietInventory } from "@/lib/kiotviet/inventory";
-import { syncInventoryNotification } from "./inventory-sync";
+import { syncInventoryNotification, type InventorySyncOptions } from "./inventory-sync";
 import { enqueueJob } from "@/lib/queue/queues";
 import { query } from "@/lib/db/client";
 import { ConflictError, MappingError, PermanentError, RetryableError, ValidationError } from "@/lib/errors";
 import { randomUUID } from "node:crypto";
 
-export async function reconcileInventoryPage(currentItem = 0, jobId?: string, reconciliationChainId: string = randomUUID()) {
+export async function reconcileInventoryPage(currentItem = 0, jobId?: string, reconciliationChainId: string = randomUUID(), options: InventorySyncOptions = {}) {
   if (!Number.isSafeInteger(currentItem) || currentItem < 0)
     throw new ValidationError("Invalid inventory reconciliation offset");
   const page = await getKiotVietInventory(currentItem, 100);
@@ -22,7 +22,7 @@ export async function reconcileInventoryPage(currentItem = 0, jobId?: string, re
           ProductId: product.id, ProductCode: product.code, ProductName: product.code,
           BranchId: inventory.branchId, BranchName: String(inventory.branchId),
           Cost: 0, OnHand: inventory.onHand, Reserved: inventory.reserved,
-        }, jobId);
+        }, jobId, options);
       } catch (error) {
         if (!(error instanceof MappingError || error instanceof ConflictError || error instanceof PermanentError || error instanceof ValidationError))
           hasRetryableFailure = true;
@@ -37,6 +37,7 @@ export async function reconcileInventoryPage(currentItem = 0, jobId?: string, re
   }
   const next = currentItem + page.pageSize;
   if (next < page.total)
+    // The next page is gated again by the worker, so disabling inventory sync stops the chain.
     await enqueueJob("reconciliation", "inventory_reconciliation", { currentItem: next, reconciliationChainId }, "low", `inventory-reconciliation-${reconciliationChainId}-${next}`);
   // Keep processing other products/pages, but let the worker fail this audit job.
   if (errors.length) {
@@ -46,4 +47,4 @@ export async function reconcileInventoryPage(currentItem = 0, jobId?: string, re
   return { processed: page.data.length, next: next < page.total ? next : null, total: page.total };
 }
 
-export async function cleanupOldData(){await query("DELETE FROM webhook_events WHERE status='processed' AND received_at < now()-interval '30 days'");await query("DELETE FROM sync_jobs WHERE status='completed' AND completed_at < now()-interval '30 days'");await query("DELETE FROM sync_logs WHERE created_at < now()-interval '90 days'");await query("DELETE FROM audit_logs WHERE created_at < now()-interval '180 days'");}
+export async function cleanupOldData(){await query("DELETE FROM webhook_events WHERE status IN ('processed','ignored') AND received_at < now()-interval '30 days'");await query("DELETE FROM sync_jobs WHERE status IN ('completed','skipped') AND completed_at < now()-interval '30 days'");await query("DELETE FROM sync_logs WHERE created_at < now()-interval '90 days'");await query("DELETE FROM audit_logs WHERE created_at < now()-interval '180 days'");}

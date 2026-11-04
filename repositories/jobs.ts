@@ -35,6 +35,13 @@ export const jobsRepository = {
       [id],
     );
   },
+  /** A disabled sync direction is not a failure: the job finishes as skipped and is never retried. */
+  async skip(id: string, reason: string) {
+    await query(
+      "UPDATE sync_jobs SET status='skipped',error_code='SYNC_DISABLED',error=$2,completed_at=now(),updated_at=now() WHERE id=$1",
+      [id, reason],
+    );
+  },
   async fail(id: string, error: Error, manualReview: boolean) {
     await query(
       "UPDATE sync_jobs SET status=$2,error_code=$3,error=$4,completed_at=CASE WHEN $2='manual_review' THEN now() ELSE completed_at END,updated_at=now() WHERE id=$1",
