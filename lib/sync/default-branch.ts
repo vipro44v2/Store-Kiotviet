@@ -16,6 +16,14 @@ export interface OrderSettings {
   invoiceTriggerEnabledAt?: string;
   /** Currency that KiotViet prices are recorded in; must equal the Shopify order currency to invoice. */
   kiotVietCurrency?: string;
+  /**
+   * KiotViet "thu khác" (GET /surchages) that records Shopify shipping on the
+   * KiotViet order (documented POST /orders `surchages`). Shipping is never
+   * added to product prices. Invoicing orders with shipping additionally requires
+   * invoiceInheritsFromOrder=true, set after confirming in KiotViet that an
+   * invoice created from an order keeps the order's surcharge.
+   */
+  shippingSurcharge?: { id: number; code: string; invoiceInheritsFromOrder?: boolean };
   /** Shopify line items that are payment-processing fees, never KiotViet products. See lib/sync/order-line-items.ts. */
   processingFeeVariantIds?: Array<number | string>;
   processingFeeProductIds?: Array<number | string>;

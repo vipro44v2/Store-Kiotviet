@@ -762,3 +762,56 @@ it.each([null, "fulfilled"])("new fulfilled trigger always creates order only (f
   expect(mocks.createOrder).toHaveBeenCalledWith(expect.objectContaining({ makeInvoice: false }));
   expect(invoiceJob).toHaveBeenCalledWith("5001");
 });
+
+describe("Invoice Creation Trigger = Shopify Fulfilled", () => {
+  beforeEach(() => {
+    mocks.db.orders = {
+      autoCreate: true, paidOnly: true, syncCustomers: true, autoInvoice: false,
+      invoiceCreationTrigger: "shopify_fulfilled", invoiceTriggerEnabledAt: "2026-11-01T00:00:00Z", kiotVietCurrency: "VND",
+    };
+    invoiceJob.mockResolvedValue("waiting");
+  });
+
+  it("Shopify Paid creates the KiotViet order with makeInvoice false and only asks the trigger to evaluate", async () => {
+    await expect(syncShopifyOrder(order({ currency: "VND" }))).resolves.toEqual({ action: "created", kiotVietOrderId: "700" });
+    expect(mocks.createOrder).toHaveBeenCalledWith(expect.objectContaining({ makeInvoice: false }));
+    expect(mocks.db.invoices.size).toBe(0);
+    expect(invoiceJob).toHaveBeenCalledWith("5001");
+  });
+
+  it("ignores a legacy autoInvoice=true once a trigger is configured", async () => {
+    mocks.db.orders.autoInvoice = true;
+    await syncShopifyOrder(order({ currency: "VND" }));
+    expect(mocks.createOrder).toHaveBeenCalledWith(expect.objectContaining({ makeInvoice: false }));
+  });
+
+  it("asks the trigger again on orders/updated (e.g. after fulfillment) without creating another order", async () => {
+    await syncShopifyOrder(order({ currency: "VND" }));
+    await syncShopifyOrder(order({ currency: "VND", fulfillment_status: "fulfilled" }), { jobType: "shopify_order_update" });
+    expect(mocks.createOrder).toHaveBeenCalledOnce();
+    expect(invoiceJob).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not ask for an invoice when the order was skipped (unpaid)", async () => {
+    await syncShopifyOrder(order({ financial_status: "pending" }));
+    expect(invoiceJob).not.toHaveBeenCalled();
+  });
+});
+
+describe("Shopify shipping on new KiotViet orders", () => {
+  const shipped = () => order({ total_price: "330000", shipping_lines: [{ price: "35000", discounted_price: "30000" }] });
+
+  it("records charged shipping as the configured KiotViet surcharge, not in product prices", async () => {
+    mocks.db.orders = { ...mocks.db.orders, shippingSurcharge: { id: 3, code: "SHIP" } };
+    await syncShopifyOrder(shipped());
+    const input = mocks.createOrder.mock.calls[0][0];
+    expect(input.surchages).toEqual([{ id: 3, code: "SHIP", price: 30000 }]);
+    expect(input.orderDetails).toEqual([expect.objectContaining({ price: 150000, quantity: 2 })]);
+    expect(input.totalPayment).toBe(330000);
+  });
+
+  it("keeps the existing payload when no surcharge is configured", async () => {
+    await syncShopifyOrder(shipped());
+    expect(mocks.createOrder.mock.calls[0][0]).not.toHaveProperty("surchages");
+  });
+});

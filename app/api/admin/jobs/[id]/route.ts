@@ -57,7 +57,8 @@ export async function POST(
           if (state !== "failed" && state !== "completed")
             return Response.json({ success: false, error: "Invoice job is already queued or processing" }, { status: 409 });
         }
-        const claimed = await query("UPDATE sync_jobs SET queue_job_id=$2,status='pending',error=NULL,error_code=NULL,updated_at=now() WHERE id=$1 AND status NOT IN ('pending','processing') RETURNING id", [id, queueId]);
+        // At most one active invoice job per order (unique index invoice_job_active_order_idx).
+        const claimed = await query("UPDATE sync_jobs SET queue_job_id=$2,status='pending',error=NULL,error_code=NULL,updated_at=now() WHERE id=$1 AND status NOT IN ('pending','processing') AND NOT EXISTS (SELECT 1 FROM sync_jobs other WHERE other.type='shopify_invoice_create' AND other.id<>sync_jobs.id AND other.payload->>'entityId'=sync_jobs.payload->>'entityId' AND other.status IN ('pending','processing')) RETURNING id", [id, queueId]);
         if (!claimed.length) return Response.json({ success: false, error: "Invoice retry already requested" }, { status: 409 });
         try {
         if (existing) await existing.retry(state as "failed" | "completed");

@@ -3,6 +3,8 @@ import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
 import { query } from "@/lib/db/client";
 import { getAllKiotVietCategories } from "@/lib/kiotviet/products";
+import { listKiotVietSurcharges } from "@/lib/kiotviet/surcharges";
+import { ordersSettingsSchema } from "@/lib/settings/order-settings";
 import { SYNC_SETTINGS_KEY, synchronizationSettingsSchema } from "@/lib/settings/sync-settings";
 
 const allowed = new Set([
@@ -36,14 +38,17 @@ export async function PUT(
       value = { categoryIds };
     }
     if (key === SYNC_SETTINGS_KEY) value = synchronizationSettingsSchema.parse(value);
-    if (key === "orders")
-      value = z.object({
-        autoInvoice: z.boolean().optional(),
-        invoiceCreationTrigger: z.enum(["shopify_fulfilled", "shopify_paid", "disabled"]).optional(),
-        kiotVietCurrency: z.string().regex(/^[A-Z]{3}$/).optional(),
-      }).passthrough().refine((orders) => (orders.invoiceCreationTrigger === "disabled" || (!orders.invoiceCreationTrigger && orders.autoInvoice !== true)) || Boolean(orders.kiotVietCurrency), {
-        message: "orders.kiotVietCurrency is required when orders.autoInvoice is enabled",
-      }).parse(value);
+    if (key === "orders") {
+      const orders = ordersSettingsSchema.parse(value);
+      if (orders.shippingSurcharge) {
+        // Must be a real KiotViet "thu khác"; never an invented id/code.
+        const { id, code } = orders.shippingSurcharge;
+        const exists = (await listKiotVietSurcharges()).some((surcharge) => surcharge.id === id && surcharge.surchargeCode === code);
+        if (!exists)
+          return Response.json({ success: false, error: `KiotViet surcharge ${id} (${code}) was not found in GET /surchages` }, { status: 400 });
+      }
+      value = orders;
+    }
     if (key === "orders") {
       // Derive activation time in PostgreSQL, never trust a browser-supplied cutoff.
       delete value.invoiceTriggerEnabledAt;

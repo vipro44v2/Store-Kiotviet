@@ -52,6 +52,10 @@ export function SyncSettingsCard({
   const [invoiceCreationTrigger, setInvoiceCreationTrigger] = useState(String(orders?.invoiceCreationTrigger ?? "legacy"));
   const autoInvoice = invoiceCreationTrigger === "legacy" ? orders?.autoInvoice === true : invoiceCreationTrigger !== "disabled";
   const [kiotVietCurrency, setKiotVietCurrency] = useState(typeof orders?.kiotVietCurrency === "string" ? orders.kiotVietCurrency : "");
+  const storedSurcharge = (orders?.shippingSurcharge ?? {}) as { id?: number; code?: string; invoiceInheritsFromOrder?: boolean };
+  const [surchargeId, setSurchargeId] = useState(storedSurcharge.id ? String(storedSurcharge.id) : "");
+  const [surchargeCode, setSurchargeCode] = useState(storedSurcharge.code ?? "");
+  const [surchargeVerified, setSurchargeVerified] = useState(storedSurcharge.invoiceInheritsFromOrder === true);
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -78,6 +82,11 @@ export function SyncSettingsCard({
       if (invoiceCreationTrigger !== "legacy") nextOrders.invoiceCreationTrigger = invoiceCreationTrigger;
       if (currency) nextOrders.kiotVietCurrency = currency;
       else delete nextOrders.kiotVietCurrency;
+      if (surchargeId.trim() || surchargeCode.trim()) {
+        if (!/^d+$/.test(surchargeId.trim()) || !surchargeCode.trim())
+          throw new Error("Nhập cả ID và mã thu khác KiotViet cho phí vận chuyển, hoặc để trống cả hai");
+        nextOrders.shippingSurcharge = { id: Number(surchargeId.trim()), code: surchargeCode.trim(), invoiceInheritsFromOrder: surchargeVerified };
+      } else delete nextOrders.shippingSurcharge;
       if (JSON.stringify(nextOrders) !== JSON.stringify(orders ?? {})) await put("orders", nextOrders);
       setMessage("Đã lưu. Áp dụng cho cả các job đang chờ trong hàng đợi.");
       router.refresh();
@@ -139,6 +148,21 @@ export function SyncSettingsCard({
           <br />
           <small>Lưu tại orders.kiotVietCurrency. Phải trùng tiền tệ của đơn Shopify; hệ thống không quy đổi tiền tệ.</small>
         </label>
+        <fieldset style={{ marginBottom: 12 }}>
+          <legend><strong>Phí vận chuyển Shopify → thu khác KiotViet</strong></legend>
+          <label>ID thu khác <input value={surchargeId} inputMode="numeric" style={{ width: 100 }} onChange={(event) => setSurchargeId(event.target.value)} /></label>{" "}
+          <label>Mã thu khác <input value={surchargeCode} style={{ width: 120 }} onChange={(event) => setSurchargeCode(event.target.value)} /></label>
+          <br />
+          <label>
+            <input type="checkbox" checked={surchargeVerified} onChange={(event) => setSurchargeVerified(event.target.checked)} />{" "}
+            Đã kiểm tra trên KiotViet: hóa đơn tạo từ đơn đặt hàng giữ nguyên khoản thu khác này
+          </label>
+          <br />
+          <small>
+            Lưu tại orders.shippingSurcharge. Phí vận chuyển khách đã trả được ghi vào đơn KiotViet dưới dạng thu khác (không cộng vào giá sản phẩm).
+            Mã phải tồn tại trong KiotViet (GET /surchages). Đơn có phí vận chuyển chỉ được tạo hóa đơn sau khi đánh dấu đã kiểm tra.
+          </small>
+        </fieldset>
         <label style={{ display: "block" }}>
           <strong>Khi Shopify đã trừ tồn (đơn bán) nhưng KiotViet chưa phản ánh</strong>
           <br />

@@ -205,7 +205,23 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
     for (const productId of actual.keys())
       if (!expected.has(productId)) reasons.push(`extra_line: KiotViet order has product ${productId} that is not a Shopify physical line`);
     plan.expectedLines = [...expected].map(([productId, line]) => ({ productId, ...line }));
-    if (plan.expectedTotal !== undefined && cents(kiotVietOrder.total) !== cents(plan.expectedTotal))
+    // Shipping must already be on the KiotViet order as the configured surcharge;
+    // the invoice never invents it and product prices never absorb it.
+    const shippingCents = cents(plan.financials?.shippingTotal ?? 0);
+    const surchargeId = Number(settings.shippingSurcharge?.id);
+    let orderShippingCents = 0;
+    for (const surcharge of kiotVietOrder.invoiceOrderSurcharges ?? []) {
+      if (Number(surcharge?.surchargeId) === surchargeId) orderShippingCents += cents(surcharge?.price);
+      else reasons.push(`unexpected_surcharge: KiotViet order has surcharge ${surcharge?.surchargeId} (${surcharge?.surchargeName ?? ""}) that is not Shopify shipping`);
+    }
+    if (shippingCents > 0 && orderShippingCents === 0)
+      reasons.push(`shipping_not_on_kiotviet_order: Shopify charged ${shippingCents / 100} shipping but the KiotViet order has no shipping surcharge (orders created before orders.shippingSurcharge was configured); invoice it manually in KiotViet`);
+    else if (orderShippingCents !== shippingCents)
+      reasons.push(`shipping_mismatch: KiotViet order shipping surcharge ${orderShippingCents / 100} differs from Shopify shipping ${shippingCents / 100}`);
+    // KiotViet's order `total` may or may not include surcharges (undocumented); both are
+    // consistent once the surcharge itself was verified above.
+    if (plan.expectedTotal !== undefined &&
+        ![cents(plan.expectedTotal), cents(plan.expectedTotal) - orderShippingCents].includes(cents(kiotVietOrder.total)))
       reasons.push(`total_mismatch: KiotViet order total ${kiotVietOrder.total} differs from expected ${plan.expectedTotal}`);
     plan.stockNow = await readBranchStock([...expected.keys()], Number(kiotVietOrder.branchId));
     if (Object.values(plan.stockNow).some(value => value === null || !Number.isFinite(value))) reasons.push("branch_stock_unavailable: cannot establish stock before invoicing");
@@ -230,7 +246,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
   if (active.length > 1) return block(`duplicate_invoices: KiotViet order ${kiotVietOrder.code} has ${active.length} invoices (${active.map((invoice) => invoice.code).join(", ")})`);
   if (!lookup.complete && active.length === 1) reasons.push("invoice_lookup_incomplete: invoice uniqueness cannot be fully verified");
   if (active.length === 1) return { ...plan, action: { kind: "link", invoice: { id: active[0].id, code: active[0].code } } };
-  if (!lookup.complete) return block(...reasons, "invoice_lookup_incomplete: could not prove that no invoice exists for this KiotViet order");
+  if (!lookup.complete) return block(...reasons, `invoice_lookup_incomplete: could not prove that no invoice exists for this KiotViet order (${lookup.indexError ?? "index not current"}); build the index with scripts/build-kiotviet-invoice-index.ts`);
   if (lookup.invoices.length)
     return block(`cancelled_invoice_exists: ${lookup.invoices.map((invoice) => invoice.code).join(", ")}; review in KiotViet before invoicing again`);
   if (kiotVietOrder.status === 3) reasons.push("kiotviet_order_completed: the KiotViet order is completed but has no invoice");
@@ -270,7 +286,7 @@ function invoiceSearchStart(order: KiotVietOrderDetail) {
 }
 
 function reconciliationFor(plan: InvoiceRecoveryPlan): InvoiceReconciliation {
-  return { ...plan.invoiceRow?.reconciliation, branchId: Number(plan.kiotVietOrder?.branchId), expectedLines: plan.expectedLines, prepaid: plan.prepaid, validationReasons: plan.validationReasons };
+  return { ...plan.invoiceRow?.reconciliation, branchId: Number(plan.kiotVietOrder?.branchId), expectedLines: plan.expectedLines, prepaid: plan.prepaid, shippingTotal: plan.financials?.shippingTotal ?? 0, validationReasons: plan.validationReasons };
 }
 
 /**

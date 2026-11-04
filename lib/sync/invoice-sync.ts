@@ -177,7 +177,11 @@ export async function finalizeInvoice(
         cents(actual.price) === cents(line.price) && cents(actual.discount) === 0)),
     orderCode: detail.orderCode === kiotVietOrder.code,
     completed: Number(detail.status) === 1,
-    total: row.expected_total !== null && cents(detail.total) === expected,
+    // An order-linked invoice may report its total with or without the shipping surcharge;
+    // the surcharge itself must then match the expected shipping exactly.
+    total: row.expected_total !== null && (cents(detail.total) === expected ||
+      (cents(reconciliation.shippingTotal) > 0 && cents(detail.total) === expected - cents(reconciliation.shippingTotal) &&
+        (detail.invoiceOrderSurcharges ?? []).reduce((sum, surcharge) => sum + cents(surcharge?.price), 0) === cents(reconciliation.shippingTotal))),
     // KiotViet may report the invoice payment alone or including the order's prepayment.
     payment: row.expected_total !== null &&
       (cents(detail.totalPayment) === expected || cents(detail.totalPayment) + prepaid === expected),

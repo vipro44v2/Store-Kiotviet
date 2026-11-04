@@ -314,3 +314,84 @@ describe("existing order #1072 without invoice", () => {
     expect((await planInvoiceRecovery(ORDER_ID)).action).toMatchObject({ kind: "blocked", reasons: [expect.stringContaining("invoice_lookup_incomplete")] });
   });
 });
+
+describe("shipping via KiotViet surcharge and existing prepayments", () => {
+  const surcharge = { id: 3, code: "SHIP", invoiceInheritsFromOrder: true };
+  const withShipping = () => {
+    mocks.event = { id: "e", payload: order1072({ total_price: "103.33", shipping_lines: [{ price: "12.00", discounted_price: "10.00" }] }) };
+    mocks.live.mockResolvedValue({ cancelledAt: null, displayFinancialStatus: "PAID", currencyCode: "USD", totalPriceSet: { shopMoney: { amount: "103.33" } }, refunds: [] });
+  };
+  const blockedWith = async (code: string) => {
+    const plan = await planInvoiceRecovery(ORDER_ID);
+    expect(plan.action).toMatchObject({ kind: "blocked", reasons: expect.arrayContaining([expect.stringContaining(code)]) });
+    return plan;
+  };
+
+  it("blocks shipping when no KiotViet surcharge is configured (never added to product prices)", async () => {
+    withShipping();
+    await blockedWith("unsupported_shipping");
+  });
+
+  it("blocks shipping until the operator confirmed invoices keep the order surcharge", async () => {
+    withShipping();
+    mocks.orderSettings.shippingSurcharge = { id: 3, code: "SHIP" };
+    mocks.kiotVietOrder.mockResolvedValue(kiotVietOrder({ total: 100, totalPayment: 100, invoiceOrderSurcharges: [{ surchargeId: 3, price: 10 }] }));
+    await blockedWith("shipping_unverified");
+  });
+
+  it("invoices product lines plus the shipping surcharge without recording the prepayment twice", async () => {
+    withShipping();
+    mocks.orderSettings.shippingSurcharge = surcharge;
+    mocks.kiotVietOrder.mockResolvedValue(kiotVietOrder({ total: 100, totalPayment: 100, invoiceOrderSurcharges: [{ surchargeId: 3, price: 10 }] }));
+    mocks.invoiceDetail.mockResolvedValue({ id: 8001, code: "HD8001", orderCode: "DH1072", status: 1, branchId: 10, invoiceDetails: kiotVietOrder().orderDetails, total: 100, totalPayment: 0, invoiceOrderSurcharges: [{ surchargeId: 3, price: 10 }] });
+    const plan = await planInvoiceRecovery(ORDER_ID);
+    expect(plan.expectedTotal).toBe(100);
+    expect(plan.action).toMatchObject({ kind: "create_invoice", input: { totalPayment: 0 } });
+    // Product prices are untouched; shipping is not an invoice line.
+    expect((plan.action as { input: { invoiceDetails: Array<{ price: number }> } }).input.invoiceDetails.map((detail) => detail.price)).toEqual([20, 25, 30, 15]);
+    await applyInvoiceRecovery(plan);
+    expect(mocks.invoice).toMatchObject({ status: "created", reconciliation: expect.objectContaining({ shippingTotal: 10 }) });
+  });
+
+  it("accepts a KiotViet order total that excludes the verified surcharge", async () => {
+    withShipping();
+    mocks.orderSettings.shippingSurcharge = surcharge;
+    mocks.kiotVietOrder.mockResolvedValue(kiotVietOrder({ total: 90, totalPayment: 100, invoiceOrderSurcharges: [{ surchargeId: 3, price: 10 }] }));
+    expect((await planInvoiceRecovery(ORDER_ID)).action.kind).toBe("create_invoice");
+  });
+
+  it("blocks orders whose KiotViet order was created without the shipping surcharge", async () => {
+    withShipping();
+    mocks.orderSettings.shippingSurcharge = surcharge;
+    mocks.kiotVietOrder.mockResolvedValue(kiotVietOrder({ total: 90, totalPayment: 100 }));
+    await blockedWith("shipping_not_on_kiotviet_order");
+  });
+
+  it("blocks a surcharge amount or extra surcharge that does not match Shopify shipping", async () => {
+    withShipping();
+    mocks.orderSettings.shippingSurcharge = surcharge;
+    mocks.kiotVietOrder.mockResolvedValue(kiotVietOrder({ total: 102, totalPayment: 100, invoiceOrderSurcharges: [{ surchargeId: 3, price: 12 }] }));
+    await blockedWith("shipping_mismatch");
+    mocks.kiotVietOrder.mockResolvedValue(kiotVietOrder({ total: 100, invoiceOrderSurcharges: [{ surchargeId: 9, surchargeName: "Gift wrap", price: 10 }] }));
+    await blockedWith("unexpected_surcharge");
+  });
+
+  it.each([
+    [90, 0],
+    [40, 50],
+    [0, 90],
+  ])("records only the unpaid remainder when KiotViet already has %s prepaid", async (prepaid, payment) => {
+    mocks.kiotVietOrder.mockResolvedValue(kiotVietOrder({ totalPayment: prepaid }));
+    expect((await planInvoiceRecovery(ORDER_ID)).action).toMatchObject({ kind: "create_invoice", input: { totalPayment: payment } });
+  });
+
+  it("blocks when KiotViet payment rows disagree with totalPayment", async () => {
+    mocks.kiotVietOrder.mockResolvedValue(kiotVietOrder({ totalPayment: 90, payments: [{ amount: 50 }] }));
+    await blockedWith("payment_mismatch");
+  });
+
+  it("blocks when the KiotViet currency is not configured", async () => {
+    delete mocks.orderSettings.kiotVietCurrency;
+    await blockedWith("kiotviet_currency_not_configured");
+  });
+});

@@ -4,6 +4,7 @@ import { closeRedis } from "../lib/redis/client";
 if (getEnv().NODE_ENV === "production") assertProductionEnv();
 async function main(){
 await getQueue("reconciliation").upsertJobScheduler("fulfillment-invoices", { every: 60_000 }, { name: "fulfillment_invoice_reconciliation", data: {}, opts: { removeOnComplete: 100 } });
+await getQueue("reconciliation").upsertJobScheduler("kiotviet-invoice-index", { every: 60_000 }, { name: "kiotviet_invoice_index", data: {}, opts: { removeOnComplete: 100 } });
 await getQueue("reconciliation").removeJobScheduler("kiotviet-return-reconciliation");
 await getQueue("reconciliation").upsertJobScheduler(
   "inventory-reconciliation",

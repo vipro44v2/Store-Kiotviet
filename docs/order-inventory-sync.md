@@ -139,6 +139,48 @@ The dry run only reads.
 - `SELECT status,kiotviet_invoice_code,expected_total,reconciliation->'checks',reconciliation->'stockBefore',reconciliation->'stockAfter',reconciliation->'stockVerified' FROM invoice_mappings WHERE shopify_order_id='7108106289336';` (`stockVerified=false` can also mean another sale happened in between; check KiotViet stock history.)
 - Shopify: after the stock webhook, `SELECT * FROM inventory_snapshots WHERE sku IN ('377','711','1045','1030') ORDER BY created_at DESC LIMIT 8;` should show `shopify_quantity = expected_shopify_quantity`, with no second decrease.
 
+## Invoice on Shopify Fulfilled (`orders.invoiceCreationTrigger`)
+
+Recommended instead of the legacy `autoInvoice`. With `invoiceCreationTrigger = "shopify_fulfilled"`:
+- **Shopify Paid** creates the KiotViet order with `makeInvoice: false`, as before. `autoInvoice` stays `false` and is ignored once a trigger is set.
+- **Shopify Fulfilled** comes from the `fulfillments/create`/`update` and `orders/updated` webhooks, plus a rescan every minute that catches missed webhooks. It admits one `shopify_invoice_create` job for the existing KiotViet order. The job runs the same validation as `scripts/recover-kiotviet-invoice.ts`, then sends `POST /invoices` with `orderId`. It never creates a second KiotViet order.
+- Only orders created after `invoiceTriggerEnabledAt` are considered. The server sets that time when the trigger changes, and historical orders are never backfilled. #1072 is recovered only with the manual script.
+
+**Lifecycle (migration 009).**
+- Partial fulfillment records `invoice_mappings.status = 'blocked'` (`partial_fulfillment`) and creates no job. The order stays in the rescan, so the later full fulfillment admits the job.
+- Only one invoice job per order can be active (`pending`/`processing`).
+- A job that ended in manual review is not repeated for the same Shopify order version and settings version. A new fulfillment, payment or refund, or a settings fix such as configuring the currency, admits a new one.
+- Jobs that exhausted their retries are re-admitted by the rescan after 30 minutes.
+- `needs_review` is used only when a request may have been sent. Validation failures are `blocked`, and migration 009 converts the old validation-only `needs_review` rows.
+
+**Invoice lookup (migration 009).** Before any invoice is sent, the app must prove that the KiotViet order has none. The local index `kiotviet_invoice_index` holds every invoice: one resumable pass over `GET /invoices?orderBy=id&orderDirection=Asc`, then appends.
+- About 134 requests for 13,215 invoices once. After that, about one request per lookup and one per minute from the scheduler.
+- It refuses to answer, rather than guess, when:
+  - ids are not strictly increasing (`orderBy=id` not honored);
+  - an already indexed invoice disappears (the index is rebuilt);
+  - the total shrinks;
+  - the index was not confirmed current after the lookup started.
+- Build or check it with `npx tsx --env-file=.env.production scripts/build-kiotviet-invoice-index.ts [--status]`.
+
+**Shipping.** Shopify shipping is recorded on the KiotViet order as a KiotViet "thu khác", using the documented `surchages` field of `POST /orders`. It is never added to product prices.
+- Set `orders.shippingSurcharge = {id, code}` on the settings page. The id and code are checked against `GET /surchages`.
+- The KiotViet docs do not say whether an invoice created from an order keeps the order's surcharge. Until an operator has confirmed this in KiotViet and ticked "Đã kiểm tra…" (`invoiceInheritsFromOrder: true`), orders with shipping are blocked (`shipping_unverified`).
+- Orders created before the surcharge was configured have no shipping on the KiotViet order. They are blocked (`shipping_not_on_kiotviet_order`) and must be invoiced manually in KiotViet.
+
+**Prepayments.**
+- The invoice records only `expected total − amount already paid on the KiotViet order`. A fully prepaid order gets 0, so nothing is charged or recorded twice.
+- A larger prepayment, or payment rows that disagree with `totalPayment`, blocks the invoice.
+
+### Enabling it
+1. Deploy, run migrations 008 and 009, and restart the worker and scheduler.
+2. Admin → Settings → "Chiều đồng bộ":
+   - Invoice Creation Trigger = "Shopify Fulfilled";
+   - "Tiền tệ của giá trên KiotViet" = the real currency of KiotViet prices;
+   - optionally the shipping surcharge ID and code.
+   Then click "Lưu cài đặt".
+3. Build the invoice index until it reports "current": `scripts/build-kiotviet-invoice-index.ts`.
+4. Fulfill one new test order in Shopify, then check `SELECT status,kiotviet_invoice_code,last_error FROM invoice_mappings ORDER BY updated_at DESC LIMIT 5;`.
+
 ## Production deployment
 
 Run on the server. Commands assume the PM2 layout in `ecosystem.config.js` and an env file containing `DATABASE_URL` (adjust `--env-file` to yours).

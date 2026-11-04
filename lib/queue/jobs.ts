@@ -1,6 +1,7 @@
 export const JOB_TYPES = [
   "shopify_invoice_create",
   "fulfillment_invoice_reconciliation",
+  "kiotviet_invoice_index",
   "shopify_order_create",
   "shopify_order_update",
   "shopify_order_cancel",

@@ -35,6 +35,7 @@ import {
 import { ensureProductMapping } from "./ensure-product-mapping";
 import { log } from "@/lib/logger";
 import {
+  shippingChargedCents,
   computeOrderAmounts,
   partitionOrderLines,
   type ExcludedFeeLine,
@@ -276,6 +277,18 @@ async function resolveOrderCustomerId(
 }
 
 /** KiotViet answered and refused the request, so nothing was created. */
+/**
+ * Records Shopify shipping on the KiotViet order as the configured "thu khác"
+ * (documented POST /orders `surchages`), so order total = products + shipping.
+ * Without a configured surcharge the payload is unchanged.
+ */
+export function shippingSurcharges(order: ShopifyOrderWebhook, settings: OrderSettings): Pick<KiotVietOrderInput, "surchages"> {
+  const cents = shippingChargedCents(order);
+  const surcharge = settings.shippingSurcharge;
+  if (cents <= 0 || !surcharge?.id || !surcharge.code) return {};
+  return { surchages: [{ id: Number(surcharge.id), code: surcharge.code, price: cents / 100 }] };
+}
+
 export function isDefiniteRejection(error: unknown) {
   return (
     error instanceof ApiError ||
@@ -559,6 +572,7 @@ async function createMappedOrder(
         branchId,
         expectedLines: orderDetails.map((detail) => ({ productId: detail.productId, sku: detail.productCode, quantity: detail.quantity, price: detail.price })),
         stockBefore: await readBranchStock(orderDetails.map((detail) => detail.productId), branchId),
+        shippingTotal: (shippingSurcharges(order, settings).surchages ?? []).reduce((sum, surcharge) => sum + surcharge.price, 0),
       };
     }
     input = {
@@ -574,6 +588,7 @@ async function createMappedOrder(
       // Documented: creates the invoice and its receipt from this order (deducts stock).
       makeInvoice: false,
       orderDetails,
+      ...shippingSurcharges(order, settings),
     };
   } catch (error) {
     // Nothing was sent to KiotViet yet, so the order can be claimed again.

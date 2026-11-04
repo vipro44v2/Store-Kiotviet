@@ -97,6 +97,14 @@ export function lineChargedCents(line: ShopifyOrderLineItem, taxesIncluded: bool
   return gross - discounts + (taxesIncluded ? 0 : taxCents(line.tax_lines, field));
 }
 
+/** Shipping the customer was charged (after shipping discounts), excluding shipping tax. */
+export function shippingChargedCents(order: ShopifyOrderWebhook) {
+  return (order.shipping_lines ?? []).reduce(
+    (sum, shipping) => sum + toCents(shipping?.discounted_price ?? shipping?.price, "shipping_lines"),
+    0,
+  );
+}
+
 export function partitionOrderLines(
   order: ShopifyOrderWebhook,
   settings: OrderSettings = {},

@@ -1,6 +1,6 @@
 import type { ShopifyOrderWebhook } from "@/types/shopify";
 import type { OrderSettings } from "./default-branch";
-import { toCents } from "./order-line-items";
+import { shippingChargedCents, toCents } from "./order-line-items";
 import type { PreparedOrder } from "./order-sync";
 
 export interface InvoiceFinancials {
@@ -10,6 +10,8 @@ export interface InvoiceFinancials {
   currency: string | null;
   /** Σ unit price × quantity of the physical (non-fee) lines sent to KiotViet. */
   merchandiseTotal: number;
+  /** Shipping the customer paid, recorded as the configured KiotViet surcharge. */
+  shippingTotal: number;
   /** Amount the KiotViet invoice must record as paid. */
   expectedPayment: number;
   refundedTotal: number;
@@ -55,9 +57,17 @@ export function evaluateInvoiceFinancials(
     const tax = (line.tax_lines ?? []).reduce((sum, taxLine) => sum + toCents(taxLine?.price, "tax"), 0);
     if (!taxesIncluded && tax > 0) reasons.push(`unsupported_tax: line item ${line.id} has ${money(tax)} tax added on top of its price`);
   }
+  // Shipping is recorded only as the configured KiotViet surcharge ("thu khác"),
+  // never folded into product prices.
+  const shippingCents = shippingChargedCents(order);
+  const surcharge = settings.shippingSurcharge;
+  if (shippingCents > 0) {
+    if (!surcharge?.id || !surcharge.code)
+      reasons.push(`unsupported_shipping: shipping of ${money(shippingCents)} needs orders.shippingSurcharge (a KiotViet "thu khác") to be recorded`);
+    else if (surcharge.invoiceInheritsFromOrder !== true)
+      reasons.push(`shipping_unverified: confirm in KiotViet that an invoice created from an order keeps its surcharge, then set orders.shippingSurcharge.invoiceInheritsFromOrder`);
+  }
   for (const shipping of order.shipping_lines ?? []) {
-    const charged = toCents(shipping?.discounted_price ?? shipping?.price, "shipping");
-    if (charged > 0) reasons.push(`unsupported_shipping: shipping of ${money(charged)} has no KiotViet invoice line`);
     const tax = (shipping?.tax_lines ?? []).reduce((sum, taxLine) => sum + toCents(taxLine?.price, "tax"), 0);
     if (!taxesIncluded && tax > 0) reasons.push(`unsupported_tax: shipping has ${money(tax)} tax`);
   }
@@ -65,8 +75,8 @@ export function evaluateInvoiceFinancials(
   if (tip > 0) reasons.push(`unsupported_tip: tip of ${money(tip)}`);
 
   const adjustedCents = Math.round(prepared.amounts.adjustedTotal * 100);
-  if (adjustedCents !== merchandiseCents)
-    reasons.push(`amount_mismatch: Shopify total ${prepared.amounts.shopifyTotal.toFixed(2)} − fees ${money(feeCents)} = ${money(adjustedCents)} but KiotViet lines total ${money(merchandiseCents)}`);
+  if (adjustedCents !== merchandiseCents + shippingCents)
+    reasons.push(`amount_mismatch: Shopify total ${prepared.amounts.shopifyTotal.toFixed(2)} − fees ${money(feeCents)} = ${money(adjustedCents)} but KiotViet lines ${money(merchandiseCents)} + shipping ${money(shippingCents)} = ${money(merchandiseCents + shippingCents)}`);
 
   // Refunds: only a refund of the processing fee itself keeps the invoice exact.
   let refundedCents = 0;
@@ -93,7 +103,8 @@ export function evaluateInvoiceFinancials(
     reasons,
     currency,
     merchandiseTotal: merchandiseCents / 100,
-    expectedPayment: merchandiseCents / 100,
+    shippingTotal: shippingCents / 100,
+    expectedPayment: (merchandiseCents + shippingCents) / 100,
     refundedTotal: refundedCents / 100,
   };
 }

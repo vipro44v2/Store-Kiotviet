@@ -328,6 +328,15 @@ export async function processSyncJob(
     case "fulfillment_invoice_reconciliation":
       await reconcileFulfillmentInvoices();
       break;
+    case "kiotviet_invoice_index": {
+      // Read-only copy of KiotViet invoices; only kept current while invoicing is configured.
+      const orders = (await query<{ value: Record<string, unknown> }>("SELECT value FROM system_settings WHERE key='orders'"))[0]?.value ?? {};
+      const invoicing = orders.autoInvoice === true || ["shopify_fulfilled", "shopify_paid"].includes(String(orders.invoiceCreationTrigger));
+      if (!invoicing) break;
+      const { advanceInvoiceIndex } = await import("@/lib/kiotviet/invoice-index");
+      await advanceInvoiceIndex({ maxPages: 30, deadlineMs: 50_000 });
+      break;
+    }
     case "shopify_refund":
     case "shopify_product_to_kiotviet":
       throw new PermanentError(

@@ -9,6 +9,8 @@ export interface KiotVietOrderInput {
   totalPayment: number;
   makeInvoice: boolean;
   customer?: { id: number };
+  /** Documented POST /orders field (sic). Used only for Shopify shipping. */
+  surchages?: Array<{ id: number; code: string; price: number }>;
   orderDetails: Array<{
     productId: number;
     productCode: string;
@@ -88,6 +90,7 @@ export interface KiotVietOrderDetail {
   createdDate?: string;
   orderDetails?: Array<{ productId: number; productCode?: string; productName?: string; quantity: number; price: number; discount?: number | null }>;
   payments?: Array<{ amount?: number | null }> | null;
+  invoiceOrderSurcharges?: Array<{ surchargeId?: number | null; surchargeName?: string | null; surValue?: number | null; price?: number | null }> | null;
 }
 export function getKiotVietOrder(id: number) {
   return kiotVietClient.get<KiotVietOrderDetail>(`/orders/${id}`);

@@ -10,7 +10,7 @@ vi.mock("@/lib/env", () => ({ getEnv: () => ({ KIOTVIET_RETAILER: "shop" }) }));
 
 import { createKiotVietOrder } from "@/lib/kiotviet/orders";
 import { kiotVietClient } from "@/lib/kiotviet/client";
-import { createKiotVietInvoice, findKiotVietInvoicesForOrder } from "@/lib/kiotviet/invoices";
+import { createKiotVietInvoice } from "@/lib/kiotviet/invoices";
 import { ApiError, RetryableError, UncertainResultError } from "@/lib/errors";
 
 const input = {
@@ -97,24 +97,7 @@ describe("KiotViet invoice API", () => {
     expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).toMatchObject({ orderId: 5555, branchId: 10 });
   });
 
-  it("matches invoices by orderCode and confirms absence only after a full scan", async () => {
-    fetchMock
-      .mockResolvedValueOnce(json(200, { total: 1, pageSize: 100, data: [{ id: 1, code: "HD1", orderCode: "OTHER", status: 1 }] }))
-      .mockResolvedValueOnce(json(200, { total: 2, pageSize: 100, data: [
-        { id: 2, code: "HD2", orderCode: "DH1072", status: 1 }, { id: 3, code: "HD3", orderCode: "DH9", status: 1 },
-      ] }));
-    await expect(findKiotVietInvoicesForOrder({ id: 5555, code: "DH1072" }, new Date("2026-10-29T00:00:00Z")))
-      .resolves.toEqual({ invoices: [{ id: 2, code: "HD2", orderCode: "DH1072", status: 1 }], complete: true });
-    expect(String(fetchMock.mock.calls[0][0])).toContain("orderId=5555");
-    expect(String(fetchMock.mock.calls[1][0])).not.toContain("fromPurchaseDate");
-  });
-
-  it("reports an incomplete lookup when the scan cannot finish", async () => {
-    fetchMock
-      .mockResolvedValueOnce(json(200, { total: 0, pageSize: 100, data: [] }))
-      .mockResolvedValueOnce(json(200, { total: 500, pageSize: 100, data: [] }));
-    await expect(findKiotVietInvoicesForOrder({ id: 5555, code: "DH1072" }, new Date())).resolves.toMatchObject({ complete: false });
-  });
+  // Invoice lookup completeness is covered by tests/unit/invoice-lookup.test.ts (invoice index).
 });
 
 describe("007 invoice migration", () => {
@@ -128,5 +111,17 @@ describe("007 invoice migration", () => {
   it("defaults Auto Invoice to off without overwriting a stored value", () => {
     expect(sql).toContain("jsonb_build_object('autoInvoice', false) || value");
     expect(sql).toContain("NOT (value ? 'autoInvoice')");
+  });
+});
+
+describe("009 invoice lifecycle and index migration", () => {
+  const sql = readFileSync(path.join(process.cwd(), "database/migrations/009_invoice_lifecycle_and_index.sql"), "utf8");
+  it("allows one ACTIVE invoice job per order instead of one job forever", () => {
+    expect(sql).toContain("DROP INDEX IF EXISTS invoice_job_order_idx");
+    expect(sql).toMatch(/CREATE UNIQUE INDEX IF NOT EXISTS invoice_job_active_order_idx[\s\S]*status IN \('pending','processing'\)/);
+  });
+  it("only downgrades validation-only needs_review rows that never sent a request", () => {
+    expect(sql).toMatch(/failure_stage='automatic_validation'[\s\S]*kiotviet_invoice_id IS NULL AND claimed_at IS NULL AND claim_token IS NULL/);
+    expect(sql).not.toMatch(/DELETE FROM|DROP TABLE|TRUNCATE/i);
   });
 });
