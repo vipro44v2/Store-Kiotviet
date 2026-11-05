@@ -30,3 +30,26 @@ it("loads refund transactions and affected lines separately", async () => {
   expect(await getInvoiceOrder("1")).toMatchObject({ refunds: [{ id: 5,
     refund_line_items: [{ line_item_id: 6, quantity: 1 }], transactions: [{ kind: "refund", status: "success", amount: "3.33" }] }] });
 });
+it("maps restock type, refunded subtotal and current quantity, and reads fulfilled units only for product refunds", async () => {
+  const base = order();
+  base.lineItems.nodes[0] = { ...base.lineItems.nodes[0], quantity: 3, currentQuantity: 2 } as typeof base.lineItems.nodes[0];
+  graphql.mockResolvedValueOnce({ order: { ...base, refunds: [{ id: "gid://shopify/Refund/5" }],
+    fulfillments: [{ id: "gid://shopify/Fulfillment/7", status: "SUCCESS" }, { id: "gid://shopify/Fulfillment/8", status: "CANCELLED" }] } });
+  graphql.mockResolvedValueOnce({ refund: { id: "gid://shopify/Refund/5",
+    refundLineItems: connection([{ quantity: 1, restockType: "CANCEL", lineItem: { id: "gid://shopify/LineItem/2" }, subtotalSet: money("80") }]),
+    transactions: connection([{ kind: "REFUND", status: "SUCCESS", amountSet: money("80") }]) } });
+  graphql.mockResolvedValueOnce({ fulfillment: { fulfillmentLineItems: connection([{ quantity: 2, lineItem: { id: "gid://shopify/LineItem/2" } }]) } });
+  const snapshot = await getInvoiceOrder("1");
+  expect(snapshot).toMatchObject({
+    line_items: [{ id: 2, quantity: 3, current_quantity: 2 }],
+    refunds: [{ refund_line_items: [{ line_item_id: 2, quantity: 1, restock_type: "cancel", subtotal: "80" }] }],
+    fulfillments: [{ id: 7, status: "success", line_items: [{ id: 2, quantity: 2 }] }, { id: 8, status: "cancelled", line_items: [] }],
+  });
+  expect(graphql).toHaveBeenCalledTimes(3); // the cancelled fulfillment is not read
+});
+it("makes no fulfillment request when no refund names line items", async () => {
+  graphql.mockResolvedValueOnce({ order: { ...order(), fulfillments: [{ id: "gid://shopify/Fulfillment/7", status: "SUCCESS" }] } });
+  const snapshot = await getInvoiceOrder("1");
+  expect(snapshot.fulfillments).toBeUndefined();
+  expect(graphql).toHaveBeenCalledOnce();
+});

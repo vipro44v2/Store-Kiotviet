@@ -42,7 +42,14 @@ import {
   type ExcludedFeeLine,
   type OrderAmounts,
 } from "./order-line-items";
-import { discountedUnitPriceCents, lineDiscountCents, productOnlyPolicy } from "./product-only-invoicing";
+import {
+  computeRefundAdjustments,
+  discountedUnitPriceCents,
+  lineAdjustmentAudit,
+  lineDiscountCents,
+  productOnlyPolicy,
+  type RefundAdjustments,
+} from "./product-only-invoicing";
 import {
   attachKiotVietOrderToInvoice,
   blockAutoInvoice,
@@ -132,10 +139,15 @@ function orderLabel(order: ShopifyOrderWebhook) {
 }
 
 export interface PreparedOrder {
+  /** Lines sent to KiotViet. Product-Only: effective quantities, fully cancelled lines left out. */
   lines: ValidatedOrderLine[];
   /** Processing-fee lines left out of the KiotViet order and its payment. */
   fees: ExcludedFeeLine[];
   amounts: OrderAmounts;
+  /** Product-Only: every purchased product line as ordered (original quantities). */
+  originalLines?: ShopifyOrderLineItem[];
+  /** Product-Only: refunded-quantity adjustments (lib/sync/product-only-invoicing.ts). */
+  adjustments?: RefundAdjustments;
 }
 
 /**
@@ -153,7 +165,13 @@ export function prepareOrderForKiotViet(
       shopifyOrderId,
     });
   const { purchased, fees } = partitionOrderLines(order, settings);
-  const lines = purchased.map(({ line, index }) => {
+  // Product-Only: units of confirmed cancelled refunds are not merchandise. Ambiguous
+  // refunds keep the original quantity here; their reasons block invoicing later.
+  const adjustments = productOnlyPolicy(settings).enabled
+    ? computeRefundAdjustments(order, purchased.map(({ line }) => line))
+    : undefined;
+  const remaining = (line: ShopifyOrderLineItem) => adjustments?.lines.get(String(line.id))?.remainingQuantity ?? Number(line.quantity);
+  const lines = purchased.filter(({ line }) => !adjustments || remaining(line) > 0).map(({ line, index }) => {
     const lineName = line?.name ?? line?.title ?? null;
     const lineLabel = `line item ${line?.id ?? `#${index + 1}`}${lineName ? ` "${lineName}"` : ""}`;
     const details = {
@@ -180,12 +198,15 @@ export function prepareOrderForKiotViet(
         `${orderLabel(order)} ${lineLabel} has an invalid price`,
         { ...details, sku },
       );
-    return { line, sku, quantity, price };
+    return { line, sku, quantity: adjustments ? remaining(line) : quantity, price };
   });
+  const originalLines = purchased.map(({ line }) => line);
   return {
     lines,
     fees,
-    amounts: computeOrderAmounts(order, lines.map(({ line }) => line), fees),
+    // Shopify's totals cover the order as placed, so amounts use the original lines.
+    amounts: computeOrderAmounts(order, adjustments ? originalLines : lines.map(({ line }) => line), fees),
+    ...(adjustments ? { originalLines, adjustments } : {}),
   };
 }
 
@@ -208,6 +229,8 @@ function feeLogContext(prepared: PreparedOrder) {
       reason: fee.reason,
       amount: fee.chargedCents / 100,
     })),
+    // Audit: original, excluded and remaining quantity with the reason, per refunded line.
+    lineAdjustments: lineAdjustmentAudit(prepared.adjustments),
   };
 }
 
@@ -219,15 +242,32 @@ function feeLogContext(prepared: PreparedOrder) {
  */
 function productOnlyLines(lines: ValidatedOrderLine[]): ValidatedOrderLine[] {
   return lines.map((line) => {
-    const unit = discountedUnitPriceCents(line.line, line.quantity);
+    // The per-unit discount comes from the ORIGINAL quantity, so cancelled units take
+    // their own share and nothing is shifted onto the remaining units.
+    const unit = discountedUnitPriceCents(line.line, Number(line.line.quantity));
     return unit === null ? line : { ...line, price: unit / 100 };
   });
 }
 
-/** Σ (price × quantity − discounts) of the product lines, in cents. */
+/**
+ * Shopify says the customer paid. Product-Only also accepts partially_refunded: the order is
+ * still paid, and refunded units are handled by the refund adjustments, never by this status.
+ */
+function isPaid(order: ShopifyOrderWebhook, settings: OrderSettings) {
+  return order.financial_status === "paid" ||
+    (productOnlyPolicy(settings).enabled && order.financial_status === "partially_refunded");
+}
+
+/** Merchandise paid for the remaining (effective) units of the product lines, in cents. */
 function merchandisePaidCents(lines: ValidatedOrderLine[]) {
-  return lines.reduce((sum, { line, quantity }) =>
-    sum + Math.round(Number(line.price) * 100) * quantity - lineDiscountCents(line), 0);
+  return lines.reduce((sum, { line, quantity }) => {
+    const original = Number(line.quantity);
+    const unit = discountedUnitPriceCents(line, original);
+    if (unit !== null) return sum + unit * quantity;
+    // Discount not divisible per unit (the invoice is blocked anyway): prorate the line.
+    const net = Math.round(Number(line.price) * 100) * original - lineDiscountCents(line);
+    return sum + Math.round((net * quantity) / original);
+  }, 0);
 }
 
 async function buildOrderDetails(
@@ -443,7 +483,7 @@ async function runShopifyOrderSync(
       return { kind: "busy" } as const;
     if (settings.autoCreate === false)
       return { kind: "skip", reason: "auto_create_disabled" } as const;
-    if (settings.paidOnly !== false && order.financial_status !== "paid")
+    if (settings.paidOnly !== false && !isPaid(order, settings))
       return { kind: "skip", reason: "awaiting_payment" } as const;
     if (order.cancelled_at)
       return { kind: "skip", reason: "shopify_order_cancelled" } as const;
@@ -453,9 +493,10 @@ async function runShopifyOrderSync(
     } catch (error) {
       return { kind: "invalid", error } as const;
     }
-    // Never create an empty KiotViet order when only processing fees remain.
+    // Never create an empty KiotViet order when only processing fees remain, or when every
+    // product unit was cancelled by a confirmed refund (Product-Only).
     if (!prepared.lines.length)
-      return { kind: "skip", reason: "fee_only_order", prepared } as const;
+      return { kind: "skip", reason: prepared.originalLines?.length ? "all_items_cancelled" : "fee_only_order", prepared } as const;
     const token = randomUUID();
     if (mapping)
       await client.query(
@@ -620,7 +661,7 @@ async function createMappedOrder(
       // Product-Only records only the merchandise payment: shipping, tips and
       // other charges stay in Shopify and are never put on the KiotViet order.
       totalPayment:
-        order.financial_status !== "paid" ? 0
+        !isPaid(order, settings) ? 0
           : productOnly ? merchandisePaidCents(prepared.lines) / 100
           : prepared.amounts.adjustedTotal,
       // Documented: creates the invoice and its receipt from this order (deducts stock).
@@ -638,8 +679,9 @@ async function createMappedOrder(
     throw error;
   }
 
-  if (prepared.fees.length || !prepared.amounts.consistent)
-    await log(prepared.amounts.consistent ? "info" : "warn", "Shopify order amounts adjusted for KiotViet", {
+  const refundAdjusted = lineAdjustmentAudit(prepared.adjustments).length > 0;
+  if (prepared.fees.length || !prepared.amounts.consistent || refundAdjusted)
+    await log(prepared.amounts.consistent && !prepared.adjustments?.ambiguous.length ? "info" : "warn", "Shopify order amounts adjusted for KiotViet", {
       action: prepared.amounts.consistent ? "order_fees_excluded" : "order_amount_mismatch",
       provider: "kiotviet",
       entityType: "order",

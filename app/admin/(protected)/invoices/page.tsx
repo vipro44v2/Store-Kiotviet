@@ -8,13 +8,14 @@ import { INVOICE_DISPLAY_STATUS, invoicesRepository } from "@/repositories/invoi
 
 export default async function InvoicesPage() {
   await connection();
-  let rows: Record<string, unknown>[] = [], stats: InvoiceAutomationStats | null = null;
+  let rows: Record<string, unknown>[] = [], adjustments: Record<string, unknown>[] = [], stats: InvoiceAutomationStats | null = null;
   let index: InvoiceIndexHealth | null = null, orders: Record<string, unknown> | undefined, error = "";
   try {
     let settings: Array<{ value: Record<string, unknown> }>;
-    [rows, stats, index, settings] = await Promise.all([
+    [rows, stats, index, settings, adjustments] = await Promise.all([
       invoicesRepository.recent(), invoicesRepository.automationStats(), getInvoiceIndexHealth(),
       query<{ value: Record<string, unknown> }>("SELECT value FROM system_settings WHERE key='orders'"),
+      invoicesRepository.lineAdjustments(),
     ]);
     orders = settings[0]?.value;
   } catch (e) {
@@ -43,6 +44,21 @@ export default async function InvoicesPage() {
         </div>
       )}
       {!error && <DataTable rows={rows.map((row) => ({ ...row, status: INVOICE_DISPLAY_STATUS[String(row.status)] ?? row.status }))} />}
+      {!error && adjustments.length > 0 && (
+        <>
+          <header className="admin-header">
+            <div>
+              <p className="eyebrow">Product-Only</p>
+              <h2>Điều chỉnh số lượng do hoàn tiền</h2>
+              <small>
+                Chỉ các đơn vị được hoàn tiền và xác nhận đã hủy (chưa giao) mới bị loại khỏi đơn/hóa đơn KiotViet. requires_verification: hoàn tiền
+                không chứng minh được là hàng chưa giao (trả hàng, đã giao, thiếu dữ liệu) — hóa đơn bị chặn để kiểm tra. Đơn KiotViet đã tạo không bao giờ bị sửa tự động.
+              </small>
+            </div>
+          </header>
+          <DataTable rows={adjustments.map((row) => ({ ...row, status: INVOICE_DISPLAY_STATUS[String(row.status)] ?? row.status }))} />
+        </>
+      )}
       <div className="settings-grid">
         <InvoiceOverride />
       </div>

@@ -67,16 +67,42 @@ export interface ShopifyOrderLineItem {
   total_discount?: string | null;
   discount_allocations?: Array<{ amount?: string | null }> | null;
   tax_lines?: ShopifyTaxLine[] | null;
+  /**
+   * `quantity` is always the ORIGINAL ordered quantity (refunded/removed units included).
+   * `current_quantity` already excludes refunded and removed units; it is only used as a
+   * cross-check, never as a base, so a cancellation is never subtracted twice.
+   */
+  current_quantity?: number | null;
+  fulfillable_quantity?: number | null;
 }
 export interface ShopifyShippingLine {
   price?: string | null;
   discounted_price?: string | null;
   tax_lines?: ShopifyTaxLine[] | null;
 }
+export interface ShopifyRefundLineItem {
+  id?: number | null;
+  line_item_id: number;
+  quantity: number;
+  /**
+   * cancel: unfulfilled units removed from the order; no_restock: refunded without
+   * restocking (fulfilled or not); return: fulfilled units returned; legacy_restock: old API.
+   */
+  restock_type?: "cancel" | "no_restock" | "return" | "legacy_restock" | string | null;
+  /** Refunded amount for these units after discounts, before tax (Shopify's own allocation). */
+  subtotal?: string | null;
+}
 export interface ShopifyRefund {
   id: number;
-  refund_line_items?: Array<{ line_item_id: number; quantity: number }> | null;
+  refund_line_items?: ShopifyRefundLineItem[] | null;
   transactions?: Array<{ kind?: string | null; status?: string | null; amount?: string | null }> | null;
+}
+export interface ShopifyFulfillment {
+  id?: number | null;
+  /** success | cancelled | error | failure | open | pending; only success counts as shipped. */
+  status?: string | null;
+  /** Fulfilled units per line item (REST: line item objects with their fulfilled quantity). */
+  line_items?: Array<{ id: number; quantity: number }> | null;
 }
 export interface ShopifyOrderWebhook {
   id: number;
@@ -90,6 +116,8 @@ export interface ShopifyOrderWebhook {
   /** Shop currency of all amounts in this payload. */
   currency?: string | null;
   refunds?: ShopifyRefund[] | null;
+  /** Present in order webhooks; the invoice snapshot fills it only when a refund touches product lines. */
+  fulfillments?: ShopifyFulfillment[] | null;
   taxes_included?: boolean | null;
   total_tip_received?: string | null;
   shipping_lines?: ShopifyShippingLine[] | null;

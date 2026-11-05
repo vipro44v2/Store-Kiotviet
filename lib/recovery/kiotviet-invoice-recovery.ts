@@ -29,6 +29,7 @@ import { RecoveryArgsError } from "./shopify-order-recovery";
 import { PREPAYMENT_EVIDENCE_KEY, prepaymentInheritanceStatus } from "@/lib/kiotviet/prepayment-evidence";
 import { resolveInvoiceSeller, type VerifiedSeller } from "@/lib/kiotviet/users";
 import {
+  lineAdjustmentAudit,
   productOnlyPaymentDecision,
   productOnlyPolicy,
   type FinancialDifference,
@@ -131,6 +132,8 @@ export interface ProductOnlyAudit {
   differences: FinancialDifference[];
   /** True only when no difference at all remains; excluded charges are never "reconciled". */
   financiallyReconciled: boolean;
+  /** Original, excluded and remaining quantity with the reason, per refunded product line. */
+  lineAdjustments: ReturnType<typeof lineAdjustmentAudit>;
 }
 
 export interface InvoiceProposal {
@@ -259,17 +262,37 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
         discount: (current?.discount ?? 0) + Number(detail.discount ?? 0),
       });
     }
+    // Units cancelled by a refund after the KiotViet order was created: the existing order is
+    // never changed or recreated automatically, and never partly invoiced; it is reported.
+    const cancelledBySku = new Map<string, { original: number; remaining: number }>();
+    for (const adjustment of plan.prepared.adjustments?.lines.values() ?? []) {
+      if (adjustment.excludedQuantity <= 0) continue;
+      const key = normalizeSku(adjustment.sku);
+      const current = cancelledBySku.get(key) ?? { original: 0, remaining: 0 };
+      cancelledBySku.set(key, { original: current.original + adjustment.originalQuantity, remaining: current.remaining + adjustment.remainingQuantity });
+    }
+    const refundAfterOrder = (sku: string, kiotVietQuantity: number) => {
+      const cancelled = cancelledBySku.get(normalizeSku(sku));
+      return cancelled && kiotVietQuantity === cancelled.original
+        ? `refund_after_kiotviet_order: SKU ${sku} is ${kiotVietQuantity} on the existing KiotViet order but ${cancelled.remaining} after cancelled refunds; adjust the KiotViet order explicitly (it is never changed automatically), then retry`
+        : null;
+    };
     for (const [productId, line] of expected) {
       const found = actual.get(productId);
       if (!found) reasons.push(`line_missing: KiotViet order has no line for SKU ${line.sku} (product ${productId})`);
       else {
-        if (found.quantity !== line.quantity) reasons.push(`quantity_mismatch: SKU ${line.sku} is ${found.quantity} in KiotViet, ${line.quantity} in Shopify`);
+        if (found.quantity !== line.quantity)
+          reasons.push(refundAfterOrder(line.sku, found.quantity) ?? `quantity_mismatch: SKU ${line.sku} is ${found.quantity} in KiotViet, ${line.quantity} in Shopify`);
         if (cents(found.price) !== cents(line.price)) reasons.push(`price_mismatch: SKU ${line.sku} costs ${found.price} in KiotViet, ${line.price} in Shopify`);
         if (found.discount) reasons.push(`unsupported_discount: KiotViet line for SKU ${line.sku} has a discount`);
       }
     }
-    for (const productId of actual.keys())
-      if (!expected.has(productId)) reasons.push(`extra_line: KiotViet order has product ${productId} that is not a Shopify physical line`);
+    for (const [productId, found] of actual)
+      if (!expected.has(productId)) {
+        const code = (kiotVietOrder.orderDetails ?? []).find((detail) => Number(detail.productId) === productId)?.productCode;
+        reasons.push((code ? refundAfterOrder(String(code), found.quantity) : null) ??
+          `extra_line: KiotViet order has product ${productId} that is not a Shopify physical line`);
+      }
     plan.expectedLines = [...expected].map(([productId, line]) => ({ productId, ...line }));
     if (policy.enabled) {
       // Product-Only: the invoice holds product lines only. Whether KiotViet copies an
@@ -351,6 +374,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
       shopifyPaid: shopifyPaidCents / 100, shopifyTotal: plan.prepared?.amounts.shopifyTotal ?? 0,
       invoiceMerchandise: invoiceCents / 100, kiotVietPrepaid: prepaidCents / 100, additionalPayment: 0,
       differences, financiallyReconciled: differences.length === 0,
+      lineAdjustments: lineAdjustmentAudit(plan.prepared?.adjustments),
     };
   }
 

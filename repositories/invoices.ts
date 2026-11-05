@@ -26,6 +26,18 @@ export const invoicesRepository = {
       [limit],
     );
   },
+  /** Refunded-quantity adjustments per product line (invoiced and blocked orders), newest first. */
+  async lineAdjustments(limit = 100) {
+    return query<Record<string, unknown>>(
+      `SELECT concat_ws(' ',o.shopify_order_number,'('||i.shopify_order_id||')') AS shopify_order,i.status,
+        a->>'sku' AS sku,(a->>'originalQuantity')::int AS original_quantity,(a->>'excludedQuantity')::int AS excluded_quantity,
+        (a->>'remainingQuantity')::int AS remaining_quantity,a->>'reason' AS reason,a->>'fulfilledQuantity' AS fulfilled_quantity,a->>'detail' AS detail
+      FROM invoice_mappings i LEFT JOIN order_mappings o ON o.shopify_order_id=i.shopify_order_id,
+        jsonb_array_elements(COALESCE(i.reconciliation->'productOnly'->'lineAdjustments',i.reconciliation->'lineAdjustments','[]'::jsonb)) a
+      ORDER BY i.updated_at DESC LIMIT $1`,
+      [limit],
+    );
+  },
   /** Status counts, post-creation payment checks and invoice latency (trigger → verified invoice, last 7 days). */
   async automationStats() {
     const [[counts], [latency], [lookup]] = await Promise.all([

@@ -22,7 +22,36 @@ The server records `unverifiedPrepaymentAcceptedBy/At` (the browser cannot set t
 
 - `invoiceTotal = Σ discounted unit price × quantity` of the KiotViet order lines. New orders are created with discounted unit prices, no shipping surcharge, and `totalPayment` = merchandise paid. Historical KiotViet orders are invoiced from their own lines, unchanged.
 - Shipping, processing fees, tips and other surcharges are recorded in `reconciliation.productOnly.differences` (with Shopify paid, invoice merchandise, KiotViet prepayment and payment source). They never block, and `financiallyReconciled` stays `false`.
-- Still blocking: unmapped/ambiguous SKU, wrong product/quantity/price against the KiotViet order, discounts that can't be split into whole cents, invalid seller, cancelled orders, product refunds, added product tax, currency mismatch, a surcharge already on the KiotViet order, duplicate or cancelled invoices, an unknown earlier POST outcome, an inconclusive duplicate lookup.
+- Still blocking: unmapped/ambiguous SKU, wrong product/quantity/price against the KiotViet order, discounts that can't be split into whole cents, invalid seller, cancelled orders, product refunds that cannot be tied to cancelled unshipped units (see below), added product tax, currency mismatch, a surcharge already on the KiotViet order, duplicate or cancelled invoices, an unknown earlier POST outcome, an inconclusive duplicate lookup.
+
+## Refunded and cancelled items
+
+`effectiveQuantity = originalQuantity − confirmedCancelledRefundQuantity`, per Shopify product line (`computeRefundAdjustments` in `lib/sync/product-only-invoicing.ts`). Shopify's financial status never decides physical quantities; only refund line items do.
+
+| Refund line item | Result |
+| --- | --- |
+| `restock_type: cancel` (unfulfilled units removed by Shopify) | units excluded; a fully cancelled line is left out entirely |
+| `no_restock`, and the successful fulfillments prove the units were not shipped (fulfilled ≤ ordered − refunded) | units excluded |
+| `no_restock` without fulfillment data, or with more units fulfilled than remain | `refund_requires_verification` (blocked) |
+| `return`, `legacy_restock` or no type (delivered or unknown) | `refund_requires_verification` (blocked); returns belong to the KiotViet return workflow |
+| money refunded with no refund line items | no quantity change; if it exceeds the excluded charges and cancelled units → `refund_exceeds_excluded_charges` |
+| `current_quantity` ≠ ordered − refunded (e.g. units removed by an order edit) | `refund_requires_verification` (blocked) |
+
+- **Base quantity:** always the original `quantity`. `current_quantity` is only a cross-check, so a cancellation is never subtracted twice.
+- **Repeated refunds:** de-duplicated by id, in both quantity and money.
+- **Ambiguous lines:** keep their original quantity.
+- **Discounts:** the discounted unit price is computed from the **original** quantity, so a cancelled unit takes its own share of the line discount. Nothing is redistributed onto the remaining units.
+- **Financial records:** the cancelled value is recorded as `cancelled_items_excluded`. If Shopify's refunded subtotal for those units differs, the difference is recorded as `cancelled_refund_allocation_difference` (informational).
+
+The same effective lines drive the KiotViet order (quantities, discounted prices, payment), invoice validation, the expected invoice payment and the stock-movement check:
+
+- **No units left:** if every product unit was cancelled, no KiotViet order is created (`all_items_cancelled`).
+- **Paid status:** in Product-Only mode a `partially_refunded` order counts as paid for order creation.
+- **Existing KiotViet orders:** never changed, recreated or partly invoiced. A refund after the KiotViet order exists gives `refund_after_kiotviet_order` (blocked). Adjust the KiotViet order explicitly in KiotViet, then retry; this adjustment is deliberately not automated.
+
+Audit: `reconciliation.productOnly.lineAdjustments` (also saved for blocked orders), the order-creation log (`lineAdjustments`) and Admin → Hóa đơn → *Điều chỉnh số lượng do hoàn tiền*. Each entry shows the original, excluded, remaining and fulfilled quantity, the reason and the detail.
+
+The invoice snapshot reads fulfillment line items only when a refund names line items, so normal orders need no extra Shopify request.
 
 ## Payment: the invoice never creates a payment
 

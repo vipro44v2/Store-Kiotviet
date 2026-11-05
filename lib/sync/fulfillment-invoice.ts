@@ -7,6 +7,7 @@ import { isRedisEnabled } from "@/lib/redis/client";
 import { getEnv } from "@/lib/env";
 import { applyInvoiceRecovery, planInvoiceRecovery } from "@/lib/recovery/kiotviet-invoice-recovery";
 import { getInvoiceIndexHealth } from "@/lib/kiotviet/invoice-index";
+import { lineAdjustmentAudit } from "./product-only-invoicing";
 import { getSyncSettings } from "./sync-settings";
 import { syncInventoryNotification } from "./inventory-sync";
 import type { OrderSettings } from "./default-branch";
@@ -45,13 +46,16 @@ export function invoiceTriggerState(live: { updatedAt?: string }, settingsVersio
  * Not eligible (yet). 'blocked' can be re-evaluated; 'needs_review' is reserved
  * for uncertain remote results and is never overwritten here.
  */
-async function recordBlocked(orderId: string, reason: string, stage: string) {
+async function recordBlocked(orderId: string, reason: string, stage: string, audit?: Record<string, unknown>) {
+  // `audit` (e.g. refunded-quantity adjustments) is merged into reconciliation so Admin shows it
+  // for blocked orders too; nothing was sent to KiotViet.
   await query(
-    `INSERT INTO invoice_mappings(shopify_order_id,status,source,last_error,failure_stage)
-    VALUES($1,'blocked','auto',$2,$3) ON CONFLICT(shopify_order_id) DO UPDATE
-    SET status='blocked',last_error=EXCLUDED.last_error,failure_stage=EXCLUDED.failure_stage,updated_at=now()
+    `INSERT INTO invoice_mappings(shopify_order_id,status,source,last_error,failure_stage,reconciliation)
+    VALUES($1,'blocked','auto',$2,$3,COALESCE($4::jsonb,'{}'::jsonb)) ON CONFLICT(shopify_order_id) DO UPDATE
+    SET status='blocked',last_error=EXCLUDED.last_error,failure_stage=EXCLUDED.failure_stage,
+      reconciliation=invoice_mappings.reconciliation || COALESCE($4::jsonb,'{}'::jsonb),updated_at=now()
     WHERE invoice_mappings.kiotviet_invoice_id IS NULL AND invoice_mappings.status IN ('blocked','failed')`,
-    [orderId, reason.slice(0, 2000), stage],
+    [orderId, reason.slice(0, 2000), stage, audit ? JSON.stringify(audit) : null],
   );
 }
 
@@ -273,7 +277,9 @@ export async function processFulfillmentInvoice(orderId: string, context: { rece
   if (plan.action.kind === "blocked") {
     const reason = plan.action.reasons.join("; ");
     if (TRANSIENT_REASONS.some((code) => reason.includes(code))) throw new RetryableError(reason);
-    await recordBlocked(orderId, reason, "automatic_validation");
+    await recordBlocked(orderId, reason, "automatic_validation", plan.productOnly
+      ? { invoicingMode: "product_only", productOnly: plan.productOnly }
+      : plan.prepared?.adjustments ? { lineAdjustments: lineAdjustmentAudit(plan.prepared.adjustments) } : undefined);
     throw new ConflictError(reason);
   }
   if (plan.action.kind !== "none") {

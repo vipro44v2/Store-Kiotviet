@@ -866,3 +866,62 @@ describe("seller on new KiotViet orders", () => {
     await expect(syncShopifyOrder(order(), { jobType: "shopify_order_update" })).resolves.toMatchObject({ action: "created" });
   });
 });
+
+describe("Product-Only: refunded and cancelled units at KiotViet order creation", () => {
+  const productOnly = { invoiceCreationTrigger: "shopify_fulfilled", kiotVietCurrency: "VND", productOnlyInvoicing: true };
+  const twoLines = (overrides: Partial<ShopifyOrderWebhook> = {}) => order({
+    financial_status: "partially_refunded", total_price: "480000",
+    line_items: [
+      { id: 11, sku: "NU012", quantity: 2, price: "150000", name: "Áo thun" },
+      { id: 12, sku: "NU013", quantity: 3, price: "70000", name: "Mũ", discount_allocations: [{ amount: "30000" }] },
+    ],
+    ...overrides,
+  });
+  const cancel = (lineItemId: number, quantity: number, id = 1) =>
+    ({ id, refund_line_items: [{ line_item_id: lineItemId, quantity, restock_type: "cancel" }], transactions: [{ kind: "refund", status: "success", amount: "0" }] });
+
+  it("creates the KiotViet order with the remaining quantity and pays only the remaining merchandise", async () => {
+    mocks.db.orders = { ...mocks.db.orders, ...productOnly };
+    await syncShopifyOrder(twoLines({ refunds: [cancel(12, 1)], fulfillments: [] }));
+    const input = mocks.createOrder.mock.calls[0][0];
+    // NU013: 70,000 − 10,000 discount per unit; the cancelled unit takes its own discount.
+    expect(input.orderDetails).toEqual([
+      expect.objectContaining({ productCode: "NU012", quantity: 2, price: 150000 }),
+      expect.objectContaining({ productCode: "NU013", quantity: 2, price: 60000 }),
+    ]);
+    expect(input.totalPayment).toBe(420000);
+    expect(mocks.log).toHaveBeenCalledWith("info", "Shopify order amounts adjusted for KiotViet", expect.objectContaining({
+      lineAdjustments: [expect.objectContaining({ lineItemId: "12", originalQuantity: 3, excludedQuantity: 1, remainingQuantity: 2, reason: "cancelled_refund" })],
+    }));
+  });
+
+  it("leaves a fully cancelled line out, and creates nothing when every unit was cancelled", async () => {
+    mocks.db.orders = { ...mocks.db.orders, ...productOnly };
+    await syncShopifyOrder(twoLines({ refunds: [cancel(12, 3)], fulfillments: [] }));
+    expect(mocks.createOrder.mock.calls[0][0].orderDetails.map((detail: { productCode: string }) => detail.productCode)).toEqual(["NU012"]);
+    mocks.createOrder.mockClear();
+    const result = await syncShopifyOrder(twoLines({ id: 5002, refunds: [cancel(11, 2, 1), cancel(12, 3, 2)], fulfillments: [] }));
+    expect(result).toEqual({ action: "skipped", reason: "all_items_cancelled" });
+    expect(mocks.createOrder).not.toHaveBeenCalled();
+  });
+
+  it("keeps the original quantity when the refund cannot be tied to unshipped units (the invoice is blocked later)", async () => {
+    mocks.db.orders = { ...mocks.db.orders, ...productOnly };
+    const returned = { id: 1, refund_line_items: [{ line_item_id: 12, quantity: 1, restock_type: "return" }], transactions: [] };
+    await syncShopifyOrder(twoLines({ refunds: [returned], fulfillments: [{ status: "success", line_items: [{ id: 12, quantity: 3 }] }] }));
+    expect(mocks.createOrder.mock.calls[0][0].orderDetails[1]).toMatchObject({ productCode: "NU013", quantity: 3 });
+  });
+
+  it("strict mode keeps the original quantities and the existing paid-only rule", async () => {
+    await syncShopifyOrder(twoLines({ refunds: [cancel(12, 1)] }));
+    expect(mocks.createOrder).not.toHaveBeenCalled(); // partially_refunded is not "paid" in strict mode
+  });
+
+  it("never touches an existing KiotViet order when a refund arrives later", async () => {
+    mocks.db.orders = { ...mocks.db.orders, ...productOnly };
+    await syncShopifyOrder(twoLines({ financial_status: "paid" }));
+    expect(mocks.createOrder).toHaveBeenCalledOnce();
+    await syncShopifyOrder(twoLines({ refunds: [cancel(12, 1)], fulfillments: [] }), { jobType: "shopify_order_update" });
+    expect(mocks.createOrder).toHaveBeenCalledOnce();
+  });
+});

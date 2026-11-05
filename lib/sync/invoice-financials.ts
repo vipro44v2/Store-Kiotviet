@@ -3,6 +3,7 @@ import type { OrderSettings } from "./default-branch";
 import { shippingChargedCents, toCents } from "./order-line-items";
 import type { PreparedOrder } from "./order-sync";
 import {
+  computeRefundAdjustments,
   discountedUnitPriceCents,
   lineDiscountCents,
   productOnlyPolicy,
@@ -153,7 +154,6 @@ export function evaluateProductOnlyFinancials(
     if (amountCents !== 0) differences.push({ code, amount: amountCents / 100, message });
   };
   const taxesIncluded = order.taxes_included === true;
-  const feeLineIds = new Set(prepared.fees.map((fee) => String(fee.line.id)));
 
   if (order.cancelled_at) reasons.push("order_cancelled: the Shopify order is cancelled");
   const financialStatus = order.financial_status ?? "unknown";
@@ -163,19 +163,36 @@ export function evaluateProductOnlyFinancials(
   const { reasons: currencyProblems, currency } = currencyReasons(order, settings);
   reasons.push(...currencyProblems);
 
-  let merchandiseCents = 0, productTaxCents = 0;
+  // Effective lines: original quantity minus confirmed cancelled refunds (computeRefundAdjustments).
+  // The discounted unit price always comes from the ORIGINAL quantity, so a cancelled unit takes
+  // its own share of the line discount with it and nothing is shifted onto the remaining units.
+  const originalLines = prepared.originalLines ?? prepared.lines.map(({ line }) => line);
+  const adjustments = prepared.adjustments ?? computeRefundAdjustments(order, originalLines);
+  let merchandiseCents = 0, originalMerchandiseCents = 0, productTaxCents = 0;
   const unitPrices: Record<string, number> = {};
-  for (const { line, quantity } of prepared.lines) {
-    const unit = discountedUnitPriceCents(line, quantity);
+  for (const line of originalLines) {
+    const original = Number(line.quantity);
+    const remaining = adjustments.lines.get(String(line.id))?.remainingQuantity ?? original;
+    const netOriginal = toCents(line.price, `line item ${line.id}`) * original - lineDiscountCents(line);
+    originalMerchandiseCents += netOriginal;
+    // Shopify's total still contains the full line tax.
+    productTaxCents += (line.tax_lines ?? []).reduce((sum, taxLine) => sum + toCents(taxLine?.price, "tax"), 0);
+    if (remaining === 0) continue;
+    const unit = discountedUnitPriceCents(line, original);
     if (unit === null) {
-      reasons.push(`discount_not_representable: line item ${line.id} discount cannot be split over ${quantity} unit(s) in whole cents`);
-      merchandiseCents += toCents(line.price, `line item ${line.id}`) * quantity - lineDiscountCents(line);
+      reasons.push(`discount_not_representable: line item ${line.id} discount cannot be split over ${original} unit(s) in whole cents`);
+      merchandiseCents += Math.round((netOriginal * remaining) / original);
     } else {
       unitPrices[String(line.id)] = unit / 100;
-      merchandiseCents += unit * quantity;
+      merchandiseCents += unit * remaining;
     }
-    productTaxCents += (line.tax_lines ?? []).reduce((sum, taxLine) => sum + toCents(taxLine?.price, "tax"), 0);
   }
+  const cancelledCents = originalMerchandiseCents - merchandiseCents;
+  record("cancelled_items_excluded", cancelledCents, `Refunded and cancelled units worth ${money(cancelledCents)} are not on the invoice`);
+  const refundSubtotalCents = [...adjustments.lines.values()].reduce((sum, line) => sum + line.excludedRefundSubtotalCents, 0);
+  if (cancelledCents > 0 && refundSubtotalCents > 0)
+    record("cancelled_refund_allocation_difference", refundSubtotalCents - cancelledCents,
+      `Shopify refunded ${money(refundSubtotalCents)} for the cancelled units; their discounted value is ${money(cancelledCents)}`);
   // Tax charged on top of product prices is not a surcharge; it is never silently dropped.
   if (!taxesIncluded && productTaxCents > 0)
     reasons.push(`unsupported_tax: ${money(productTaxCents)} product tax is added on top of prices`);
@@ -199,7 +216,8 @@ export function evaluateProductOnlyFinancials(
   }
   const shopifyTotalCents = toCents(order.total_price, "total_price");
   const productChargesCents = merchandiseCents + (taxesIncluded ? 0 : productTaxCents);
-  const explainedCents = productChargesCents + shippingCents + shippingTaxCents + feeCents + tipCents;
+  // Shopify's total is the order as placed, cancelled units included.
+  const explainedCents = originalMerchandiseCents + (taxesIncluded ? 0 : productTaxCents) + shippingCents + shippingTaxCents + feeCents + tipCents;
   const otherCents = shopifyTotalCents - explainedCents;
   if (otherCents < 0)
     // The customer paid less than the merchandise and charges: invoicing it would overstate the sale.
@@ -210,23 +228,25 @@ export function evaluateProductOnlyFinancials(
     else reasons.push(`amount_mismatch: Shopify total ${money(shopifyTotalCents)} has ${money(otherCents)} not explained by products, shipping, fees and tips`);
   }
 
-  // Refunds: product refunds change the merchandise; refunds of excluded charges do not.
+  // Refunds: confirmed cancelled units were removed above; any other refunded product units
+  // are ambiguous (possibly delivered) and block. Money alone never removes a product.
   let refundedCents = 0;
   const refunds = order.refunds ?? [];
   if (financialStatus === "partially_refunded" && !refunds.length)
     reasons.push("refund_details_missing: partially_refunded order without refund details");
+  reasons.push(...adjustments.ambiguous);
+  const countedRefunds = new Set<string>();
   for (const refund of refunds) {
-    const amount = (refund.transactions ?? [])
+    if (countedRefunds.has(String(refund.id))) continue; // the same refund delivered twice
+    countedRefunds.add(String(refund.id));
+    refundedCents += (refund.transactions ?? [])
       .filter((transaction) => transaction?.kind === "refund" && transaction?.status === "success")
       .reduce((sum, transaction) => sum + toCents(transaction?.amount, "refund"), 0);
-    refundedCents += amount;
-    const productLines = (refund.refund_line_items ?? []).filter((item) => Number(item.quantity) > 0 && !feeLineIds.has(String(item.line_item_id)));
-    if (productLines.length)
-      reasons.push(`refund_affects_products: refund ${refund.id} refunds line item(s) ${productLines.map((item) => item.line_item_id).join(", ")}`);
   }
+  // Refunds may cover the excluded charges and the cancelled units, never the invoiced merchandise.
   const excludedChargesCents = Math.max(0, shopifyTotalCents - productChargesCents);
   if (refundedCents > excludedChargesCents)
-    reasons.push(`refund_exceeds_excluded_charges: refunded ${money(refundedCents)} is more than the excluded charges ${money(excludedChargesCents)}`);
+    reasons.push(`refund_exceeds_excluded_charges: refunded ${money(refundedCents)} is more than the excluded charges and cancelled units ${money(excludedChargesCents)}; part of the remaining merchandise was refunded`);
   else record("refund_of_excluded_charges", -refundedCents, `Shopify refunded ${money(refundedCents)} of excluded charges`);
   const shopifyPaidCents = shopifyTotalCents - refundedCents;
   record("shopify_paid_vs_invoice", shopifyPaidCents - merchandiseCents,
