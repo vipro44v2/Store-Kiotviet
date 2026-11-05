@@ -4,13 +4,11 @@ import type { KiotVietInvoice, KiotVietInvoicesResponse } from "./types";
 import { query } from "@/lib/db/client";
 import {
   countedGet,
-  dbNow,
   ensureIndexFresh,
   forgetIndexedInvoice,
-  getInvoiceIndexState,
   indexedInvoicesForOrder,
   INVOICE_INDEX_LOOKUP_CATCH_UP,
-  localInvoiceCandidates,
+  localLookupSnapshot,
   scanInvoicesAboveFloor,
   withApiCallCount,
   type IndexFreshness,
@@ -72,6 +70,10 @@ export interface InvoiceLookupMetrics {
   localMs: number;
   /** Freshness proof, the orderId hint and candidate re-reads. */
   remoteMs: number;
+  /** Completeness step only (index freshness or floor scan), including waiting for a shared refresh. */
+  refreshMs: number;
+  /** Re-reading candidate invoices from KiotViet. */
+  rereadMs: number;
   totalMs: number;
   apiCalls: number;
   candidates: number;
@@ -110,16 +112,19 @@ export async function findKiotVietInvoicesForOrder(
 ): Promise<InvoiceLookup> {
   const started = performance.now();
   const { result, calls } = await withApiCallCount(async () => {
-    const lookupStart = await dbNow();
-    const candidates = new Set(await localInvoiceCandidates(order));
+    // One round trip: lookup start (DB clock), index checkpoint and local candidates.
+    const snapshot = await localLookupSnapshot(order);
+    const { lookupStart, state } = snapshot;
+    const candidates = new Set(snapshot.candidates);
     const localMs = performance.now() - started;
-    const state = await getInvoiceIndexState();
     const indexLag = state.remote_total === null ? null : Math.max(0, state.remote_total - state.scanned_count);
+    let refreshMs = 0;
     const indexFirst = indexLag !== null && indexLag <= INVOICE_INDEX_LOOKUP_CATCH_UP;
     let complete = false, method: InvoiceLookup["method"], freshness: IndexFreshness | null = null;
     const errors: string[] = [];
     for (const path of indexFirst ? ["index", "floor"] : ["floor", "index"]) {
       if (complete) break;
+      const refreshStarted = performance.now();
       if (path === "floor") {
         if (!order.invoiceIdFloor) continue;
         const tail = await scanInvoicesAboveFloor(order.invoiceIdFloor);
@@ -127,21 +132,26 @@ export async function findKiotVietInvoicesForOrder(
         if (tail.complete) [complete, method] = [true, "floor_scan"];
         else errors.push(tail.error);
       } else {
-        const fresh = await ensureIndexFresh(lookupStart, { maxPages: options.maxIndexPages ?? 10 });
+        const fresh = await ensureIndexFresh(lookupStart, { maxPages: options.maxIndexPages ?? 10 }, state);
         if (fresh.complete) {
           [complete, method, freshness] = [true, "index", fresh.freshness];
-          // Rows the freshness check just appended.
-          for (const row of await indexedInvoicesForOrder(order.code)) candidates.add(Number(row.invoice_id));
+          // Only when the check appended invoices can the index hold new candidates.
+          if (fresh.progress.scanned > state.scanned_count)
+            for (const row of await indexedInvoicesForOrder(order.code)) candidates.add(Number(row.invoice_id));
         } else if (fresh.error) errors.push(fresh.error);
       }
+      refreshMs += performance.now() - refreshStarted;
     }
     if (!complete) for (const id of await orderFilterHint(order)) candidates.add(id);
+    const rereadStarted = performance.now();
     const invoices = candidates.size ? await currentInvoices(candidates, order.code) : [];
-    return { invoices, complete, method, freshness, errors, localMs, candidates: candidates.size, indexLag };
+    const rereadMs = performance.now() - rereadStarted;
+    return { invoices, complete, method, freshness, errors, localMs, refreshMs, rereadMs, candidates: candidates.size, indexLag };
   });
   const totalMs = performance.now() - started;
   const metrics: InvoiceLookupMetrics = {
     method: result.method ?? null, freshness: result.freshness, localMs: round(result.localMs), remoteMs: round(totalMs - result.localMs),
+    refreshMs: round(result.refreshMs), rereadMs: round(result.rereadMs),
     totalMs: round(totalMs), apiCalls: calls, candidates: result.candidates, indexLag: result.indexLag,
   };
   return {

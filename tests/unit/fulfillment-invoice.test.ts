@@ -425,3 +425,16 @@ describe("inventory synchronization independent of invoice creation", () => {
     expect(failure?.sql).toContain("last_error=CASE WHEN status='created'");
   });
 });
+
+describe("Product-Only payment discrepancy does not stop the pipeline", () => {
+  it("syncs stock and completes the job for a created invoice whose KiotViet payment differs", async () => {
+    m.apply.mockImplementation(async () => {
+      m.invoice = { ...createdInvoice, shopify_order_id: "1",
+        reconciliation: { ...createdInvoice.reconciliation, paymentVerification: { status: "mismatch", blocking: false, remainingBalance: 202 } } };
+      return { applied: true, status: "created" };
+    });
+    await expect(processFulfillmentInvoice("1")).resolves.toBeUndefined();
+    expect(m.stock).toHaveBeenCalledWith(expect.objectContaining({ ProductId: 2, BranchId: 10 }), undefined, expect.objectContaining({ refreshFromKiotViet: true }));
+    expect(m.updates.some((update) => update.sql.includes("'shopifyStockSynchronized',true"))).toBe(true);
+  });
+});

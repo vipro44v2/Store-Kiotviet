@@ -344,8 +344,14 @@ export async function processSyncJob(
       if (!invoicing) break;
       const { advanceInvoiceIndex, getInvoiceIndexHealth, withInvoiceIndexLease } = await import("@/lib/kiotviet/invoice-index");
       // At most 30 pages per run and one run at a time keeps KiotViet requests bounded.
+      const runStarted = performance.now();
       const progress = await withInvoiceIndexLease(`job-${String(job.data.auditJobId ?? job.id)}`,
         () => advanceInvoiceIndex({ maxPages: 30, deadlineMs: 50_000 }));
+      if (progress)
+        await log("info", "KiotViet invoice index run", {
+          action: "invoice_index_run", provider: "kiotviet", durationMs: Math.round(performance.now() - runStarted),
+          pages: progress.pages, scanned: progress.scanned, total: progress.total, current: progress.current, error: progress.error ?? null,
+        });
       if (!progress) {
         await log("info", "KiotViet invoice index run skipped; another run holds the lease", { action: "invoice_index_overlap_skipped", provider: "kiotviet" });
         break;

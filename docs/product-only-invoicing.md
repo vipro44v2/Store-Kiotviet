@@ -39,7 +39,9 @@ The POST always sends `totalPayment: 0`. The existing KiotViet order payment is 
 Right after the POST, the returned invoice ID is saved (`needs_review` until verified). Then the invoice is read back and `reconciliation.paymentVerification` records `expectedPaid`, `invoiceTotalPayment`, `paymentRowsTotal`, `invoiceTotal`, `remainingBalance` and `discrepancies`:
 
 - `verified`: KiotViet reports exactly the prepayment as paid, the payment rows add up, and the remaining balance is 0. The invoice can be `created`.
-- `mismatch`: the status is `needs_review`, `last_error` starts with `payment_inheritance_mismatch:` and lists the exact discrepancy. The invoice is **never** created again to fix it, and the system never reports it as paid.
+- `mismatch`: **informational** (`blocking: false`). Shopify Paid decides that the customer paid. The invoice is `created` if its identity, lines, completed status, merchandise-only total and stock movement are verified. `paymentVerification` keeps KiotViet's own amounts (`kiotVietInvoiceFullyPaid`, `remainingBalance`, `discrepancies`), so the system never claims the KiotViet invoice is paid when KiotViet says otherwise. A warning `kiotviet_invoice_payment_discrepancy` is logged. No payment is ever sent to make it match, and the invoice is never created again.
+
+`needs_review` is reserved for technical uncertainty: unknown invoice identity, wrong lines or total, an invoice that is not completed, unverified stock movement, or an incomplete duplicate lookup. Its `last_error` starts with `invoice_verification_failed:` (payment differences are only appended as information).
 
 ## Duplicate lookup (`findKiotVietInvoicesForOrder`)
 
@@ -58,9 +60,9 @@ The normal path for a new order is therefore 1 local query (plus the clock and t
 
 **`GET /invoices?orderId=` is never proof.** Its semantics are not documented. `scripts/verify-kiotviet-invoice-order-filter.ts` measures them (read-only; `--record` stores the result) and reports `filters`, `ignored` or `inconclusive`. Even with `filters`, the lookup asks the filter only when completeness failed, as an extra source of invoices to link, matched on `orderCode`. With `ignored`, the request is skipped.
 
-**POST timeout**: the row stays `creating` (outcome unknown) and the POST is never resent. The job then searches with the same lookup (delays `INVOICE_UNCERTAIN_POLL_MS`, default `1000,3000,8000`):
+**POST timeout**: the row stays `creating` (outcome unknown) and the POST is never resent. The job then searches with the same lookup, with bounded exponential backoff (1 s, 2 s, 4 s, 8 s; override with `INVOICE_UNCERTAIN_POLL_MS`, at most 10 delays of at most 60 s):
 
-- **Exactly one invoice found:** its ID is saved immediately and it goes through normal verification (lines, stock, payment). If the search that found it was incomplete, it stays `needs_review`.
+- **Exactly one invoice found:** its ID is saved immediately (inside the claim's advisory lock, and only while this attempt still owns the row) and it goes through normal verification. If another worker already settled the row, nothing is changed. If the search that found it was incomplete, it stays `needs_review`.
 - **Two or more invoices:** `needs_review`, linking neither.
 - **None found:** still `creating`. Later job retries re-plan and link it once it is visible. After the 5-minute window, `invoice_outcome_unknown` goes to manual review (`--reset-uncertain` is operator-only).
 
@@ -68,15 +70,21 @@ Unchanged safety: advisory lock plus claim token on the invoice claim, the `UNIQ
 
 **Metrics** are stored in `reconciliation.duplicateLookup` (plan) and `reconciliation.prePostLookup`: `localMs`, `remoteMs`, `totalMs`, `apiCalls`, `freshness`, `method`, `candidates`, `indexLag`. Admin shows the PostgreSQL P95, the total average and P95, requests per lookup, and the share of shared confirmations. The `planned` stage log carries the same fields.
 
-**Measured** (development machine; real PostgreSQL engine via PGlite in-process, all 12 migrations applied, 20,000 indexed invoices, 8,000 order and invoice mappings):
+**Measured** (development machine; real PostgreSQL engine via PGlite in-process, so there is no network round trip; all 13 migrations applied; 20,000 indexed invoices; 8,000 order and invoice mappings). Before → after:
 
-| Measure | p50 | p95 | max |
-| --- | --- | --- | --- |
-| Candidate query, order with invoices | 0.48 ms | 0.90 ms | 7.4 ms |
-| Candidate query, new order (miss) | 0.42 ms | 0.68 ms | 2.0 ms |
-| Whole local step (clock + candidates + index state) | 1.02 ms | 1.53 ms | 4.4 ms |
+| Measure | Before | After |
+| --- | --- | --- |
+| Index page write (100 invoices + checkpoint) | 101 statements, p50 32.0 ms / p95 34.7 ms | 1 statement, p50 1.6 ms / p95 2.3 ms |
+| Index page through `advanceInvoiceIndex` (module code) | — | 2.5 ms per page |
+| Local lookup step | 3 statements, p50 0.98 ms / p95 1.62 ms | 1 statement (`localLookupSnapshot`), p50 0.57 ms / p95 0.90 ms |
+| Full lookup, KiotViet mocked as instant (app overhead only) | — | p50 2.8 ms / p95 4.1 ms |
+| `UNION`+`OR` vs `UNION ALL` 3 branches (candidates) | hit 0.48 / miss 0.40 ms | 0.41 / 0.39 ms, worse max: **kept** `UNION`+`OR` |
+| `invoice_mappings` update with / without the `updated_at` index | p50 0.42 ms | 0.39 ms, ~8% smaller: **dropped** (013) |
+| Stock-retry scan, with / without a partial index | 1.24 ms | 0.94 ms: **no index** (once a minute) |
 
-`EXPLAIN ANALYZE` uses a BitmapOr over `invoice_mappings_kiotviet_order_id_key` and `invoice_mappings_kiotviet_order_code_idx`, plus `kiotviet_invoice_index_order_code_idx` (execution 0.22 ms).
+`EXPLAIN ANALYZE` uses a BitmapOr over `invoice_mappings_kiotviet_order_id_key` and `invoice_mappings_kiotviet_order_code_idx`, plus `kiotviet_invoice_index_order_code_idx` (execution 0.22 ms). Each saved statement also saves a network round trip on a real connection.
+
+Refresh sharing: concurrent lookups join an in-flight refresh. A lookup that starts after a refresh began waits for it, then shares **one queued refresh** with every other late arrival (`freshness: "queued"`) instead of sending its own request. A test shows 3 lookups → 2 KiotViet requests. Across separate processes, sharing goes through `current_as_of` (`reused`); PM2 runs one worker process.
 
 A networked `pg` connection adds its round-trip time per query. The remote part (0–1 KiotViet requests) was **not** measured: it depends on KiotViet's response time and is not assumed to be under 1 s. Measure both on staging or production with:
 
@@ -88,6 +96,8 @@ npx tsx --env-file=.env.production scripts/benchmark-invoice-lookup.ts --remote 
 ## Duplicate detection without waiting for the index
 
 When the app claims a Shopify order for KiotViet order creation (before the KiotViet order exists), it stores `order_mappings.invoice_id_floor` = the highest indexed invoice id. Every invoice of that order must have a larger id. So the job proves "no invoice yet" by reading invoices newest-first until it reaches an id ≤ floor (normally 1 request). Each page must be strictly ordered by id. Each later page re-reads the previous page's last invoice, so an insert, delete or ignored ordering during the scan makes it inconclusive, never complete. With more than 500 invoices above the floor, the job falls back to the full index. Orders linked by recovery, or recovered after a timed-out order POST, have no floor and always use the index. The final re-check right before the POST is unchanged.
+
+Index writes: each page is persisted with **one statement**. A data-modifying CTE advances the guarded checkpoint (`generation` + `scanned_count`) and batch-UPSERTs the page with `unnest(...)` + `ON CONFLICT(invoice_id) DO UPDATE`; `DISTINCT ON` makes duplicate ids in a page safe. Rows are written only if the checkpoint matched, and the checkpoint only moves with its rows, so a crash or error changes neither and the page is re-read. A concurrent runner waits on the state row lock, then matches nothing and writes nothing. Cancelled invoices are stored with their status (candidates are re-read anyway).
 
 Index maintenance: an overlap mismatch is repaired by binary-search repositioning (no full rebuild). Scheduled runs hold a lease (`lease_owner/lease_until`), so they never overlap. Each run reads at most 30 pages. Jobs without a floor are deferred cheaply while the index lags and are re-admitted once it is current. Lag and staleness are shown in Admin.
 
@@ -107,7 +117,7 @@ pg_dump "$DATABASE_URL" -Fc -f "backup-$(date +%F-%H%M).dump"
 pm2 stop shopify-kiotviet-worker shopify-kiotviet-scheduler shopify-kiotviet-web
 # install the reviewed release (git pull / rsync)
 npm ci
-npx tsx --env-file=.env.production scripts/migrate.ts        # applies 010, 011 and 012 if not yet applied
+npx tsx --env-file=.env.production scripts/migrate.ts        # applies 010–013 if not yet applied
 npm run typecheck && npm test && npm run build
 NODE_OPTIONS="--env-file=/var/www/shopify-kiotviet/.env.production" pm2 restart ecosystem.config.js --update-env
 pm2 save
@@ -118,14 +128,14 @@ npx tsx --env-file=.env.production scripts/benchmark-invoice-lookup.ts --iterati
 npx tsx --env-file=.env.production scripts/verify-kiotviet-invoice-order-filter.ts            # add --record to store the result
 ```
 
-Migration 012 creates three plain indexes inside the migration transaction. On these table sizes that takes seconds, but it locks writes to `invoice_mappings` and `order_mappings` while building, so run it with the worker stopped (as above). Rollback: `database/rollback/012_invoice_lookup_indexes.down.sql` (indexes only). The worker setting `INVOICE_UNCERTAIN_POLL_MS` (optional, default `1000,3000,8000`) goes in `.env.production`.
+Migration 012 creates three plain indexes inside the migration transaction. On these table sizes that takes seconds, but it locks writes to `invoice_mappings` and `order_mappings` while building, so run it with the worker stopped (as above). Rollback: `database/rollback/012_invoice_lookup_indexes.down.sql` (indexes only). Migration 013 drops `invoice_mappings_updated_at_idx` (rollback `013_drop_invoice_updated_at_index.down.sql` recreates it). The worker setting `INVOICE_UNCERTAIN_POLL_MS` (optional, default exponential `1000,2000,4000,8000`) goes in `.env.production`.
 
 Then, in Admin → Settings:
 
 1. Keep `shopify_fulfilled` and `USD`. Tick **Product-Only Invoicing** and save.
 2. Decide with accounting about **Allow Unverified Prepayment Inheritance**. Enable it only after reading and ticking the confirmation.
 3. Watch the first new Paid + Fulfilled order with the queries below: one invoice, `paymentVerification.status`, `stockVerified`, `shopifyStockSynchronized`, `timings`.
-4. If its payment shows `mismatch`, turn the policy off and settle that invoice in KiotViet manually. From then on, new orders are blocked again instead of being created unpaid.
+4. If its payment shows `mismatch`, the invoice is still `created` and stock is synced. Accounting settles the KiotViet balance manually. If that is not acceptable for future orders, turn the policy off; new prepaid orders are then blocked again instead of being invoiced.
 
 Rollback, fastest first:
 
@@ -163,7 +173,7 @@ SELECT count(*),percentile_cont(0.95) WITHIN GROUP (ORDER BY (l->>'localMs')::fl
   percentile_cont(0.95) WITHIN GROUP (ORDER BY (l->>'totalMs')::float8) AS total_p95_ms,
   avg((l->>'apiCalls')::float8) AS api_calls_avg, count(*) FILTER (WHERE l->>'freshness' IN ('reused','joined')) AS shared
 FROM invoice_mappings, LATERAL (VALUES (reconciliation->'duplicateLookup'),(reconciliation->'prePostLookup')) v(l)
-WHERE updated_at>now()-interval '7 days' AND jsonb_typeof(l)='object';
+WHERE invoiced_at>now()-interval '7 days' AND jsonb_typeof(l)='object';
 
 -- Invoices linked automatically after a timed-out POST
 SELECT shopify_order_id,kiotviet_invoice_code,status,reconciliation->'uncertainPost' FROM invoice_mappings WHERE reconciliation ? 'uncertainPost';
@@ -208,7 +218,7 @@ npx tsx --env-file=.env.production scripts/recover-kiotviet-invoice.ts 710736488
 ```
 
 - **#1082 / DH031389**: the dry run is expected to show invoice 202, Shopify paid 210.42, `processing_fee_excluded 8.42` and additional payment 0.
-  - With `allowUnverifiedPrepaymentInheritance` on, the plan is `create one invoice`. Only then would `--apply` create it, and its payment is then verified or flagged `needs_review`.
+  - With `allowUnverifiedPrepaymentInheritance` on, the plan is `create one invoice`. Only then would `--apply` create it, and its payment is then recorded as `verified` or `mismatch` (informational; status follows identity, lines and stock).
   - Otherwise it stays `blocked: prepayment_inheritance_unverified`.
 - **#1071 / DH031121**: invoice 154 against a 164 prepayment, with `shipping_excluded 10`. Always `blocked: prepayment_exceeds_invoice`. Under `prepaymentExceedsInvoicePolicy: manual_override` it can go through the admin override (stays `needs_review`). The 10 USD is never changed, deleted, duplicated or refunded.
 
@@ -216,7 +226,7 @@ These expectations come from unit-test fixtures built from the reported totals (
 
 ## Remaining risks
 
-1. **Unverified inheritance is a business decision.** With the policy on, an invoice can be created before KiotViet's behavior is known. If KiotViet does not carry the prepayment, every such invoice shows unpaid in KiotViet and is `needs_review` until accounting settles it. The first invoice reveals the behavior: check it before leaving the policy on.
+1. **Unverified inheritance is a business decision.** With the policy on, an invoice can be created before KiotViet's behavior is known. If KiotViet does not carry the prepayment, every such invoice is `created` but shows unpaid in KiotViet (`paymentVerification.status = mismatch`) until accounting settles it. The first invoice reveals the behavior: check it before leaving the policy on.
 2. **The floor scan and the index both assume** KiotViet allocates increasing invoice ids and honors `orderBy=id` (checked on every page). A staff invoice created between the final check and the POST is still possible (see `docs/fulfillment-invoices.md`).
 3. **Overpaid historical orders (#1071)**, **added product tax** and **KiotViet orders that already carry a surcharge** still need people.
 4. **Latency targets are unmeasured.** Real values depend on KiotViet/Shopify response times and rate limits; Admin now shows them.

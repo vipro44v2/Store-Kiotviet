@@ -214,6 +214,11 @@ export async function finalizeInvoice(
     // Kept visible for accounting, but not a creation gate in Product-Only mode.
     reconciliation.financiallyReconciled = checks.financiallyReconciled && (reconciliation.productOnly as { financiallyReconciled?: boolean } | undefined)?.financiallyReconciled === true;
     delete checks.financiallyReconciled;
+    // Shopify Paid decides that the customer paid. KiotViet's view of the invoice payment is
+    // informational here: it is recorded below (paymentVerification) and logged, never a
+    // reason for needs_review, and never "fixed" by sending a payment.
+    delete checks.payment;
+    delete checks.paymentRecords;
     // The invoice was sent with totalPayment 0: did KiotViet carry the order prepayment?
     // Recorded exactly as KiotViet reports it; never repaired by another invoice or payment.
     const money = (value: number) => (value / 100).toFixed(2);
@@ -226,11 +231,20 @@ export async function finalizeInvoice(
     if (remainingCents !== 0) paymentDiscrepancies.push(`remaining balance ${money(remainingCents)} on an invoice of ${money(cents(detail.total))}`);
     reconciliation.paymentVerification = {
       status: paymentDiscrepancies.length ? "mismatch" : "verified",
+      blocking: false,
+      customerPaymentSource: "shopify",
       policy: (reconciliation.productOnly as { prepaymentPolicy?: string } | undefined)?.prepaymentPolicy ?? null,
+      // Exactly what KiotViet reports for this invoice; never claimed paid when it is not.
+      kiotVietInvoiceFullyPaid: paidCents === cents(detail.total) && remainingCents === 0 && rowsCents === paidCents,
       expectedPaid: expectedPayment / 100, invoiceTotalPayment: paidCents / 100, paymentRowsTotal: rowsCents === null ? null : rowsCents / 100,
       invoiceTotal: cents(detail.total) / 100, remainingBalance: remainingCents / 100, discrepancies: paymentDiscrepancies,
       checkedAt: new Date().toISOString(),
     };
+    if (paymentDiscrepancies.length)
+      await log("warn", "KiotViet invoice payment differs from the carried prepayment (informational)", {
+        action: "kiotviet_invoice_payment_discrepancy", provider: "kiotviet", entityType: "invoice", entityId: row.shopify_order_id,
+        kiotVietInvoiceId: detail.id, kiotVietInvoiceCode: detail.code, paymentVerification: reconciliation.paymentVerification,
+      });
   }
   reconciliation.checks = checks;
   if (reconciliation.branchId && reconciliation.expectedLines?.length) {
@@ -252,8 +266,9 @@ export async function finalizeInvoice(
     WHERE shopify_order_id=$1 AND (kiotviet_invoice_id IS NULL OR kiotviet_invoice_id=$2) RETURNING shopify_order_id`,
     [
       row.shopify_order_id, detail.id, detail.code, ok ? "created" : "needs_review", JSON.stringify(reconciliation),
-      ok ? null : `${paymentDiscrepancies.length ? "payment_inheritance_mismatch" : "invoice_verification_failed"}: KiotViet invoice ${detail.code} does not match: ${failed.join(", ")}${paymentDiscrepancies.length ? ` (payment: ${paymentDiscrepancies.join("; ")})` : ""}`,
-      ok ? null : paymentDiscrepancies.length ? "verify_payment" : "verify_invoice",
+      // Payment discrepancies never decide the status; they are only mentioned alongside a real failure.
+      ok ? null : `invoice_verification_failed: KiotViet invoice ${detail.code} does not match: ${failed.join(", ")}${paymentDiscrepancies.length ? ` (also informational payment differences: ${paymentDiscrepancies.join("; ")})` : ""}`,
+      ok ? null : "verify_invoice",
       options.source ?? null, kiotVietOrder.id, kiotVietOrder.code,
     ],
   );

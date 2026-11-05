@@ -51,7 +51,7 @@ export function InvoiceAutomationStatus({ orders, index, stats }: {
         <dt>Kiểm tra trùng hóa đơn (7 ngày)</dt>
         <dd>
           {lookup && lookup.samples
-            ? `PostgreSQL P95 ${ms(lookup.localP95Ms)} · tổng trung bình ${ms(lookup.totalAvgMs)} · P95 ${ms(lookup.totalP95Ms)} · ${lookup.apiCallsAvg ?? "—"} request KiotViet/lần · dùng chung xác nhận ${Math.round((lookup.shared / lookup.samples) * 100)}% của ${lookup.samples}`
+            ? `PostgreSQL P95 ${ms(lookup.localP95Ms)} · làm mới chỉ mục P95 ${ms(lookup.refreshP95Ms)} · tổng P50 ${ms(lookup.totalP50Ms)} · trung bình ${ms(lookup.totalAvgMs)} · P95 ${ms(lookup.totalP95Ms)} · ${lookup.apiCallsAvg ?? "—"} request KiotViet/lần · dùng chung xác nhận ${Math.round((lookup.shared / lookup.samples) * 100)}% của ${lookup.samples}`
             : "chưa có dữ liệu"}
         </dd>
       </dl>

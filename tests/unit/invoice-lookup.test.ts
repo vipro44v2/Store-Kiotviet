@@ -10,6 +10,9 @@ const m = vi.hoisted(() => ({
   failAfter: Infinity,
   calls: 0,
   repositions: 0,
+  pageWrites: 0,
+  snapshots: 0,
+  failPageWrite: false,
   sql: [] as string[],
   hintMode: "none" as "none" | "ignored",
   appInvoices: [] as Array<{ invoice_id: number; order_code: string }>,
@@ -23,10 +26,13 @@ vi.mock("@/lib/db/client", () => ({
     const s = m.state;
     m.sql.push(sql);
     if (sql.startsWith("DELETE FROM kiotviet_invoice_index")) { m.index.delete(Number(params[0])); return []; }
-    if (sql.startsWith("SELECT clock_timestamp()")) return [{ now: new Date() }];
-    if (sql.includes("FROM invoice_mappings") && sql.includes("UNION SELECT invoice_id::text FROM kiotviet_invoice_index"))
-      return [...m.appInvoices.filter((row) => row.order_code === params[1]).map((row) => ({ invoice_id: String(row.invoice_id) })),
-        ...[...m.index].filter(([, row]) => row.order_code === params[1]).map(([id]) => ({ invoice_id: String(id) }))];
+    if (sql === "SELECT clock_timestamp() AS now") return [{ now: new Date() }];
+    if (sql.startsWith("SELECT clock_timestamp() AS db_now")) {
+      m.snapshots++;
+      const candidates = [...new Set([...m.appInvoices.filter((row) => row.order_code === params[1]).map((row) => String(row.invoice_id)),
+        ...[...m.index].filter(([, row]) => row.order_code === params[1]).map(([id]) => String(id))])];
+      return [{ db_now: new Date(), ...s, candidates }];
+    }
     if (sql.startsWith("SELECT value FROM system_settings")) return m.filterEvidence ? [{ value: m.filterEvidence }] : [];
     if (sql.startsWith("SELECT scanned_count")) return [{ ...s }];
     if (sql.startsWith("UPDATE kiotviet_invoice_index_state SET scanned_count=0")) {
@@ -52,6 +58,15 @@ vi.mock("@/lib/db/client", () => ({
     if (sql.startsWith("UPDATE kiotviet_invoice_index_state SET last_error")) {
       if (s.generation === params[0]) s.last_error = String(params[1]);
       return [];
+    }
+    if (sql.startsWith("WITH advanced AS (")) {
+      m.pageWrites++;
+      if (m.failPageWrite) { m.failPageWrite = false; throw new Error("connection terminated (worker crash)"); }
+      if (s.generation !== params[0] || s.scanned_count !== params[1]) return [];
+      const ids = params[7] as number[], codes = params[8] as string[], orders = params[9] as Array<string | null>, statuses = params[10] as Array<number | null>;
+      ids.forEach((id, i) => m.index.set(Number(id), { invoice_code: codes[i], order_code: orders[i], status: statuses[i] }));
+      Object.assign(s, { scanned_count: params[2], last_invoice_id: params[3] == null ? null : String(params[3]), remote_total: params[4], current_as_of: params[5] ? params[6] : s.current_as_of, last_error: null });
+      return [{ ...s, saved_count: new Set(ids).size }];
     }
     if (sql.startsWith("UPDATE kiotviet_invoice_index_state SET scanned_count=$3")) {
       if (s.generation !== params[0] || s.scanned_count !== params[1]) return [];
@@ -101,6 +116,9 @@ beforeEach(() => {
   m.failAfter = Infinity;
   m.calls = 0;
   m.repositions = 0;
+  m.pageWrites = 0;
+  m.snapshots = 0;
+  m.failPageWrite = false;
   m.sql = [];
   m.hintMode = "none";
   m.appInvoices = [];
@@ -188,7 +206,8 @@ describe("KiotViet invoice index (13,215 invoices)", () => {
 describe("findKiotVietInvoicesForOrder", () => {
   it("proves absence for a retailer with 13,215 invoices once the index is current", async () => {
     await advanceInvoiceIndex({ maxPages: 200 });
-    await expect(findKiotVietInvoicesForOrder({ id: 5555, code: "DH-NOT-INVOICED" })).resolves.toMatchObject({ invoices: [], complete: true, method: "index" });
+    const result = await findKiotVietInvoicesForOrder({ id: 5555, code: "DH-NOT-INVOICED" });
+    expect(result).toMatchObject({ invoices: [], complete: true, method: "index" });
   });
 
   it("finds an existing invoice by orderCode and re-reads its current status", async () => {
@@ -343,5 +362,107 @@ describe("fast duplicate lookup", () => {
       return serve(url);
     });
     await expect(findKiotVietInvoicesForOrder({ id: 5555, code: "DH-NEW" })).resolves.toMatchObject({ complete: true, invoices: [] });
+  });
+});
+
+describe("index page writes (batch UPSERT + checkpoint, one statement)", () => {
+  it("writes each page with one statement that carries every invoice of the page", async () => {
+    await advanceInvoiceIndex({ maxPages: 3 });
+    expect(m.pageWrites).toBe(3);
+    expect(m.sql.filter((sql) => sql.startsWith("INSERT INTO kiotviet_invoice_index"))).toHaveLength(0);
+    expect(m.index.size).toBe(100 + 99 + 99);
+    expect(m.state).toMatchObject({ scanned_count: 298, last_invoice_id: "298" });
+    expect(m.index.get(150)).toMatchObject({ invoice_code: "HD150", order_code: "DH150", status: 1 });
+  });
+
+  it("a crash during the page write leaves checkpoint and rows unchanged; the next run resumes exactly", async () => {
+    await advanceInvoiceIndex({ maxPages: 2 });
+    const before = { ...m.state }, indexed = m.index.size;
+    m.failPageWrite = true;
+    await expect(advanceInvoiceIndex({ maxPages: 1 })).rejects.toThrow("worker crash");
+    expect(m.state).toEqual(before);
+    expect(m.index.size).toBe(indexed);
+    await expect(advanceInvoiceIndex({ maxPages: 200 })).resolves.toMatchObject({ current: true, scanned: 13_215 });
+    expect(m.index.size).toBe(13_215);
+  });
+
+  it("concurrent index runners never corrupt progress (guarded checkpoint, rows only with it)", async () => {
+    const results = await Promise.all([advanceInvoiceIndex({ maxPages: 200 }), advanceInvoiceIndex({ maxPages: 200 }), advanceInvoiceIndex({ maxPages: 200 })]);
+    expect(results.some((result) => result.current)).toBe(true);
+    expect(m.state).toMatchObject({ scanned_count: 13_215, remote_total: 13_215, last_invoice_id: "13215", generation: 1 });
+    expect(m.index.size).toBe(13_215);
+    expect(m.remote.every((invoice) => m.index.has(invoice.id))).toBe(true);
+  });
+
+  it("stores cancelled invoices with their status (the lookup re-reads candidates anyway)", async () => {
+    m.remote[4].status = 2;
+    await advanceInvoiceIndex({ maxPages: 1 });
+    expect(m.index.get(5)).toMatchObject({ status: 2 });
+  });
+
+  it("the tail check on a current index writes no invoice rows when nothing is new", async () => {
+    await advanceInvoiceIndex({ maxPages: 200 });
+    m.pageWrites = 0;
+    await advanceInvoiceIndex({ maxPages: 1 });
+    expect(m.pageWrites).toBe(1); // checkpoint (current_as_of) only, empty batch
+    expect(m.index.size).toBe(13_215);
+  });
+});
+
+describe("lookup round trips and refresh sharing", () => {
+  const listCalls = () => m.get.mock.calls.filter(([url]) => String(url).startsWith("/invoices?orderBy")).length;
+  beforeEach(async () => {
+    await advanceInvoiceIndex({ maxPages: 200 });
+    m.state.current_as_of = new Date(Date.now() - 1_000).toISOString();
+    m.get.mockClear();
+    m.sql = [];
+  });
+
+  it("the local step is one statement (clock + checkpoint + candidates)", async () => {
+    await findKiotVietInvoicesForOrder({ id: 5555, code: "DH-NEW" });
+    expect(m.snapshots).toBe(1);
+    // The local step is the first statement; nothing else is read before the freshness refresh.
+    expect(m.sql[0].startsWith("SELECT clock_timestamp() AS db_now")).toBe(true);
+    // No extra index candidate query when the freshness check appended nothing.
+    expect(m.sql.some((sql) => sql.includes("FROM kiotviet_invoice_index WHERE order_code=$1"))).toBe(false);
+  });
+
+  it("lookups that start during an older refresh share one queued refresh (2 requests, not 3)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let first = true;
+    m.get.mockImplementation(async (url: string) => {
+      if (first && url.includes("orderDirection=Asc")) { first = false; await gate; }
+      return serve(url);
+    });
+    const a = findKiotVietInvoicesForOrder({ id: 1, code: "DH-A" });
+    await vi.waitFor(() => expect(listCalls()).toBe(1));
+    await new Promise((resolve) => setTimeout(resolve, 5)); // B and C begin after A's refresh started
+    const b = findKiotVietInvoicesForOrder({ id: 2, code: "DH-B" });
+    const c = findKiotVietInvoicesForOrder({ id: 3, code: "DH-C" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    release();
+    const results = await Promise.all([a, b, c]);
+    expect(results.every((result) => result.complete)).toBe(true);
+    expect(results.map((result) => result.metrics?.freshness)).toEqual(["fetched", "queued", "queued"]);
+    expect(listCalls()).toBe(2);
+  });
+
+  it("an invoice created during the older refresh is still found by the queued one", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let first = true;
+    m.get.mockImplementation(async (url: string) => {
+      if (first && url.includes("orderDirection=Asc")) { first = false; const page = serve(url); await gate; return page; }
+      return serve(url);
+    });
+    const a = findKiotVietInvoicesForOrder({ id: 1, code: "DH-A" });
+    await vi.waitFor(() => expect(listCalls()).toBe(1));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    m.remote.push({ id: 20_500, code: "HD20500", orderCode: "DH-LATE", status: 1 }); // created after A's page was read
+    const late = findKiotVietInvoicesForOrder({ id: 9, code: "DH-LATE" });
+    release();
+    await a;
+    await expect(late).resolves.toMatchObject({ complete: true, invoices: [{ id: 20_500 }], metrics: { freshness: "queued" } });
   });
 });

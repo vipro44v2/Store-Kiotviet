@@ -642,10 +642,15 @@ export async function applyInvoiceRecovery(
   };
 }
 
-/** Delays (ms) before each search after an uncertain POST; INVOICE_UNCERTAIN_POLL_MS="1000,3000,8000". */
+/**
+ * Delays (ms) before each search after an uncertain POST: bounded exponential backoff
+ * 1 s, 2 s, 4 s, 8 s (≈15 s in total). INVOICE_UNCERTAIN_POLL_MS="1000,2000,4000,8000"
+ * overrides it (at most 10 searches, each delay at most 60 s).
+ */
 export function uncertainPollDelays() {
-  const configured = String(process.env.INVOICE_UNCERTAIN_POLL_MS ?? "1000,3000,8000").split(",").map(Number);
-  return configured.filter((delay) => Number.isFinite(delay) && delay >= 0).slice(0, 10);
+  const configured = process.env.INVOICE_UNCERTAIN_POLL_MS;
+  const delays = configured === undefined ? [0, 1, 2, 3].map((attempt) => 1000 * 2 ** attempt) : configured.split(",").map(Number);
+  return delays.filter((delay) => Number.isFinite(delay) && delay >= 0).map((delay) => Math.min(delay, 60_000)).slice(0, 10);
 }
 
 /**
@@ -676,10 +681,17 @@ async function settleUncertainInvoice(
     }
     if (active.length === 1) {
       const found = active[0];
-      await query(
-        "UPDATE invoice_mappings SET kiotviet_invoice_id=$3,kiotviet_invoice_code=$4,status='needs_review',last_error='Invoice found after an uncertain POST; verification pending',failure_stage='verify_invoice',invoiced_at=now(),updated_at=now() WHERE shopify_order_id=$1 AND claim_token=$2",
-        [orderId, token, found.id, found.code],
-      );
+      // Same advisory lock as the claim, and only while this attempt still owns the row with
+      // no invoice ID: a concurrent link (another worker re-planning) can never also link one.
+      const owned = await transaction(async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`kiotviet-invoice:${orderId}`]);
+        const result = await client.query(
+          "UPDATE invoice_mappings SET kiotviet_invoice_id=$3,kiotviet_invoice_code=$4,status='needs_review',last_error='Invoice found after an uncertain POST; verification pending',failure_stage='verify_invoice',invoiced_at=now(),updated_at=now() WHERE shopify_order_id=$1 AND claim_token=$2 AND kiotviet_invoice_id IS NULL RETURNING shopify_order_id",
+          [orderId, token, found.id, found.code],
+        );
+        return result.rows.length > 0;
+      });
+      if (!owned) return { applied: false, message: `Invoice ${found.code} found after the timeout, but the attempt was already settled elsewhere; nothing changed` };
       const settledReconciliation = { ...reconciliation, uncertainPost: { linkedInvoice: found.code, lookup: lookup.metrics ?? null },
         ...(!lookup.complete ? { validationReasons: [...(reconciliation.validationReasons as string[] ?? []), "invoice_lookup_incomplete"] } : {}) };
       try {

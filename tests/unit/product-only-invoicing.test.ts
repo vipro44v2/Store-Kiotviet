@@ -72,9 +72,9 @@ function run(sql: string, params: unknown[]): Record<string, unknown>[] {
   }
   if (sql.startsWith("UPDATE invoice_mappings SET last_error")) { Object.assign(row, { last_error: params[2], updated_at: now() }); return []; }
   if (sql.startsWith("UPDATE invoice_mappings SET kiotviet_invoice_id=$3")) {
-    if (row.claim_token !== params[1]) return [];
+    if (row.claim_token !== params[1] || (sql.includes("kiotviet_invoice_id IS NULL") && row.kiotviet_invoice_id)) return [];
     Object.assign(row, { kiotviet_invoice_id: String(params[2]), kiotviet_invoice_code: params[3], status: "needs_review", updated_at: now() });
-    return [];
+    return [{ shopify_order_id: row.shopify_order_id }];
   }
   if (sql.startsWith("UPDATE invoice_mappings SET kiotviet_invoice_id=$2")) {
     if (row.kiotviet_invoice_id && row.kiotviet_invoice_id !== String(params[1])) return [];
@@ -420,7 +420,6 @@ describe("new product-only orders", () => {
 
   it.each([
     ["the invoice carried a surcharge", { invoiceOrderSurcharges: [{ surchargeId: 3, price: 10 }], total: 212 }, "total"],
-    ["the prepayment was not inherited", { totalPayment: 0, payments: [] }, "payment"],
     ["the invoice lines differ", { invoiceDetails: [{ productId: 108201, quantity: 1, price: 101 }] }, "lines"],
   ])("goes to needs_review when %s", async (_label, change, check) => {
     mocks.invoiceDetail.mockResolvedValue(invoiceDetail(fixture, change));
@@ -511,15 +510,19 @@ describe("#1082 with Allow Unverified Prepayment Inheritance (no sandbox evidenc
     ["partly inherited", { totalPayment: 150, payments: [{ amount: 150 }] }, ["invoice reports 150.00 paid", "remaining balance 52.00"]],
     ["inconsistent payment records", { payments: [{ amount: 100 }] }, ["payment records total 100.00 but the invoice reports 202.00 paid"]],
     ["no payment records", { payments: null }, ["invoice returned no payment records"]],
-  ])("keeps the invoice as needs_review with the exact discrepancy when the payment is %s", async (_label, change, expected) => {
+  ])("creates the invoice (payment is informational) and records the exact discrepancy when the payment is %s", async (_label, change, expected) => {
     allow();
     mocks.invoiceDetail.mockResolvedValue(invoiceDetail(fixture, change));
+    const { log } = await import("@/lib/logger");
     await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
     const row = invoiceRow();
-    expect(row).toMatchObject({ status: "needs_review", kiotviet_invoice_id: "8001" });
-    expect(row.last_error).toMatch(/^payment_inheritance_mismatch: /);
-    expect(row.reconciliation.paymentVerification).toMatchObject({ status: "mismatch",
-      discrepancies: expect.arrayContaining(expected.map((text) => expect.stringContaining(text))) });
+    // Identity, lines, total and stock were verified: created. Shopify Paid decides the customer paid.
+    expect(row).toMatchObject({ status: "created", kiotviet_invoice_id: "8001", last_error: null });
+    expect(row.reconciliation.paymentVerification).toMatchObject({ status: "mismatch", blocking: false, customerPaymentSource: "shopify",
+      kiotVietInvoiceFullyPaid: false, discrepancies: expect.arrayContaining(expected.map((text) => expect.stringContaining(text))) });
+    expect((row.reconciliation as unknown as { checks: Record<string, boolean> }).checks).not.toHaveProperty("payment");
+    // The financial warning stays in the logs.
+    expect(vi.mocked(log)).toHaveBeenCalledWith("warn", expect.stringContaining("payment differs"), expect.objectContaining({ action: "kiotviet_invoice_payment_discrepancy" }));
     // Never repaired by creating the invoice again.
     await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
     expect(mocks.createInvoice).toHaveBeenCalledOnce();
@@ -610,5 +613,69 @@ describe("invoice POST timeout: search and link, never resend", () => {
     mocks.findInvoices.mockResolvedValue({ ...empty, metrics });
     await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
     expect(mocks.invoice?.reconciliation).toMatchObject({ duplicateLookup: metrics, prePostLookup: metrics });
+  });
+});
+
+describe("Product-Only status: payment is informational, technical checks still decide", () => {
+  const allow = () => Object.assign(mocks.orderSettings, { allowUnverifiedPrepaymentInheritance: true, acknowledgeUnverifiedPrepaymentRisk: true });
+
+  it("#1082 not inherited by KiotViet: created, with the unpaid balance recorded as KiotViet reports it", async () => {
+    allow();
+    mocks.invoiceDetail.mockResolvedValue(invoiceDetail(fixture, { totalPayment: 0, payments: [] }));
+    const plan = await planInvoiceRecovery(ORDER_1082.orderId);
+    expect(plan.action).toMatchObject({ kind: "create_invoice", input: { totalPayment: 0 } });
+    await applyInvoiceRecovery(plan);
+    expect(mocks.invoice).toMatchObject({ status: "created", reconciliation: expect.objectContaining({
+      stockVerified: true,
+      paymentVerification: expect.objectContaining({ status: "mismatch", invoiceTotalPayment: 0, remainingBalance: 202, kiotVietInvoiceFullyPaid: false }),
+    }) });
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+  });
+
+  it("still needs_review when stock movement is unverified, whatever the payment says", async () => {
+    allow();
+    mocks.createInvoice.mockResolvedValue({ id: 8001, code: "HD8001" }); // stock did not move
+    mocks.invoiceDetail.mockResolvedValue(invoiceDetail(fixture, { totalPayment: 0, payments: [] }));
+    await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    const row = mocks.invoice as { status: string; last_error: string };
+    expect(row.status).toBe("needs_review");
+    expect(row.last_error).toMatch(/^invoice_verification_failed: .*stock_movement_unverified.*also informational payment differences/);
+  });
+
+  it("still needs_review when the invoice lines or identity do not match", async () => {
+    allow();
+    mocks.invoiceDetail.mockResolvedValue(invoiceDetail(fixture, { orderCode: "DH-OTHER" }));
+    await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(mocks.invoice).toMatchObject({ status: "needs_review", reconciliation: expect.objectContaining({ checks: expect.objectContaining({ orderCode: false }) }) });
+  });
+});
+
+describe("timeout recovery ownership", () => {
+  it("never links a second invoice when the attempt was already settled by another worker", async () => {
+    Object.assign(mocks.orderSettings, { allowUnverifiedPrepaymentInheritance: true, acknowledgeUnverifiedPrepaymentRisk: true });
+    mocks.createInvoice.mockImplementation(async () => {
+      // While this POST is in doubt another worker already linked invoice 7000 to the row.
+      Object.assign(mocks.invoice!, { kiotviet_invoice_id: "7000", kiotviet_invoice_code: "HD7000" });
+      throw new UncertainResultError("timeout");
+    });
+    mocks.findInvoices.mockResolvedValueOnce({ invoices: [], complete: true }).mockResolvedValueOnce({ invoices: [], complete: true })
+      .mockResolvedValue({ invoices: [{ id: 8001, code: "HD8001", orderCode: "DH031389", status: 1 }], complete: true });
+    const result = await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(result).toMatchObject({ applied: false, message: expect.stringContaining("already settled elsewhere") });
+    expect(mocks.invoice).toMatchObject({ kiotviet_invoice_id: "7000" });
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+  });
+
+  it("searches with bounded exponential backoff by default", async () => {
+    const { uncertainPollDelays } = await import("@/lib/recovery/kiotviet-invoice-recovery");
+    const saved = process.env.INVOICE_UNCERTAIN_POLL_MS;
+    delete process.env.INVOICE_UNCERTAIN_POLL_MS;
+    try {
+      expect(uncertainPollDelays()).toEqual([1000, 2000, 4000, 8000]);
+      process.env.INVOICE_UNCERTAIN_POLL_MS = "500,999999,-1,x";
+      expect(uncertainPollDelays()).toEqual([500, 60000]);
+    } finally {
+      process.env.INVOICE_UNCERTAIN_POLL_MS = saved;
+    }
   });
 });
