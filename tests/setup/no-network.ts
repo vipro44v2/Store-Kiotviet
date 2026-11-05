@@ -8,3 +8,5 @@ const guarded: typeof fetch = async (input) => {
   throw new Error(`Network access is disabled in tests (attempted ${url}); mock the provider client instead`);
 };
 globalThis.fetch = guarded;
+// No real waiting between the post-timeout invoice searches (two immediate searches).
+process.env.INVOICE_UNCERTAIN_POLL_MS ??= "0,0";

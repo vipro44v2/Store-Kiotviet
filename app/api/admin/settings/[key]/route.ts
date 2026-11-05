@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { adminApiErrorResponse, requireAdmin } from "@/lib/auth/middleware";
+import { adminApiErrorResponse, requireAdmin, requireAdminUser } from "@/lib/auth/middleware";
 import { assertTrustedOrigin } from "@/lib/security/csrf";
 import { query } from "@/lib/db/client";
 import { getAllKiotVietCategories } from "@/lib/kiotviet/products";
@@ -52,6 +52,23 @@ export async function PUT(
     if (key === "orders") {
       // Derive activation time in PostgreSQL, never trust a browser-supplied cutoff.
       delete value.invoiceTriggerEnabledAt;
+      // Who accepted the unverified-prepayment risk, and when, is recorded by the server only.
+      delete value.unverifiedPrepaymentAcceptedAt;
+      delete value.unverifiedPrepaymentAcceptedBy;
+      const admin = await requireAdminUser();
+      const [current] = await query<{ value: Record<string, unknown> }>("SELECT value FROM system_settings WHERE key='orders'");
+      const wasAllowed = current?.value?.allowUnverifiedPrepaymentInheritance === true;
+      if (value.allowUnverifiedPrepaymentInheritance === true) {
+        value.unverifiedPrepaymentAcceptedAt = wasAllowed ? current.value.unverifiedPrepaymentAcceptedAt : new Date().toISOString();
+        value.unverifiedPrepaymentAcceptedBy = wasAllowed ? current.value.unverifiedPrepaymentAcceptedBy : admin;
+      } else delete value.acknowledgeUnverifiedPrepaymentRisk; // re-enabling asks for confirmation again
+      if (wasAllowed !== (value.allowUnverifiedPrepaymentInheritance === true))
+        await query(
+          "INSERT INTO audit_logs(actor_type,actor,action,entity_type,entity_id,before_data,after_data) VALUES('admin',$1,$2,'system_settings','orders',$3,$4)",
+          [admin, value.allowUnverifiedPrepaymentInheritance === true ? "unverified_prepayment_inheritance_enabled" : "unverified_prepayment_inheritance_disabled",
+            JSON.stringify({ allowUnverifiedPrepaymentInheritance: wasAllowed }),
+            JSON.stringify({ allowUnverifiedPrepaymentInheritance: value.allowUnverifiedPrepaymentInheritance, acknowledged: value.acknowledgeUnverifiedPrepaymentRisk === true })],
+        );
       await query(
         `INSERT INTO system_settings(key,value,updated_at) VALUES('orders',$1::jsonb || jsonb_build_object('invoiceTriggerEnabledAt',now()),now())
         ON CONFLICT(key) DO UPDATE SET value=$1::jsonb || jsonb_build_object('invoiceTriggerEnabledAt',

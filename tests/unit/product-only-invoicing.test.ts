@@ -65,6 +65,11 @@ function run(sql: string, params: unknown[]): Record<string, unknown>[] {
     Object.assign(row, { status: params[3], claim_token: null, last_error: params[2], failure_stage: params[4], updated_at: now() });
     return [];
   }
+  if (sql.startsWith("UPDATE invoice_mappings SET status='needs_review'")) {
+    if (row.claim_token !== params[1] || row.kiotviet_invoice_id) return [];
+    Object.assign(row, { status: "needs_review", claim_token: null, last_error: params[2], updated_at: now() });
+    return [];
+  }
   if (sql.startsWith("UPDATE invoice_mappings SET last_error")) { Object.assign(row, { last_error: params[2], updated_at: now() }); return []; }
   if (sql.startsWith("UPDATE invoice_mappings SET kiotviet_invoice_id=$3")) {
     if (row.claim_token !== params[1]) return [];
@@ -146,7 +151,7 @@ const ORDER_1071: Fixture = {
 const ORDER_1082: Fixture = {
   orderId: "7133915545784", name: "#1082", kiotVietOrderId: 31389, kiotVietOrderCode: "DH031389",
   lines: [{ sku: "1082-A", productId: 108201, quantity: 2, price: "101.00" }],
-  total: "202.00", prepaid: 202,
+  fee: "8.42", total: "210.42", prepaid: 202,
 };
 
 let fixture: Fixture;
@@ -223,6 +228,7 @@ describe("settings", () => {
   it("turns every exclusion on when the mode is explicitly selected", () => {
     expect(productOnlyPolicy({ productOnlyInvoicing: true })).toEqual({
       enabled: true, paymentSource: "shopify", ignoreFinancialMismatch: true, excludeShipping: true, excludeProcessingFees: true, excludeOtherSurcharges: true,
+      allowUnverifiedPrepaymentInheritance: false, prepaymentExceedsInvoicePolicy: "block",
     });
     expect(productOnlyPolicy({ productOnlyInvoicing: true, excludeShipping: false }).excludeShipping).toBe(false);
   });
@@ -257,24 +263,24 @@ describe("product-only invoice values", () => {
   });
 
   it("applies product discounts as a discounted unit price", () => {
-    const discounted = { ...ORDER_1082, lines: [{ sku: "1082-A", productId: 108201, quantity: 2, price: "101.00", discount: "20.00" }], total: "182.00" };
+    const discounted = { ...ORDER_1082, fee: undefined, lines: [{ sku: "1082-A", productId: 108201, quantity: 2, price: "101.00", discount: "20.00" }], total: "182.00" };
     const financials = prepare(shopifyOrder(discounted));
     expect(financials).toMatchObject({ eligible: true, merchandiseTotal: 182, unitPrices: { "100": 91 } });
   });
 
   it("blocks a discount that cannot be split into whole cents per unit", () => {
-    const odd = { ...ORDER_1082, lines: [{ sku: "1082-A", productId: 108201, quantity: 3, price: "10.00", discount: "10.00" }], total: "20.00" };
+    const odd = { ...ORDER_1082, fee: undefined, lines: [{ sku: "1082-A", productId: 108201, quantity: 3, price: "10.00", discount: "10.00" }], total: "20.00" };
     expect(prepare(shopifyOrder(odd)).reasons).toEqual([expect.stringContaining("discount_not_representable")]);
   });
 
   it("excludes tips and other non-product charges, but blocks a total below the merchandise", () => {
-    expect(prepare(shopifyOrder({ ...ORDER_1082, total: "209.00" }, { total_tip_received: "5.00" })).differences)
+    expect(prepare(shopifyOrder({ ...ORDER_1082, fee: undefined, total: "209.00" }, { total_tip_received: "5.00" })).differences)
       .toEqual(expect.arrayContaining([expect.objectContaining({ code: "tip_excluded", amount: 5 }), expect.objectContaining({ code: "other_charges_excluded", amount: 2 })]));
-    expect(prepare(shopifyOrder({ ...ORDER_1082, total: "190.00" })).reasons).toEqual([expect.stringContaining("amount_mismatch")]);
+    expect(prepare(shopifyOrder({ ...ORDER_1082, fee: undefined, total: "190.00" })).reasons).toEqual([expect.stringContaining("amount_mismatch")]);
   });
 
   it("keeps added product tax as a blocker (tax is not a surcharge)", () => {
-    const order = shopifyOrder(ORDER_1082);
+    const order = shopifyOrder({ ...ORDER_1082, fee: undefined });
     order.line_items[0].tax_lines = [{ price: "16.16" }];
     order.total_price = "218.16";
     expect(prepare(order).reasons).toEqual([expect.stringContaining("unsupported_tax")]);
@@ -309,7 +315,7 @@ describe("payment safety (no payment is ever created by the invoice)", () => {
   });
   it("only an exact, verified prepayment is safe, and then nothing is added", () => {
     expect(productOnlyPaymentDecision({ ...base, prepaidCents: 20_200, inheritanceVerified: false })).toMatchObject({ safe: false, reason: expect.stringContaining("prepayment_inheritance_unverified") });
-    expect(productOnlyPaymentDecision({ ...base, prepaidCents: 20_200 })).toEqual({ safe: true, additionalPayment: 0, expectedInvoicePayment: 202 });
+    expect(productOnlyPaymentDecision({ ...base, prepaidCents: 20_200 })).toEqual({ safe: true, additionalPayment: 0, expectedInvoicePayment: 202, prepaymentPolicy: "verified" });
   });
 });
 
@@ -332,7 +338,20 @@ describe("Shopify #1071 (KiotViet DH031121): 154 merchandise, 10 shipping, 164 p
     expect(mocks.createInvoice).not.toHaveBeenCalled();
   });
 
-  it("offers the manual override with totalPayment 0 and the difference visible", async () => {
+  it("is blocked even for the manual override under the default overpayment policy", async () => {
+    const { preview } = await previewInvoiceOverride(ORDER_1071.orderId, "admin");
+    expect(preview.blockers.map((item) => item.code)).toContain("prepayment_exceeds_invoice");
+    expect(preview.submitAllowed).toBe(false);
+  });
+
+  it("is never invoiced automatically, even with the unverified-inheritance policy", async () => {
+    Object.assign(mocks.orderSettings, { allowUnverifiedPrepaymentInheritance: true, acknowledgeUnverifiedPrepaymentRisk: true });
+    expect(blockedCodes(await planInvoiceRecovery(ORDER_1071.orderId))).toEqual(["prepayment_exceeds_invoice"]);
+    expect(mocks.createInvoice).not.toHaveBeenCalled();
+  });
+
+  it("offers the manual override with totalPayment 0 and the difference visible when the policy allows it", async () => {
+    mocks.orderSettings.prepaymentExceedsInvoicePolicy = "manual_override";
     const { preview } = await previewInvoiceOverride(ORDER_1071.orderId, "admin");
     expect(preview.warnings.map((warning) => warning.code)).toContain("prepayment_exceeds_invoice");
     expect(preview.payload).toMatchObject({ totalPayment: 0 });
@@ -366,7 +385,7 @@ describe("Shopify #1082 (KiotViet DH031389): 202 merchandise, 202 prepaid", () =
     expect(mocks.createInvoice).toHaveBeenCalledOnce();
     expect(mocks.invoice).toMatchObject({ status: "created", kiotviet_invoice_id: "8001", expected_total: "202",
       reconciliation: expect.objectContaining({ invoicingMode: "product_only", stockVerified: true, expectedPaymentTotal: 202,
-        productOnly: expect.objectContaining({ paymentSource: "shopify", shopifyPaid: 202, invoiceMerchandise: 202 }) }) });
+        productOnly: expect.objectContaining({ paymentSource: "shopify", shopifyPaid: 210.42, invoiceMerchandise: 202 }) }) });
     // Re-running never creates a second invoice.
     await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
     expect(mocks.createInvoice).toHaveBeenCalledOnce();
@@ -448,5 +467,148 @@ describe("new product-only orders", () => {
     arrange();
     expect(blockedCodes(await planInvoiceRecovery(NEW_ORDER.orderId))).toContain(code);
     expect(mocks.createInvoice).not.toHaveBeenCalled();
+  });
+});
+
+describe("#1082 with Allow Unverified Prepayment Inheritance (no sandbox evidence)", () => {
+  const allow = () => Object.assign(mocks.orderSettings, { allowUnverifiedPrepaymentInheritance: true, acknowledgeUnverifiedPrepaymentRisk: true });
+  const invoiceRow = () => mocks.invoice as { status: string; kiotviet_invoice_id: string; last_error: string | null;
+    reconciliation: { paymentVerification: Record<string, unknown>; productOnly: Record<string, unknown> } };
+
+  it("still blocks while the setting is off, or on without the recorded confirmation, or outside Product-Only", async () => {
+    expect(blockedCodes(await planInvoiceRecovery(ORDER_1082.orderId))).toEqual(["prepayment_inheritance_unverified"]);
+    mocks.orderSettings.allowUnverifiedPrepaymentInheritance = true;
+    expect(blockedCodes(await planInvoiceRecovery(ORDER_1082.orderId))).toEqual(["prepayment_inheritance_unverified"]);
+    // Strict invoicing ignores the setting entirely.
+    mocks.orderSettings = { defaultBranchId: 10, kiotVietCurrency: "USD", allowUnverifiedPrepaymentInheritance: true, acknowledgeUnverifiedPrepaymentRisk: true };
+    expect(blockedCodes(await planInvoiceRecovery(ORDER_1082.orderId))).toContain("prepayment_inheritance_unverified");
+  });
+
+  it("creates the 202 USD invoice with no new payment, only after duplicate checks pass", async () => {
+    allow();
+    const plan = await planInvoiceRecovery(ORDER_1082.orderId);
+    expect(plan.productOnly).toMatchObject({ invoiceMerchandise: 202, shopifyPaid: 210.42, kiotVietPrepaid: 202, additionalPayment: 0, prepaymentPolicy: "unverified_accepted" });
+    expect(plan.productOnly?.differences).toEqual(expect.arrayContaining([expect.objectContaining({ code: "processing_fee_excluded", amount: 8.42 })]));
+    expect(plan.action).toMatchObject({ kind: "create_invoice", input: { totalPayment: 0 } });
+    await applyInvoiceRecovery(plan);
+    // Duplicate lookup in the plan and again right before the POST.
+    expect(mocks.findInvoices).toHaveBeenCalledTimes(2);
+    expect(mocks.findInvoices.mock.invocationCallOrder[1]).toBeLessThan(mocks.createInvoice.mock.invocationCallOrder[0]);
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+  });
+
+  it("marks the payment verified when KiotViet carried the prepayment", async () => {
+    allow();
+    await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(invoiceRow()).toMatchObject({ status: "created", kiotviet_invoice_id: "8001", last_error: null });
+    expect(invoiceRow().reconciliation.paymentVerification).toMatchObject({
+      status: "verified", policy: "unverified_accepted", expectedPaid: 202, invoiceTotalPayment: 202, paymentRowsTotal: 202, remainingBalance: 0, discrepancies: [],
+    });
+  });
+
+  it.each([
+    ["not inherited", { totalPayment: 0, payments: [] }, ["invoice reports 0.00 paid, expected the carried prepayment 202.00", "remaining balance 202.00"]],
+    ["partly inherited", { totalPayment: 150, payments: [{ amount: 150 }] }, ["invoice reports 150.00 paid", "remaining balance 52.00"]],
+    ["inconsistent payment records", { payments: [{ amount: 100 }] }, ["payment records total 100.00 but the invoice reports 202.00 paid"]],
+    ["no payment records", { payments: null }, ["invoice returned no payment records"]],
+  ])("keeps the invoice as needs_review with the exact discrepancy when the payment is %s", async (_label, change, expected) => {
+    allow();
+    mocks.invoiceDetail.mockResolvedValue(invoiceDetail(fixture, change));
+    await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    const row = invoiceRow();
+    expect(row).toMatchObject({ status: "needs_review", kiotviet_invoice_id: "8001" });
+    expect(row.last_error).toMatch(/^payment_inheritance_mismatch: /);
+    expect(row.reconciliation.paymentVerification).toMatchObject({ status: "mismatch",
+      discrepancies: expect.arrayContaining(expected.map((text) => expect.stringContaining(text))) });
+    // Never repaired by creating the invoice again.
+    await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+    expect((await planInvoiceRecovery(ORDER_1082.orderId)).action.kind).toBe("none");
+  });
+
+  it("keeps the returned invoice ID when reading the invoice back fails", async () => {
+    allow();
+    mocks.invoiceDetail.mockRejectedValue(new Error("KiotViet 503"));
+    const result = await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(result).toMatchObject({ applied: true, status: "needs_review" });
+    expect(invoiceRow()).toMatchObject({ status: "needs_review", kiotviet_invoice_id: "8001" });
+  });
+
+  it("issues one invoice for concurrent invoice jobs", async () => {
+    allow();
+    const plans = await Promise.all([planInvoiceRecovery(ORDER_1082.orderId), planInvoiceRecovery(ORDER_1082.orderId)]);
+    const results = await Promise.all(plans.map((plan) => applyInvoiceRecovery(plan)));
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+    expect(results.filter((result) => result.applied)).toHaveLength(1);
+  });
+});
+
+describe("invoice POST timeout: search and link, never resend", () => {
+  const allow = () => Object.assign(mocks.orderSettings, { allowUnverifiedPrepaymentInheritance: true, acknowledgeUnverifiedPrepaymentRisk: true });
+  const timeout = () => mocks.createInvoice.mockImplementation(async () => {
+    for (const line of fixture.lines) mocks.stock[String(line.productId)] -= line.quantity; // KiotViet did create it
+    throw new UncertainResultError("KiotViet POST /invoices network failure or timeout; the request may have been applied");
+  });
+  const empty = { invoices: [], complete: true };
+  const found = { invoices: [{ id: 8001, code: "HD8001", orderCode: "DH031389", status: 1 }], complete: true };
+
+  it("links the invoice the timed-out POST created and verifies it (stock and payment)", async () => {
+    allow();
+    timeout();
+    // plan, pre-POST re-check, then the first search after the timeout finds nothing, the second finds it.
+    mocks.findInvoices.mockResolvedValueOnce(empty).mockResolvedValueOnce(empty).mockResolvedValueOnce(empty).mockResolvedValueOnce(found);
+    const result = await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(result).toMatchObject({ applied: true, invoiceCode: "HD8001", status: "created", message: expect.stringContaining("POST timed out; linked invoice HD8001") });
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+    expect(mocks.invoice).toMatchObject({ status: "created", kiotviet_invoice_id: "8001",
+      reconciliation: expect.objectContaining({ stockVerified: true, uncertainPost: expect.objectContaining({ linkedInvoice: "HD8001" }),
+        paymentVerification: expect.objectContaining({ status: "verified" }) }) });
+  });
+
+  it("keeps the outcome unknown (creating) when nothing is found, and a later run does not resend", async () => {
+    allow();
+    timeout();
+    const result = await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(result).toMatchObject({ applied: false, message: expect.stringContaining("NOT resent") });
+    expect(mocks.invoice).toMatchObject({ status: "creating", kiotviet_invoice_id: null });
+    // The job retries: the plan links as soon as the invoice becomes visible.
+    mocks.findInvoices.mockResolvedValue(found);
+    const replanned = await planInvoiceRecovery(ORDER_1082.orderId);
+    expect(replanned.action).toMatchObject({ kind: "link", invoice: { id: 8001 } });
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+  });
+
+  it("does not treat a failed search as proof of anything", async () => {
+    allow();
+    timeout();
+    mocks.findInvoices.mockResolvedValueOnce(empty).mockResolvedValueOnce(empty).mockRejectedValue(new Error("KiotViet 503"));
+    await expect(applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId))).resolves.toMatchObject({ applied: false });
+    expect(mocks.invoice).toMatchObject({ status: "creating" });
+  });
+
+  it("flags two invoices after an uncertain POST as needs_review without linking either", async () => {
+    allow();
+    timeout();
+    mocks.findInvoices.mockResolvedValueOnce(empty).mockResolvedValueOnce(empty)
+      .mockResolvedValue({ invoices: [...found.invoices, { id: 8002, code: "HD8002", orderCode: "DH031389", status: 1 }], complete: true });
+    const result = await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(result).toMatchObject({ applied: false, status: "needs_review", message: expect.stringContaining("duplicate_invoices") });
+    expect(mocks.invoice).toMatchObject({ status: "needs_review", kiotviet_invoice_id: null });
+  });
+
+  it("links an invoice found by an incomplete search only as needs_review", async () => {
+    allow();
+    timeout();
+    mocks.findInvoices.mockResolvedValueOnce(empty).mockResolvedValueOnce(empty).mockResolvedValue({ ...found, complete: false });
+    await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(mocks.invoice).toMatchObject({ status: "needs_review", kiotviet_invoice_id: "8001" });
+  });
+
+  it("stores the duplicate-lookup metrics of the plan and the pre-POST re-check", async () => {
+    allow();
+    const metrics = { method: "index", freshness: "reused", localMs: 1.2, remoteMs: 0.4, totalMs: 1.6, apiCalls: 0, candidates: 0, indexLag: 0 };
+    mocks.findInvoices.mockResolvedValue({ ...empty, metrics });
+    await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(mocks.invoice?.reconciliation).toMatchObject({ duplicateLookup: metrics, prePostLookup: metrics });
   });
 });

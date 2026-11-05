@@ -1,15 +1,22 @@
 import { connection } from "next/server";
 import { InvoiceOverride } from "@/components/admin/invoice-override";
 import { DataTable } from "@/components/admin/data-table";
+import { InvoiceAutomationStatus, type InvoiceAutomationStats } from "@/components/admin/invoice-automation-status";
+import { query } from "@/lib/db/client";
 import { getInvoiceIndexHealth, type InvoiceIndexHealth } from "@/lib/kiotviet/invoice-index";
 import { INVOICE_DISPLAY_STATUS, invoicesRepository } from "@/repositories/invoices";
 
 export default async function InvoicesPage() {
   await connection();
-  let rows: Record<string, unknown>[] = [], counts: Array<{ status: string; count: string }> = [];
-  let index: InvoiceIndexHealth | null = null, error = "";
+  let rows: Record<string, unknown>[] = [], stats: InvoiceAutomationStats | null = null;
+  let index: InvoiceIndexHealth | null = null, orders: Record<string, unknown> | undefined, error = "";
   try {
-    [rows, counts, index] = await Promise.all([invoicesRepository.recent(), invoicesRepository.counts(), getInvoiceIndexHealth()]);
+    let settings: Array<{ value: Record<string, unknown> }>;
+    [rows, stats, index, settings] = await Promise.all([
+      invoicesRepository.recent(), invoicesRepository.automationStats(), getInvoiceIndexHealth(),
+      query<{ value: Record<string, unknown> }>("SELECT value FROM system_settings WHERE key='orders'"),
+    ]);
+    orders = settings[0]?.value;
   } catch (e) {
     error = e instanceof Error ? e.message : "Database unavailable";
   }
@@ -24,29 +31,15 @@ export default async function InvoicesPage() {
       {error && <div className="error-banner">{error}</div>}
       {!error && (
         <div className="settings-grid">
+          <InvoiceAutomationStatus orders={orders} index={index} stats={stats} />
           <section className="setting-card">
-            <h2>Trạng thái hóa đơn</h2>
-            <p>
-              {counts.length
-                ? counts.map((row) => `${INVOICE_DISPLAY_STATUS[row.status] ?? row.status}: ${row.count}`).join(" · ")
-                : "Chưa có hóa đơn nào."}
-            </p>
+            <h2>Ý nghĩa trạng thái</h2>
             <small>
               blocked: chưa đủ điều kiện, không có yêu cầu nào được gửi (xem error code). processing: yêu cầu đã/có thể đã gửi, không bao giờ gửi lại tự động.
-              needs_review: cần kiểm tra thủ công trên KiotViet.
+              needs_review: hóa đơn đã tạo (giữ mã) nhưng thanh toán/tồn kho chưa khớp, hoặc kết quả chưa rõ — kiểm tra thủ công trên KiotViet, không tạo lại.
             </small>
+            {index?.lastError && <p><small>Lỗi chỉ mục gần nhất: {index.lastError}</small></p>}
           </section>
-          {index && (
-            <section className="setting-card">
-              <h2>Chỉ mục hóa đơn KiotViet</h2>
-              <p>
-                {index.scanned}/{index.total ?? "?"} hóa đơn · cập nhật lúc {index.currentAsOf ? index.currentAsOf.toISOString() : "chưa bao giờ"}
-                {" · "}{index.usable ? "dùng được để chống trùng hóa đơn" : "chưa dùng được (đang xây dựng lại)"}
-                {index.stale ? " · CŨ (scheduler có đang chạy?)" : ""}
-              </p>
-              {index.lastError && <small>Lỗi gần nhất: {index.lastError}</small>}
-            </section>
-          )}
         </div>
       )}
       {!error && <DataTable rows={rows.map((row) => ({ ...row, status: INVOICE_DISPLAY_STATUS[String(row.status)] ?? row.status }))} />}

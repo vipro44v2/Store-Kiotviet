@@ -47,6 +47,18 @@ export interface OrderSettings {
   excludeShipping?: boolean;
   excludeProcessingFees?: boolean;
   excludeOtherSurcharges?: boolean;
+  /**
+   * Product-Only only, default false: an order whose KiotViet prepayment equals the
+   * invoice may be invoiced (totalPayment 0) before inheritance is proven; the
+   * invoice's payment is verified right after creation and any discrepancy is
+   * needs_review. Requires acknowledgeUnverifiedPrepaymentRisk (set by an admin).
+   */
+  allowUnverifiedPrepaymentInheritance?: boolean;
+  acknowledgeUnverifiedPrepaymentRisk?: boolean;
+  unverifiedPrepaymentAcceptedAt?: string;
+  unverifiedPrepaymentAcceptedBy?: string;
+  /** block (default): never invoiced; manual_override: admin override per order (stays needs_review). */
+  prepaymentExceedsInvoicePolicy?: "block" | "manual_override";
   [key: string]: unknown;
 }
 

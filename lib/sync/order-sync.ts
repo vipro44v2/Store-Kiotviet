@@ -68,6 +68,12 @@ import {
  * manual review when the outcome stays unknown.
  */
 export const ORDER_RECOVERY_WINDOW_MS = 5 * 60_000;
+/**
+ * Set on every claim, i.e. before the KiotViet order exists: the highest invoice id
+ * already seen. All invoices of the new order get larger ids, which lets the invoice
+ * job prove "no invoice yet" with a short scan (lib/kiotviet/invoice-index.ts).
+ */
+const INVOICE_ID_FLOOR_SQL = "invoice_id_floor=(SELECT max(invoice_id) FROM kiotviet_invoice_index)";
 /** pending_create never sent a request, so a claim older than this is safe to take over. */
 export const ORDER_CLAIM_LEASE_MS = 15 * 60_000;
 export function isOrderRecoveryWindowOpen(
@@ -453,12 +459,12 @@ async function runShopifyOrderSync(
     const token = randomUUID();
     if (mapping)
       await client.query(
-        "UPDATE order_mappings SET status='pending_create',claim_token=$2,claimed_at=now(),financial_status=$3,fulfillment_status=$4,sync_status='pending',last_error=NULL,failure_stage=NULL,updated_at=now() WHERE shopify_order_id=$1",
+        `UPDATE order_mappings SET status='pending_create',claim_token=$2,claimed_at=now(),financial_status=$3,fulfillment_status=$4,sync_status='pending',last_error=NULL,failure_stage=NULL,updated_at=now(),${INVOICE_ID_FLOOR_SQL} WHERE shopify_order_id=$1`,
         [orderId, token, order.financial_status ?? null, order.fulfillment_status ?? null],
       );
     else
       await client.query(
-        "INSERT INTO order_mappings(shopify_order_id,shopify_order_number,status,financial_status,fulfillment_status,sync_status,claim_token,claimed_at) VALUES($1,$2,'pending_create',$3,$4,'pending',$5,now())",
+        "INSERT INTO order_mappings(shopify_order_id,shopify_order_number,status,financial_status,fulfillment_status,sync_status,claim_token,claimed_at,invoice_id_floor) VALUES($1,$2,'pending_create',$3,$4,'pending',$5,now(),(SELECT max(invoice_id) FROM kiotviet_invoice_index))",
         [orderId, order.name ?? null, order.financial_status ?? null, order.fulfillment_status ?? null, token],
       );
     // Auto Invoice applies only to orders created now, never to existing ones.
@@ -533,7 +539,8 @@ async function verifyUncertainOrder(
   const recovered = await findKiotVietOrderByShopifyReference(orderId);
   if (recovered) {
     await query(
-      "UPDATE order_mappings SET kiotviet_order_id=$2,kiotviet_order_code=$3,status='created',financial_status=$4,fulfillment_status=$5,sync_status='synced',claim_token=NULL,last_error=NULL,failure_stage=NULL,last_sync_at=now(),updated_at=now() WHERE shopify_order_id=$1 AND status='creating' AND kiotviet_order_id IS NULL",
+      // Found by searching its reference, so it may predate this claim's floor: no floor fast path.
+      "UPDATE order_mappings SET kiotviet_order_id=$2,kiotviet_order_code=$3,status='created',financial_status=$4,fulfillment_status=$5,sync_status='synced',claim_token=NULL,last_error=NULL,failure_stage=NULL,last_sync_at=now(),updated_at=now(),invoice_id_floor=NULL WHERE shopify_order_id=$1 AND status='creating' AND kiotviet_order_id IS NULL",
       [orderId, recovered.id, recovered.code, order.financial_status ?? null, order.fulfillment_status ?? null],
     );
     await log("info", "Existing KiotViet order linked to Shopify order", {

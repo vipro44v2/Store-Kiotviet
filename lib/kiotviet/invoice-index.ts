@@ -1,7 +1,29 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { query } from "@/lib/db/client";
 import { log } from "@/lib/logger";
 import { kiotVietClient } from "./client";
 import type { KiotVietInvoice, KiotVietInvoicesResponse } from "./types";
+
+/** Counts KiotViet requests made on behalf of one duplicate lookup (metrics only). */
+const apiCallScope = new AsyncLocalStorage<{ calls: number }>();
+export function withApiCallCount<T>(work: () => Promise<T>) {
+  const counter = { calls: 0 };
+  return apiCallScope.run(counter, async () => ({ result: await work(), calls: counter.calls }));
+}
+export function countedGet<T>(url: string, options?: Parameters<typeof kiotVietClient.get>[1]) {
+  const counter = apiCallScope.getStore();
+  if (counter) counter.calls++;
+  return kiotVietClient.get<T>(url, options);
+}
+
+/**
+ * Database clock. Freshness timestamps from different workers are compared, so they
+ * all come from PostgreSQL rather than each process's own clock.
+ */
+export async function dbNow() {
+  const [row] = await query<{ now: string | Date }>("SELECT clock_timestamp() AS now");
+  return new Date(row.now);
+}
 
 /**
  * Local copy of every KiotViet invoice's (id, code, orderCode, status), built
@@ -61,7 +83,7 @@ async function resetIndex(state: InvoiceIndexState, reason: string) {
 export const REPOSITION_MAX_REQUESTS = 22;
 
 async function remoteIdAt(position: number) {
-  const page = await kiotVietClient.get<KiotVietInvoicesResponse>(`/invoices?${new URLSearchParams({
+  const page = await countedGet<KiotVietInvoicesResponse>(`/invoices?${new URLSearchParams({
     orderBy: "id", orderDirection: "Asc", pageSize: "1", currentItem: String(position),
   })}`, { timeoutMs: 15_000, maxAttempts: 2 });
   const id = Number(page?.data?.[0]?.id);
@@ -117,10 +139,10 @@ export async function advanceInvoiceIndex(options: { maxPages?: number; deadline
   while (pages < maxPages && Date.now() < deadline) {
     const offset = state.scanned_count;
     const overlap = offset > 0 && state.last_invoice_id !== null ? 1 : 0;
-    const startedAt = new Date();
+    const startedAt = await dbNow();
     let page: KiotVietInvoicesResponse;
     try {
-      page = await kiotVietClient.get<KiotVietInvoicesResponse>(`/invoices?${new URLSearchParams({
+      page = await countedGet<KiotVietInvoicesResponse>(`/invoices?${new URLSearchParams({
         orderBy: "id", orderDirection: "Asc", pageSize: String(INVOICE_INDEX_PAGE_SIZE), currentItem: String(offset - overlap),
       })}`, { timeoutMs: 15_000, maxAttempts: 2 });
     } catch (error) {
@@ -182,6 +204,81 @@ async function upsertIndexedInvoice(invoice: KiotVietInvoice) {
   );
 }
 
+/**
+ * Runs scheduled index maintenance at most once at a time across workers. A run
+ * that finds the lease taken is skipped (null): BullMQ may start the next
+ * repetition while a slow one is still paging. The lease expires on its own if
+ * a worker dies. Lookups do not take the lease (their writes are optimistic).
+ */
+export async function withInvoiceIndexLease<T>(owner: string, work: () => Promise<T>, leaseSeconds = 120): Promise<T | null> {
+  const acquired = await query(
+    `UPDATE kiotviet_invoice_index_state SET lease_owner=$1,lease_until=now()+make_interval(secs=>$2)
+    WHERE id=1 AND (lease_until IS NULL OR lease_until<now()) RETURNING id`,
+    [owner, leaseSeconds],
+  );
+  if (!acquired.length) return null;
+  try {
+    return await work();
+  } finally {
+    await query("UPDATE kiotviet_invoice_index_state SET lease_owner=NULL,lease_until=NULL WHERE id=1 AND lease_owner=$1", [owner]);
+  }
+}
+
+/** Newest-first pages a floor scan may read before falling back to the index (≈ 500 invoices). */
+export const FLOOR_SCAN_MAX_PAGES = 5;
+
+/**
+ * Independent proof of absence for an order this app created, used instead of
+ * waiting for the index. order_mappings.invoice_id_floor is the highest invoice
+ * id this app had seen before creating the KiotViet order, so (ids are
+ * allocated increasingly, the same assumption the index relies on) every
+ * invoice of that order has a larger id. Reading invoices newest-first until an
+ * id ≤ floor therefore sees all of them. Each page re-reads the previous page's
+ * last invoice (overlap of 1) and ids must strictly decrease, so an insert,
+ * delete or ignored ordering during the scan makes it inconclusive, never complete.
+ */
+export async function scanInvoicesAboveFloor(floorId: number, options: { maxPages?: number } = {}) {
+  const maxPages = options.maxPages ?? FLOOR_SCAN_MAX_PAGES;
+  const invoices: KiotVietInvoice[] = [];
+  let offset = 0, lastId: number | null = null, pages = 0;
+  const incomplete = (error: string) => ({ complete: false as const, invoices, pages, error: `floor scan: ${error}` });
+  while (pages < maxPages) {
+    const overlap = lastId === null ? 0 : 1;
+    let page: KiotVietInvoicesResponse;
+    try {
+      page = await countedGet<KiotVietInvoicesResponse>(`/invoices?${new URLSearchParams({
+        orderBy: "id", orderDirection: "Desc", pageSize: String(INVOICE_INDEX_PAGE_SIZE), currentItem: String(offset - overlap),
+      })}`, { timeoutMs: 10_000, maxAttempts: 2 });
+    } catch (error) {
+      return incomplete(error instanceof Error ? error.message : String(error));
+    }
+    pages++;
+    const total = Number(page?.total);
+    const data = Array.isArray(page?.data) ? page.data : null;
+    if (!data || !Number.isSafeInteger(total) || total < 0) return incomplete("malformed invoice page");
+    if (overlap && Number(data[0]?.id) !== lastId) return incomplete("invoices changed during the scan");
+    const fresh = data.slice(overlap);
+    // The whole page must be strictly newest-first before the floor may stop the scan:
+    // an ascending page would otherwise "prove" absence from its very first (oldest) id.
+    let previous = lastId ?? Number.POSITIVE_INFINITY;
+    for (const invoice of fresh) {
+      const id = Number(invoice.id);
+      if (!Number.isSafeInteger(id) || id >= previous) return incomplete("orderBy=id Desc not honored");
+      previous = id;
+    }
+    for (const invoice of fresh) {
+      const id = Number(invoice.id);
+      if (id <= floorId) return { complete: true as const, invoices, pages };
+      invoices.push(invoice);
+      lastId = id;
+    }
+    offset += fresh.length;
+    if (offset >= total) return { complete: true as const, invoices, pages }; // every remote invoice is above the floor and was read
+    if (!fresh.length) return incomplete("page made no progress");
+  }
+  return incomplete(`more than ${maxPages * INVOICE_INDEX_PAGE_SIZE} invoices above the floor`);
+}
+
 /** Remaining invoices the next lookup may index itself (findKiotVietInvoicesForOrder advances ≤ 10 pages). */
 export const INVOICE_INDEX_LOOKUP_CATCH_UP = 5 * INVOICE_INDEX_PAGE_SIZE;
 /** No confirmed-current index for this long means the scheduler is not keeping up (or not running). */
@@ -215,6 +312,58 @@ export async function getInvoiceIndexHealth(now = Date.now()): Promise<InvoiceIn
 export async function forgetIndexedInvoice(invoiceId: number) {
   await query("DELETE FROM kiotviet_invoice_index WHERE invoice_id=$1", [invoiceId]);
   await log("warn", "Deleted KiotViet invoice removed from the index", { action: "invoice_index_forget", provider: "kiotviet", invoiceId });
+}
+
+export type IndexFreshness = "reused" | "joined" | "fetched";
+
+let inflight: { startedAt: Promise<Date>; promise: Promise<InvoiceIndexProgress> } | null = null;
+
+/**
+ * Proves the index holds every invoice that existed when `lookupStart` began, with
+ * as few KiotViet requests as possible:
+ * - reused (0 requests): another job or worker already confirmed the index current
+ *   with a request that started at or after lookupStart (current_as_of, DB clock);
+ * - joined (0 requests): an in-process confirmation that started after lookupStart
+ *   is awaited instead of sending a parallel one;
+ * - fetched (usually 1 request): re-read the tail page (overlap of 1).
+ * An older confirmation is never reused: it cannot cover invoices created since.
+ */
+export async function ensureIndexFresh(lookupStart: Date, options: { maxPages?: number; deadlineMs?: number } = {}) {
+  const judge = (progress: InvoiceIndexProgress, freshness: IndexFreshness) => {
+    const complete = progress.current && progress.currentAsOf !== null && progress.currentAsOf.getTime() >= lookupStart.getTime();
+    return { complete, freshness, progress, error: complete ? undefined : progress.error ?? `invoice index not current (${progress.scanned}/${progress.total ?? "?"} indexed)` };
+  };
+  const state = await getInvoiceIndexState();
+  const asOf = asDate(state.current_as_of);
+  if (asOf && asOf.getTime() >= lookupStart.getTime() && state.remote_total !== null && state.scanned_count >= state.remote_total)
+    return judge({ current: true, currentAsOf: asOf, scanned: state.scanned_count, total: state.remote_total, pages: 0 }, "reused");
+  const running = inflight;
+  // judge() still checks the joined result's own currentAsOf, so joining can never prove too much.
+  if (running && (await running.startedAt).getTime() >= lookupStart.getTime()) return judge(await running.promise, "joined");
+  // Registered synchronously so lookups running in lockstep join instead of racing.
+  const startedAt = dbNow();
+  const promise = startedAt.then(() => advanceInvoiceIndex({ maxPages: options.maxPages ?? 10, deadlineMs: options.deadlineMs ?? 25_000 }));
+  inflight = { startedAt, promise };
+  try {
+    return judge(await promise, "fetched");
+  } finally {
+    if (inflight?.promise === promise) inflight = null;
+  }
+}
+
+/**
+ * PostgreSQL-only candidates: invoices this app recorded for the KiotViet order and
+ * invoices the index holds for its code. Uses the unique kiotviet_order_id index and
+ * the order_code indexes (migration 012). Never proof of absence on its own.
+ */
+export async function localInvoiceCandidates(order: { id: number; code: string }) {
+  const rows = await query<{ invoice_id: string }>(
+    `SELECT kiotviet_invoice_id::text AS invoice_id FROM invoice_mappings
+      WHERE kiotviet_invoice_id IS NOT NULL AND (kiotviet_order_id=$1 OR kiotviet_order_code=$2)
+    UNION SELECT invoice_id::text FROM kiotviet_invoice_index WHERE order_code=$2`,
+    [order.id, order.code],
+  );
+  return rows.map((row) => Number(row.invoice_id));
 }
 
 export async function indexedInvoicesForOrder(orderCode: string) {

@@ -52,6 +52,11 @@ export interface SkippedJobResult {
   reason: string;
 }
 
+function isoTime(value: unknown) {
+  const time = value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(time) ? new Date(time).toISOString() : undefined;
+}
+
 function recordPayload(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object")
     throw new ValidationError("Webhook payload is invalid");
@@ -320,10 +325,14 @@ export async function processSyncJob(
       }
       break;
     case "shopify_fulfillment":
-      await requestFulfillmentInvoice(String(recordPayload(payload).order_id ?? job.data.entityId ?? ""));
+      // The webhook's arrival time starts the invoice latency clock (SLO: 95% within 60 s).
+      await requestFulfillmentInvoice(String(recordPayload(payload).order_id ?? job.data.entityId ?? ""),
+        { receivedAt: isoTime(event?.received_at) });
       break;
     case "shopify_invoice_create":
-      await processFulfillmentInvoice(String(job.data.entityId));
+      await processFulfillmentInvoice(String(job.data.entityId), {
+        receivedAt: isoTime(job.data.receivedAt), admittedAt: isoTime(job.data.admittedAt),
+      });
       break;
     case "fulfillment_invoice_reconciliation":
       await reconcileFulfillmentInvoices();
@@ -333,8 +342,14 @@ export async function processSyncJob(
       const orders = (await query<{ value: Record<string, unknown> }>("SELECT value FROM system_settings WHERE key='orders'"))[0]?.value ?? {};
       const invoicing = orders.autoInvoice === true || ["shopify_fulfilled", "shopify_paid"].includes(String(orders.invoiceCreationTrigger));
       if (!invoicing) break;
-      const { advanceInvoiceIndex, getInvoiceIndexHealth } = await import("@/lib/kiotviet/invoice-index");
-      const progress = await advanceInvoiceIndex({ maxPages: 30, deadlineMs: 50_000 });
+      const { advanceInvoiceIndex, getInvoiceIndexHealth, withInvoiceIndexLease } = await import("@/lib/kiotviet/invoice-index");
+      // At most 30 pages per run and one run at a time keeps KiotViet requests bounded.
+      const progress = await withInvoiceIndexLease(`job-${String(job.data.auditJobId ?? job.id)}`,
+        () => advanceInvoiceIndex({ maxPages: 30, deadlineMs: 50_000 }));
+      if (!progress) {
+        await log("info", "KiotViet invoice index run skipped; another run holds the lease", { action: "invoice_index_overlap_skipped", provider: "kiotviet" });
+        break;
+      }
       if (progress.current && progress.currentAsOf) {
         // Invoice jobs deferred while duplicate detection was inconclusive run again now.
         const { readmitIndexDeferredInvoices } = await import("@/lib/sync/fulfillment-invoice");

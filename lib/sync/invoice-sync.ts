@@ -209,10 +209,28 @@ export async function finalizeInvoice(
     total: detail.total ?? null, totalPayment: detail.totalPayment ?? null, status: detail.status ?? null,
     paymentRows: Array.isArray(detail.payments) ? detail.payments.map((row) => ({ amount: Number(row?.amount ?? 0), method: row?.method ?? null })) : null,
   };
+  const paymentDiscrepancies: string[] = [];
   if (productOnly) {
     // Kept visible for accounting, but not a creation gate in Product-Only mode.
     reconciliation.financiallyReconciled = checks.financiallyReconciled && (reconciliation.productOnly as { financiallyReconciled?: boolean } | undefined)?.financiallyReconciled === true;
     delete checks.financiallyReconciled;
+    // The invoice was sent with totalPayment 0: did KiotViet carry the order prepayment?
+    // Recorded exactly as KiotViet reports it; never repaired by another invoice or payment.
+    const money = (value: number) => (value / 100).toFixed(2);
+    const paidCents = cents(detail.totalPayment);
+    const rowsCents = Array.isArray(detail.payments) ? detail.payments.reduce((sum, item) => sum + cents(item?.amount), 0) : null;
+    const remainingCents = cents(detail.total) - paidCents;
+    if (paidCents !== expectedPayment) paymentDiscrepancies.push(`invoice reports ${money(paidCents)} paid, expected the carried prepayment ${money(expectedPayment)}`);
+    if (rowsCents === null) paymentDiscrepancies.push("invoice returned no payment records");
+    else if (rowsCents !== paidCents) paymentDiscrepancies.push(`payment records total ${money(rowsCents)} but the invoice reports ${money(paidCents)} paid`);
+    if (remainingCents !== 0) paymentDiscrepancies.push(`remaining balance ${money(remainingCents)} on an invoice of ${money(cents(detail.total))}`);
+    reconciliation.paymentVerification = {
+      status: paymentDiscrepancies.length ? "mismatch" : "verified",
+      policy: (reconciliation.productOnly as { prepaymentPolicy?: string } | undefined)?.prepaymentPolicy ?? null,
+      expectedPaid: expectedPayment / 100, invoiceTotalPayment: paidCents / 100, paymentRowsTotal: rowsCents === null ? null : rowsCents / 100,
+      invoiceTotal: cents(detail.total) / 100, remainingBalance: remainingCents / 100, discrepancies: paymentDiscrepancies,
+      checkedAt: new Date().toISOString(),
+    };
   }
   reconciliation.checks = checks;
   if (reconciliation.branchId && reconciliation.expectedLines?.length) {
@@ -234,7 +252,8 @@ export async function finalizeInvoice(
     WHERE shopify_order_id=$1 AND (kiotviet_invoice_id IS NULL OR kiotviet_invoice_id=$2) RETURNING shopify_order_id`,
     [
       row.shopify_order_id, detail.id, detail.code, ok ? "created" : "needs_review", JSON.stringify(reconciliation),
-      ok ? null : `KiotViet invoice ${detail.code} does not match: ${failed.join(", ")}`, ok ? null : "verify_invoice",
+      ok ? null : `${paymentDiscrepancies.length ? "payment_inheritance_mismatch" : "invoice_verification_failed"}: KiotViet invoice ${detail.code} does not match: ${failed.join(", ")}${paymentDiscrepancies.length ? ` (payment: ${paymentDiscrepancies.join("; ")})` : ""}`,
+      ok ? null : paymentDiscrepancies.length ? "verify_payment" : "verify_invoice",
       options.source ?? null, kiotVietOrder.id, kiotVietOrder.code,
     ],
   );

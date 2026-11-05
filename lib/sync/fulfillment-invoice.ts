@@ -75,7 +75,7 @@ export type InvoiceAdmission =
  * Called for Shopify fulfillment/order events and by the rescan. Admits at most
  * one active invoice job per order (PostgreSQL outbox; Redis loss cannot drop it).
  */
-export async function requestFulfillmentInvoice(orderId: string, options: { retryKey?: string } = {}): Promise<InvoiceAdmission> {
+export async function requestFulfillmentInvoice(orderId: string, options: { retryKey?: string; receivedAt?: string } = {}): Promise<InvoiceAdmission> {
   const { config, settingsVersion } = await orderSettings();
   if (!config.invoiceCreationTrigger || config.invoiceCreationTrigger === "disabled") return "disabled";
   const [mapping] = await query<{ invoice_id: string | null }>(
@@ -114,7 +114,7 @@ export async function requestFulfillmentInvoice(orderId: string, options: { retr
   const triggerState = invoiceTriggerState(live, settingsVersion) + (options.retryKey ? `|${options.retryKey}` : "");
   const admitted = await query(
     `INSERT INTO sync_jobs(type,payload,priority,max_attempts)
-    SELECT 'shopify_invoice_create',jsonb_build_object('entityId',$1::text,'triggerState',$3::text),'high',$2
+    SELECT 'shopify_invoice_create',jsonb_build_object('entityId',$1::text,'triggerState',$3::text,'admittedAt',now(),'receivedAt',$4::text),'high',$2
     WHERE NOT EXISTS (
       SELECT 1 FROM sync_jobs WHERE type='shopify_invoice_create' AND payload->>'entityId'=$1::text AND (
         status IN ('pending','processing')
@@ -122,7 +122,7 @@ export async function requestFulfillmentInvoice(orderId: string, options: { retr
         OR (status IN ('manual_review','completed','skipped') AND payload->>'triggerState'=$3::text)))
     ON CONFLICT ((payload->>'entityId')) WHERE type='shopify_invoice_create' AND status IN ('pending','processing') DO NOTHING
     RETURNING id`,
-    [orderId, getEnv().JOB_MAX_ATTEMPTS, triggerState],
+    [orderId, getEnv().JOB_MAX_ATTEMPTS, triggerState, options.receivedAt ?? null],
   );
   await parkOrder(orderId, "30 minutes");
   await dispatchInvoiceOutbox();
@@ -145,6 +145,8 @@ export async function dispatchInvoiceOutbox() {
 /** Bounded rotating rescan of post-activation orders without an invoice. No historical backfill. */
 export async function reconcileFulfillmentInvoices() {
   await dispatchInvoiceOutbox();
+  // Existing invoices keep getting their stock pushed even if the trigger was disabled since.
+  await retryInvoiceInventory();
   const { config } = await orderSettings();
   if (!config.invoiceCreationTrigger || config.invoiceCreationTrigger === "disabled" || !config.invoiceTriggerEnabledAt) return;
   const rows = await query<{ shopify_order_id: string }>(`SELECT o.shopify_order_id FROM order_mappings o
@@ -191,8 +193,41 @@ function stage(orderId: string, name: string, details: Record<string, unknown> =
   return log("info", `Invoice workflow: ${name}`, { action: `invoice_stage_${name}`, provider: "kiotviet", entityType: "invoice", entityId: orderId, ...details });
 }
 
-export async function processFulfillmentInvoice(orderId: string) {
-  const { config } = await orderSettings();
+/**
+ * Timestamps and durations of one invoice job, stored in reconciliation.timings.
+ * latencyMs (trigger received → invoice verified) is the SLO measure.
+ */
+export class InvoiceTimer {
+  readonly timings: Record<string, string | number> = {};
+  private last = Date.now();
+  constructor(private readonly origin?: string, admittedAt?: string) {
+    if (origin) this.timings.triggerReceivedAt = origin;
+    if (admittedAt) this.timings.admittedAt = admittedAt;
+    this.mark("jobStarted");
+    if (admittedAt) this.timings.queueMs = Math.max(0, Date.parse(String(this.timings.jobStartedAt)) - Date.parse(admittedAt));
+  }
+  mark(stageName: string) {
+    const now = Date.now();
+    this.timings[`${stageName}At`] = new Date(now).toISOString();
+    this.timings[`${stageName}Ms`] = now - this.last;
+    this.last = now;
+    return this;
+  }
+  /** Latency from the trigger (webhook arrival, else admission, else job start) to now. */
+  latency(name: string) {
+    const start = Date.parse(String(this.timings.triggerReceivedAt ?? this.timings.admittedAt ?? this.timings.jobStartedAt));
+    this.timings[name] = Date.now() - start;
+  }
+}
+
+async function saveTimings(orderId: string, timer: InvoiceTimer) {
+  await query("UPDATE invoice_mappings SET reconciliation=reconciliation || jsonb_build_object('timings',$2::jsonb) WHERE shopify_order_id=$1",
+    [orderId, JSON.stringify(timer.timings)]);
+}
+
+export async function processFulfillmentInvoice(orderId: string, context: { receivedAt?: string; admittedAt?: string } = {}) {
+  const timer = new InvoiceTimer(context.receivedAt, context.admittedAt);
+  const { config, settingsVersion } = await orderSettings();
   const live = await getShopifyOrderPaymentState(orderId);
   if (!live) throw new ConflictError("Shopify order missing");
   const decision = invoiceTriggerDecision(config, live);
@@ -210,11 +245,16 @@ export async function processFulfillmentInvoice(orderId: string) {
     await recordBlocked(orderId, "cancelled_or_refunded: cancelled or fully refunded orders are never invoiced", "fulfillment_trigger");
     return;
   }
+  timer.mark("triggerChecked");
   await stage(orderId, "trigger_ready", { trigger: config.invoiceCreationTrigger, productOnly: config.productOnlyInvoicing === true, financialStatus: live.displayFinancialStatus });
-  // Without a usable index duplicate detection is inconclusive. Defer cheaply (no
-  // Shopify/KiotViet reads, no attempt consumed); the index job re-admits it.
-  const index = await getInvoiceIndexHealth();
-  if (!index.usable) {
+  // Without a usable index duplicate detection is inconclusive, unless the order has an
+  // invoice-id floor (created by this app) that allows the short independent scan. Defer
+  // cheaply otherwise (no Shopify/KiotViet reads, no attempt consumed); the index job re-admits it.
+  const [index, [floor]] = await Promise.all([
+    getInvoiceIndexHealth(),
+    query<{ invoice_id_floor: string | null }>("SELECT invoice_id_floor::text FROM order_mappings WHERE shopify_order_id=$1", [orderId]),
+  ]);
+  if (!index.usable && !floor?.invoice_id_floor) {
     // An attempt that may already have sent its POST keeps the retry → link/review path.
     const [attempt] = await query<{ status: string }>("SELECT status FROM invoice_mappings WHERE shopify_order_id=$1", [orderId]);
     if (attempt && !["blocked", "failed"].includes(attempt.status))
@@ -225,9 +265,11 @@ export async function processFulfillmentInvoice(orderId: string) {
   }
   await query(`UPDATE invoice_mappings SET failure_stage='invoice_index_retried',updated_at=now()
     WHERE shopify_order_id=$1 AND status='blocked' AND failure_stage=$2`, [orderId, INDEX_DEFERRED_STAGE]);
-  const plan = await planInvoiceRecovery(orderId);
-  await stage(orderId, "planned", { plan: plan.action.kind, productOnly: plan.productOnly ?? null,
-    reasons: plan.action.kind === "blocked" ? plan.action.reasons : undefined });
+  // The live state read above is reused by the planner's staleness check.
+  const plan = await planInvoiceRecovery(orderId, { live });
+  timer.mark("planned");
+  await stage(orderId, "planned", { plan: plan.action.kind, productOnly: plan.productOnly ?? null, duplicateLookup: plan.duplicateLookup ?? null,
+    reasons: plan.action.kind === "blocked" ? plan.action.reasons : undefined, timings: timer.timings });
   if (plan.action.kind === "blocked") {
     const reason = plan.action.reasons.join("; ");
     if (TRANSIENT_REASONS.some((code) => reason.includes(code))) throw new RetryableError(reason);
@@ -235,19 +277,37 @@ export async function processFulfillmentInvoice(orderId: string) {
     throw new ConflictError(reason);
   }
   if (plan.action.kind !== "none") {
-    // Settings may have changed while remote validation was running.
-    const latest = await getShopifyOrderPaymentState(orderId);
-    if (!latest || invoiceTriggerDecision((await orderSettings()).config, latest) !== "ready") throw new ConflictError("Invoice trigger changed during validation");
+    // Settings may have changed while remote validation was running. Shopify changes need no
+    // second request: applyInvoiceRecovery re-reads the order and refuses a stale snapshot.
+    if ((await orderSettings()).settingsVersion !== settingsVersion) throw new ConflictError("Invoice trigger changed during validation");
     const result = await applyInvoiceRecovery(plan);
+    timer.mark("invoiceApplied");
     await stage(orderId, "applied", { applied: result.applied, status: result.status ?? null, invoiceCode: result.invoiceCode ?? null, message: result.message });
     if (!result.applied) {
       // An unknown POST outcome is never retried by sending again: the next run only
       // re-plans, which links the invoice or reports invoice_outcome_unknown.
       throw new RetryableError(result.message);
     }
+    timer.latency("invoiceLatencyMs");
+    await saveTimings(orderId, timer);
   }
   const [row] = await query<InvoiceRow>("SELECT * FROM invoice_mappings WHERE shopify_order_id=$1", [orderId]);
   if (!row?.kiotviet_invoice_id) throw new RetryableError("Invoice ID not yet verified; reconcile before retrying");
+  await syncInvoiceInventory(row);
+  timer.mark("inventorySynchronized");
+  timer.latency("totalLatencyMs");
+  if (plan.action.kind !== "none") await saveTimings(orderId, timer);
+  if (row.status !== "created") throw new ConflictError("Invoice linked; stock movement or invoice checks require manual reconciliation");
+}
+
+/**
+ * Pushes current KiotViet on-hand for the invoiced products to Shopify. Absolute
+ * quantities (never a decrement), so running it again after a failure or a
+ * verification retry cannot deduct Shopify stock twice. Independent of invoice
+ * creation: retryInvoiceInventory() repairs failures without touching the invoice.
+ */
+export async function syncInvoiceInventory(row: InvoiceRow) {
+  const orderId = row.shopify_order_id;
   try {
     const sync = await getSyncSettings();
     if (!sync.kiotVietInventoryToShopify) throw new ConflictError("Invoice exists; Shopify inventory synchronization is disabled");
@@ -258,13 +318,42 @@ export async function processFulfillmentInvoice(orderId: string) {
       { refreshFromKiotViet: true, conflictStrategy: sync.inventoryConflictStrategy });
       if (result?.status !== "synced") throw new ConflictError("Invoice exists; inventory synchronization requires review");
     }
-    await query("UPDATE invoice_mappings SET reconciliation=reconciliation || '{\"shopifyStockSynchronized\":true}'::jsonb WHERE shopify_order_id=$1", [orderId]);
+    await query(`UPDATE invoice_mappings SET reconciliation=(reconciliation - 'shopifyStockError' - 'stockRetryAt')
+      || jsonb_build_object('shopifyStockSynchronized',true,'shopifyStockSynchronizedAt',now()),
+      last_error=CASE WHEN failure_stage='shopify_inventory' THEN NULL ELSE last_error END,
+      failure_stage=CASE WHEN failure_stage='shopify_inventory' THEN NULL ELSE failure_stage END WHERE shopify_order_id=$1`, [orderId]);
     await stage(orderId, "inventory_synchronized", { lines: row.reconciliation.expectedLines.length });
   } catch (error) {
-    await query(`UPDATE invoice_mappings SET reconciliation=reconciliation || $2::jsonb,
-      last_error=$3,failure_stage='shopify_inventory',updated_at=now() WHERE shopify_order_id=$1`,
-      [orderId, JSON.stringify({ shopifyStockSynchronized: false, shopifyStockError: String(error) }), String(error)]);
+    // Retried on its own with backoff (5 min × 2^attempts, max 6 h). A needs_review invoice
+    // keeps its own error (e.g. the payment discrepancy); the stock error lives in reconciliation.
+    await query(`UPDATE invoice_mappings SET reconciliation=reconciliation || jsonb_build_object(
+        'shopifyStockSynchronized',false,'shopifyStockError',$2::text,
+        'stockSyncAttempts',COALESCE((reconciliation->>'stockSyncAttempts')::int,0)+1,
+        'stockRetryAt',now()+LEAST(interval '6 hours',interval '5 minutes'*power(2,LEAST(7,COALESCE((reconciliation->>'stockSyncAttempts')::int,0))))),
+      last_error=CASE WHEN status='created' THEN $2 ELSE last_error END,
+      failure_stage=CASE WHEN status='created' THEN 'shopify_inventory' ELSE failure_stage END,updated_at=now()
+      WHERE shopify_order_id=$1`,
+      [orderId, String(error).slice(0, 2000)]);
     throw error;
   }
-  if (row.status !== "created") throw new ConflictError("Invoice linked; stock movement or invoice checks require manual reconciliation");
+}
+
+/** Scheduler: re-pushes stock for invoices whose Shopify inventory sync failed or never ran. */
+export async function retryInvoiceInventory(limit = 20) {
+  const rows = await query<InvoiceRow>(`SELECT * FROM invoice_mappings WHERE kiotviet_invoice_id IS NOT NULL AND status IN ('created','needs_review')
+    AND ((reconciliation->>'shopifyStockSynchronized'='false' AND COALESCE((reconciliation->>'stockRetryAt')::timestamptz,now())<=now())
+      -- crashed between invoice and stock sync; only recent invoices, never a historical sweep
+      OR (NOT reconciliation ? 'shopifyStockSynchronized' AND invoiced_at BETWEEN now()-interval '1 day' AND now()-interval '10 minutes'))
+    ORDER BY updated_at LIMIT $1`, [limit]);
+  const results: Record<string, "synced" | "failed"> = {};
+  for (const row of rows) {
+    try {
+      await syncInvoiceInventory(row);
+      results[row.shopify_order_id] = "synced";
+    } catch {
+      results[row.shopify_order_id] = "failed";
+    }
+  }
+  if (rows.length) await log("info", "Invoice inventory synchronization retried", { action: "invoice_inventory_retry", provider: "shopify", results });
+  return results;
 }

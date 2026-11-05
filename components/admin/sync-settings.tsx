@@ -68,6 +68,10 @@ export function SyncSettingsCard({
   const [prepaymentVerified, setPrepaymentVerified] = useState(orders?.invoicePrepaymentVerified === true);
   const [productOnly, setProductOnly] = useState(orders?.productOnlyInvoicing === true);
   // Selecting Product-Only turns every exclusion on unless it was explicitly turned off.
+  const [allowUnverified, setAllowUnverified] = useState(orders?.allowUnverifiedPrepaymentInheritance === true);
+  // Already accepted settings stay accepted; a new enablement needs a fresh confirmation.
+  const [riskConfirmed, setRiskConfirmed] = useState(orders?.allowUnverifiedPrepaymentInheritance === true && orders?.acknowledgeUnverifiedPrepaymentRisk === true);
+  const [overpaymentPolicy, setOverpaymentPolicy] = useState(orders?.prepaymentExceedsInvoicePolicy === "manual_override" ? "manual_override" : "block");
   const [productOnlyFlags, setProductOnlyFlags] = useState(() =>
     Object.fromEntries(productOnlyOptions.map((option) => [option.key, orders?.[option.key] !== false])) as Record<ProductOnlyFlag, boolean>);
   const [message, setMessage] = useState("");
@@ -109,6 +113,13 @@ export function SyncSettingsCard({
         nextOrders.productOnlyInvoicing = productOnly;
         nextOrders.paymentSource = "shopify";
         for (const option of productOnlyOptions) nextOrders[option.key] = productOnlyFlags[option.key];
+        const enableUnverified = productOnly && allowUnverified;
+        if (enableUnverified && !riskConfirmed)
+          throw new Error("Xác nhận rủi ro kế toán trước khi bật Allow Unverified Prepayment Inheritance");
+        nextOrders.allowUnverifiedPrepaymentInheritance = enableUnverified;
+        if (enableUnverified) nextOrders.acknowledgeUnverifiedPrepaymentRisk = true;
+        else delete nextOrders.acknowledgeUnverifiedPrepaymentRisk;
+        nextOrders.prepaymentExceedsInvoicePolicy = overpaymentPolicy;
       }
       if (JSON.stringify(nextOrders) !== JSON.stringify(orders ?? {})) await put("orders", nextOrders);
       setMessage("Đã lưu. Áp dụng cho cả các job đang chờ trong hàng đợi.");
@@ -189,6 +200,38 @@ export function SyncSettingsCard({
                   {option.label} <small>({option.key})</small>
                 </label>
               ))}
+              <fieldset style={{ marginTop: 8 }}>
+                <legend><strong>Allow Unverified Prepayment Inheritance</strong></legend>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={allowUnverified}
+                    onChange={(event) => { setAllowUnverified(event.target.checked); if (!event.target.checked) setRiskConfirmed(false); }}
+                  />{" "}
+                  Allow Product-Only invoices to be created without prior proof that KiotViet transfers an existing order payment to the invoice.
+                  No additional payment is submitted. Invoices with payment discrepancies are marked Needs Review.
+                </label>
+                {allowUnverified && (
+                  <label style={{ display: "block", marginTop: 4 }}>
+                    <input type="checkbox" checked={riskConfirmed} onChange={(event) => setRiskConfirmed(event.target.checked)} />{" "}
+                    <strong>Tôi hiểu rủi ro kế toán:</strong> hóa đơn có thể được tạo trước khi chứng minh KiotViet chuyển tiền trả trước sang hóa đơn;
+                    nếu KiotViet không chuyển, hóa đơn sẽ hiển thị chưa thanh toán và được đánh dấu Needs Review để kế toán xử lý
+                    (hệ thống không bao giờ tự tạo, sửa hoặc hoàn tiền thanh toán).
+                  </label>
+                )}
+                {orders?.allowUnverifiedPrepaymentInheritance === true && (
+                  <small>Đã bật bởi {String(orders.unverifiedPrepaymentAcceptedBy ?? "?")} lúc {String(orders.unverifiedPrepaymentAcceptedAt ?? "?")}.</small>
+                )}
+              </fieldset>
+              <label style={{ display: "block", marginTop: 8 }}>
+                Tiền trả trước lớn hơn hóa đơn sản phẩm (đơn cũ, ví dụ #1071){" "}
+                <select value={overpaymentPolicy} onChange={(event) => setOverpaymentPolicy(event.target.value)}>
+                  <option value="block">Chặn (mặc định)</option>
+                  <option value="manual_override">Cho phép ghi đè thủ công từng đơn (luôn Needs Review)</option>
+                </select>
+                <br />
+                <small>Không bao giờ tự động; tiền trả trước hiện có không bị thay đổi, xóa, nhân đôi hay hoàn lại.</small>
+              </label>
             </div>
           )}
         </fieldset>

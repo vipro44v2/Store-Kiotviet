@@ -203,7 +203,9 @@ export async function applyOrderRecovery(plan: RecoveryPlan): Promise<{ applied:
         VALUES($1,$2,$3,'created','synced','manual_recovery',now())
         ON CONFLICT(shopify_order_id) DO UPDATE SET kiotviet_order_id=EXCLUDED.kiotviet_order_id,
           kiotviet_order_code=EXCLUDED.kiotviet_order_code,status='created',sync_status='synced',claim_token=NULL,
-          last_error=NULL,failure_stage='manual_recovery',last_sync_at=now(),updated_at=now()
+          last_error=NULL,failure_stage='manual_recovery',last_sync_at=now(),updated_at=now(),
+          -- A linked order may predate any earlier claim's floor: invoice lookups fall back to the full index.
+          invoice_id_floor=NULL
         WHERE order_mappings.kiotviet_order_id IS NULL
         RETURNING shopify_order_id`,
         [orderId, action.kiotVietOrder.id, action.kiotVietOrder.code],

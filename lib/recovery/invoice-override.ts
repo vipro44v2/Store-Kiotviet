@@ -6,6 +6,8 @@ import { ConflictError, ValidationError } from "@/lib/errors";
 import { log } from "@/lib/logger";
 import type { KiotVietInvoiceInput } from "@/lib/kiotviet/invoices";
 import { classifyInvoiceReasons } from "@/lib/sync/invoice-override-rules";
+import type { OrderSettings } from "@/lib/sync/default-branch";
+import { productOnlyPolicy } from "@/lib/sync/product-only-invoicing";
 import { applyInvoiceRecovery, planInvoiceRecovery, type InvoiceProposal, type InvoiceRecoveryPlan } from "./kiotviet-invoice-recovery";
 
 /**
@@ -49,7 +51,16 @@ export async function buildOverridePreview(orderId: string) {
   const plan = await planInvoiceRecovery(orderId);
   const action = plan.action;
   const reasons = action.kind === "blocked" ? action.reasons : plan.validationReasons ?? [];
-  const { warnings, blockers } = classifyInvoiceReasons(reasons);
+  const { warnings: classified, blockers } = classifyInvoiceReasons(reasons);
+  // A prepayment larger than the product-only invoice (e.g. #1071) has its own explicit
+  // policy: overridable only when orders.prepaymentExceedsInvoicePolicy is manual_override.
+  const [settingsRow] = await query<{ value: OrderSettings }>("SELECT value FROM system_settings WHERE key='orders'");
+  const overpaymentOverridable = productOnlyPolicy(settingsRow?.value ?? {}).prepaymentExceedsInvoicePolicy === "manual_override";
+  const warnings = classified.filter((warning) => {
+    if (warning.code !== "prepayment_exceeds_invoice" || overpaymentOverridable) return true;
+    blockers.push({ code: warning.code, message: `${warning.message} (orders.prepaymentExceedsInvoicePolicy is "block")` });
+    return false;
+  });
   if (action.kind === "none") blockers.push(blocker("existing_active_invoice", action.reason));
   if (action.kind === "link")
     blockers.push(blocker("existing_active_invoice", `KiotViet invoice ${action.invoice.code} already exists; link it with scripts/recover-kiotviet-invoice.ts`));

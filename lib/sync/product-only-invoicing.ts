@@ -25,6 +25,9 @@ export interface ProductOnlyPolicy {
   excludeShipping: boolean;
   excludeProcessingFees: boolean;
   excludeOtherSurcharges: boolean;
+  /** Exact prepayment may be invoiced before inheritance is proven (checked after creation). */
+  allowUnverifiedPrepaymentInheritance: boolean;
+  prepaymentExceedsInvoicePolicy: "block" | "manual_override";
 }
 
 export function productOnlyPolicy(settings: OrderSettings): ProductOnlyPolicy {
@@ -38,6 +41,10 @@ export function productOnlyPolicy(settings: OrderSettings): ProductOnlyPolicy {
     excludeShipping: flag(settings.excludeShipping),
     excludeProcessingFees: flag(settings.excludeProcessingFees),
     excludeOtherSurcharges: flag(settings.excludeOtherSurcharges),
+    // Never implied by the mode: explicit opt-in plus a recorded acknowledgement.
+    allowUnverifiedPrepaymentInheritance: enabled && settings.allowUnverifiedPrepaymentInheritance === true &&
+      settings.acknowledgeUnverifiedPrepaymentRisk === true,
+    prepaymentExceedsInvoicePolicy: settings.prepaymentExceedsInvoicePolicy === "manual_override" ? "manual_override" : "block",
   };
 }
 
@@ -67,8 +74,11 @@ export interface FinancialDifference {
   message: string;
 }
 
+/** verified: sandbox evidence + accounting sign-off; unverified_accepted: proven per invoice after creation. */
+export type PrepaymentPolicy = "verified" | "unverified_accepted";
+
 export type ProductOnlyPaymentDecision =
-  | { safe: true; additionalPayment: 0; expectedInvoicePayment: number }
+  | { safe: true; additionalPayment: 0; expectedInvoicePayment: number; prepaymentPolicy: PrepaymentPolicy }
   | { safe: false; reason: string };
 
 const money = (cents: number) => (cents / 100).toFixed(2);
@@ -86,6 +96,8 @@ export function productOnlyPaymentDecision(input: {
   shopifyPaidCents: number;
   inheritanceVerified: boolean;
   inheritanceReason?: string;
+  /** orders.allowUnverifiedPrepaymentInheritance (Product-Only, acknowledged). */
+  allowUnverified?: boolean;
 }): ProductOnlyPaymentDecision {
   const { prepaidCents, invoiceTotalCents, shopifyPaidCents } = input;
   if (prepaidCents === 0)
@@ -94,7 +106,10 @@ export function productOnlyPaymentDecision(input: {
     return { safe: false, reason: `prepayment_exceeds_invoice: the KiotViet order records ${money(prepaidCents)} paid but the product-only invoice is ${money(invoiceTotalCents)}; how KiotViet carries the extra ${money(prepaidCents - invoiceTotalCents)} onto an invoice is unverified` };
   if (prepaidCents < invoiceTotalCents)
     return { safe: false, reason: `prepayment_below_invoice: the KiotViet order records ${money(prepaidCents)} paid but the product-only invoice is ${money(invoiceTotalCents)}; the invoice would remain partly unpaid` };
-  if (!input.inheritanceVerified)
+  if (!input.inheritanceVerified && !input.allowUnverified)
     return { safe: false, reason: `prepayment_inheritance_unverified: KiotViet already records ${money(prepaidCents)} paid on this order and it is undocumented whether an invoice created from it inherits that payment; ${input.inheritanceReason ?? "not verified"}` };
-  return { safe: true, additionalPayment: 0, expectedInvoicePayment: prepaidCents / 100 };
+  // With the explicit policy the invoice is still sent without any payment; whether KiotViet
+  // carried the prepayment is checked on the created invoice (finalizeInvoice → paymentVerification).
+  return { safe: true, additionalPayment: 0, expectedInvoicePayment: prepaidCents / 100,
+    prepaymentPolicy: input.inheritanceVerified ? "verified" : "unverified_accepted" };
 }

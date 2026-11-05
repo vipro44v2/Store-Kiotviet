@@ -1,134 +1,223 @@
 # Product-Only Invoicing
 
-Extends the existing Shopify → KiotViet invoice pipeline (`docs/fulfillment-invoices.md`).
+Extends the Shopify → KiotViet invoice pipeline (`docs/fulfillment-invoices.md`).
+Workflow: **Shopify Paid + Fulfilled → KiotViet order → KiotViet invoice → stock deducted in KiotViet → KiotViet on-hand pushed to Shopify.**
 Nothing was deployed and no production record was changed while implementing this.
 
-## What changes when the mode is on
+## Settings (`system_settings.orders`)
 
-Admin → Settings → **Product-Only Invoicing** writes these keys under `system_settings.orders`:
-
-| Key | Selected default | Meaning |
+| Key | Default after migration | Meaning |
 | --- | --- | --- |
-| `productOnlyInvoicing` | `true` | Orders and invoices carry product merchandise only |
+| `invoiceCreationTrigger` | unchanged | Keep `shopify_fulfilled`: only PAID / PARTIALLY_REFUNDED **and** fully fulfilled orders created after `invoiceTriggerEnabledAt` |
+| `kiotVietCurrency` | unchanged | Keep `USD`; a different Shopify currency blocks |
+| `productOnlyInvoicing` | `false` | Orders and invoices carry product merchandise only |
 | `paymentSource` | `"shopify"` | Shopify's live financial status decides "customer paid" |
-| `excludeShipping` | `true` | Shipping (and its tax) is never on the order/invoice; recorded as a difference |
-| `excludeProcessingFees` | `true` | Processing-fee lines are recorded as a difference |
-| `excludeOtherSurcharges` | `true` | Tips and other non-product charges are recorded as a difference |
-| `ignoreFinancialMismatch` | `true` | A Shopify total *above* the merchandise does not block |
+| `excludeShipping` / `excludeProcessingFees` / `excludeOtherSurcharges` / `ignoreFinancialMismatch` | not written (on once the mode is selected) | Excluded charges are recorded as differences instead of blocking |
+| `allowUnverifiedPrepaymentInheritance` | `false` | See below. Product-Only only; needs `acknowledgeUnverifiedPrepaymentRisk` |
+| `prepaymentExceedsInvoicePolicy` | `"block"` | KiotViet prepayment > product invoice (e.g. #1071): `block`, or `manual_override` (admin override per order, always `needs_review`). Never automatic |
 
-Existing installations stay strict: migration 010 writes only `productOnlyInvoicing:false` and `paymentSource:"shopify"`. Selecting the mode turns every flag on unless an admin turns one off; a flag that is off makes that category block again. The mode requires an explicit Invoice Creation Trigger (`shopify_paid` or `shopify_fulfilled`); the trigger and its activation timestamp are never changed by the migration.
+The server records `unverifiedPrepaymentAcceptedBy/At` (the browser cannot set them) and writes an `audit_logs` row each time the unverified policy is turned on or off. Turning it off drops the acknowledgement, so turning it on again asks for confirmation again. Strict invoicing ignores both new policies.
 
-**New orders** (created after the mode is on): KiotViet order lines use the discounted unit price (`discount: 0`), no shipping surcharge is added, and `totalPayment` is the merchandise paid. A discount that cannot be split into whole cents per unit keeps the list price; that order's invoice is then blocked (`discount_not_representable`).
+## Invoice rules (Product-Only)
 
-**Invoice**: `invoiceTotal = Σ discounted unit price × quantity` of the existing KiotViet order lines. Existing (historical) KiotViet orders are invoiced from their own lines and are never altered. The POST always sends `totalPayment: 0`.
+- `invoiceTotal = Σ discounted unit price × quantity` of the KiotViet order lines. New orders are created with discounted unit prices, no shipping surcharge, and `totalPayment` = merchandise paid. Historical KiotViet orders are invoiced from their own lines, unchanged.
+- Shipping, processing fees, tips and other surcharges are recorded in `reconciliation.productOnly.differences` (with Shopify paid, invoice merchandise, KiotViet prepayment and payment source). They never block, and `financiallyReconciled` stays `false`.
+- Still blocking: unmapped/ambiguous SKU, wrong product/quantity/price against the KiotViet order, discounts that can't be split into whole cents, invalid seller, cancelled orders, product refunds, added product tax, currency mismatch, a surcharge already on the KiotViet order, duplicate or cancelled invoices, an unknown earlier POST outcome, an inconclusive duplicate lookup.
 
-**Payment safety** (`lib/sync/product-only-invoicing.ts → productOnlyPaymentDecision`). The invoice never creates a payment. Only one case is automatic:
+## Payment: the invoice never creates a payment
 
-| KiotViet order prepayment vs invoice | Result |
+The POST always sends `totalPayment: 0`. The existing KiotViet order payment is never altered, refunded or duplicated.
+
+| KiotViet prepayment vs invoice | Result |
 | --- | --- |
-| equal, and inheritance verified (sandbox evidence `carried` + `orders.invoicePrepaymentVerified`) | invoice created; must report exactly the prepayment as paid |
-| equal, inheritance not verified | `blocked: prepayment_inheritance_unverified` |
-| prepayment > invoice (e.g. shipping prepaid on an older order) | `blocked: prepayment_exceeds_invoice` |
-| prepayment < invoice | `blocked: prepayment_below_invoice` |
-| no prepayment | `blocked: kiotviet_payment_missing` |
+| equal + sandbox evidence `carried` + `invoicePrepaymentVerified` | created; policy `verified` |
+| equal + `allowUnverifiedPrepaymentInheritance` (acknowledged) | created; policy `unverified_accepted`; payment checked on the created invoice |
+| equal, neither | `blocked: prepayment_inheritance_unverified` |
+| prepayment > invoice | `blocked: prepayment_exceeds_invoice` (see `prepaymentExceedsInvoicePolicy`) |
+| prepayment < invoice / none | `blocked: prepayment_below_invoice` / `kiotviet_payment_missing` |
 
-The blocked cases can still be invoiced one order at a time through the existing admin override; the remaining difference keeps such an invoice `needs_review`.
+Right after the POST, the returned invoice ID is saved (`needs_review` until verified). Then the invoice is read back and `reconciliation.paymentVerification` records `expectedPaid`, `invoiceTotalPayment`, `paymentRowsTotal`, `invoiceTotal`, `remainingBalance` and `discrepancies`:
 
-**Still blocking in Product-Only mode**: unmapped/ambiguous SKUs, quantity or price differences against the KiotViet order, invalid seller, cancelled orders, product refunds, added product tax, currency mismatch, a Shopify total below the merchandise, a surcharge already on the KiotViet order (undocumented whether it would be copied onto the invoice), duplicate or cancelled invoices, an uncertain previous POST, and an inconclusive duplicate lookup.
+- `verified`: KiotViet reports exactly the prepayment as paid, the payment rows add up, and the remaining balance is 0. The invoice can be `created`.
+- `mismatch`: the status is `needs_review`, `last_error` starts with `payment_inheritance_mismatch:` and lists the exact discrepancy. The invoice is **never** created again to fix it, and the system never reports it as paid.
 
-**No longer blocking**: `unsupported_shipping`, `shipping_not_on_kiotviet_order`, `shipping_mismatch`, shipping-caused `total_mismatch`, processing fees, tips and other surcharges. They are stored in `invoice_mappings.reconciliation.productOnly.differences` (with Shopify paid amount, invoice merchandise, KiotViet prepayment and payment source) and `reconciliation.financiallyReconciled` stays `false`. They do not turn a verified invoice into `needs_review`.
+## Duplicate lookup (`findKiotVietInvoicesForOrder`)
 
-Post-creation checks are unchanged except that the invoice total must equal the merchandise and carry no surcharge: branch, lines/quantities/prices, order code, completed status, total, payment = carried prepayment, payment rows, and the branch stock movement. Any failure → `needs_review` with the invoice ID kept. Then KiotViet stock is pushed to Shopify (absolute quantities, existing locks).
+An empty result is proof of absence only when completeness was established for every invoice that existed when the lookup began (`complete: true`). Times come from the PostgreSQL clock, so workers compare the same clock. The steps:
 
-## Invoice index automation
+1. **Local, PostgreSQL only** (`localInvoiceCandidates`): one indexed query over `invoice_mappings` (by `kiotviet_order_id` / `kiotviet_order_code`) and `kiotviet_invoice_index` (by `order_code`). These are candidates, never proof.
+2. **Completeness**, with the fewest requests:
+   - **reused** (0 requests): another job or worker already confirmed the index current with a request that started after this lookup began.
+   - **joined** (0 requests): an in-flight confirmation in the same process is awaited. Concurrent jobs share one tail request.
+   - **fetched** (usually 1 request): the tail page is re-read with an overlap of 1.
+   - **floor_scan** (usually 1 request): used when the index lags by more than 500 invoices, for orders this app created (see below).
+   - A confirmation older than the lookup is never reused.
+3. **Re-read** only the candidates found, so their status (active or cancelled) is current. A 404 removes the cached entry instead of reporting a duplicate.
 
-- An overlap mismatch (invoices deleted in KiotViet) no longer rebuilds 13k+ invoices: the scan position is re-located by binary search (≈ log₂(total) single-row reads), keeping the index. Only a remote list that is not sorted by id still forces a full rebuild.
-- A cached invoice that KiotViet answers 404 for is removed from the index instead of failing every lookup.
-- While the index lags by more than 500 invoices, an invoice job is **deferred** before any remote read (`blocked`, `failure_stage='invoice_index'`, `invoice_index_not_ready`). Attempts in `pending`/`creating` are never deferred; they keep the retry → link/review path.
-- The scheduler's `kiotviet_invoice_index` job (every minute) re-admits deferred orders once the index is current — once per deferral.
-- Orders whose invoice jobs keep exhausting their retries are re-checked at 30 min × 2ⁿ (max 24 h).
-- A stale index (not current for 15 min) is logged (`invoice_index_stale`) and shown on Admin → Hóa đơn.
-- Duplicate protection is unchanged: no invoice is created unless the lookup is complete.
+The normal path for a new order is therefore 1 local query (plus the clock and the index state) and 0–1 KiotViet requests.
 
-## Status values
+**`GET /invoices?orderId=` is never proof.** Its semantics are not documented. `scripts/verify-kiotviet-invoice-order-filter.ts` measures them (read-only; `--record` stores the result) and reports `filters`, `ignored` or `inconclusive`. Even with `filters`, the lookup asks the filter only when completeness failed, as an extra source of invoices to link, matched on `orderCode`. With `ignored`, the request is skipped.
 
-Admin → Hóa đơn shows each order's status, `error_code`, `failure_stage`, merchandise and Shopify-paid amounts. `invoice_mappings.status` maps to: `pending`, `creating` (shown as **processing**: POST sent or possibly sent, never resent automatically), `created`, `blocked` (not eligible, nothing sent), `needs_review`, `failed` (definitely not created, safe to retry). Each workflow stage logs `invoice_stage_<name>` (`trigger_ready`, `deferred_for_index`, `planned`, `applied`, `inventory_synchronized`).
+**POST timeout**: the row stays `creating` (outcome unknown) and the POST is never resent. The job then searches with the same lookup (delays `INVOICE_UNCERTAIN_POLL_MS`, default `1000,3000,8000`):
 
-## Deployment (VPS + PM2; operator procedure, not executed)
+- **Exactly one invoice found:** its ID is saved immediately and it goes through normal verification (lines, stock, payment). If the search that found it was incomplete, it stays `needs_review`.
+- **Two or more invoices:** `needs_review`, linking neither.
+- **None found:** still `creating`. Later job retries re-plan and link it once it is visible. After the 5-minute window, `invoice_outcome_unknown` goes to manual review (`--reset-uncertain` is operator-only).
 
-Back up PostgreSQL first. Migration 010 is additive (one generated column, one index, four counters).
+Unchanged safety: advisory lock plus claim token on the invoice claim, the `UNIQUE` constraints on `kiotviet_invoice_id` / `kiotviet_order_id` / `shopify_order_id`, the pre-POST re-check, and the stale-snapshot refusal.
+
+**Metrics** are stored in `reconciliation.duplicateLookup` (plan) and `reconciliation.prePostLookup`: `localMs`, `remoteMs`, `totalMs`, `apiCalls`, `freshness`, `method`, `candidates`, `indexLag`. Admin shows the PostgreSQL P95, the total average and P95, requests per lookup, and the share of shared confirmations. The `planned` stage log carries the same fields.
+
+**Measured** (development machine; real PostgreSQL engine via PGlite in-process, all 12 migrations applied, 20,000 indexed invoices, 8,000 order and invoice mappings):
+
+| Measure | p50 | p95 | max |
+| --- | --- | --- | --- |
+| Candidate query, order with invoices | 0.48 ms | 0.90 ms | 7.4 ms |
+| Candidate query, new order (miss) | 0.42 ms | 0.68 ms | 2.0 ms |
+| Whole local step (clock + candidates + index state) | 1.02 ms | 1.53 ms | 4.4 ms |
+
+`EXPLAIN ANALYZE` uses a BitmapOr over `invoice_mappings_kiotviet_order_id_key` and `invoice_mappings_kiotviet_order_code_idx`, plus `kiotviet_invoice_index_order_code_idx` (execution 0.22 ms).
+
+A networked `pg` connection adds its round-trip time per query. The remote part (0–1 KiotViet requests) was **not** measured: it depends on KiotViet's response time and is not assumed to be under 1 s. Measure both on staging or production with:
+
+```bash
+npx tsx --env-file=.env.production scripts/benchmark-invoice-lookup.ts --iterations 1000   # PostgreSQL only, read-only
+npx tsx --env-file=.env.production scripts/benchmark-invoice-lookup.ts --remote 5           # + 5 full lookups (KiotViet GETs only)
+```
+
+## Duplicate detection without waiting for the index
+
+When the app claims a Shopify order for KiotViet order creation (before the KiotViet order exists), it stores `order_mappings.invoice_id_floor` = the highest indexed invoice id. Every invoice of that order must have a larger id. So the job proves "no invoice yet" by reading invoices newest-first until it reaches an id ≤ floor (normally 1 request). Each page must be strictly ordered by id. Each later page re-reads the previous page's last invoice, so an insert, delete or ignored ordering during the scan makes it inconclusive, never complete. With more than 500 invoices above the floor, the job falls back to the full index. Orders linked by recovery, or recovered after a timed-out order POST, have no floor and always use the index. The final re-check right before the POST is unchanged.
+
+Index maintenance: an overlap mismatch is repaired by binary-search repositioning (no full rebuild). Scheduled runs hold a lease (`lease_owner/lease_until`), so they never overlap. Each run reads at most 30 pages. Jobs without a floor are deferred cheaply while the index lags and are re-admitted once it is current. Lag and staleness are shown in Admin.
+
+## Latency and state
+
+Each job stores `reconciliation.timings`: `triggerReceivedAt` (fulfillment webhook arrival), `admittedAt`, `jobStartedAt`, per-stage `…At`/`…Ms` (`triggerChecked`, `planned`, `invoiceApplied`, `inventorySynchronized`), `queueMs`, `invoiceLatencyMs` (webhook → verified invoice, the SLO measure) and `totalLatencyMs` (including stock). Admin → Settings and Admin → Hóa đơn show the average, the P95 and the share within 60 s over 7 days. Targets (5–30 s typical, 95% ≤ 60 s) are goals; nothing has been measured in production yet.
+
+One Shopify read per job was removed: the planner reuses the job's live state, and the pre-apply check compares the settings version. Shopify changes are still caught by apply's fresh order snapshot.
+
+Stock sync is independent of invoice creation. A failure is stored in `reconciliation.shopifyStockSynchronized=false` with `stockRetryAt` (5 min × 2ⁿ, max 6 h), and the minute scheduler retries only the stock push. Shopify receives absolute KiotViet on-hand, never a decrement, so retries cannot deduct twice. A stock failure never overwrites a `needs_review` invoice's payment error.
+
+## Rollout (VPS + PM2; operator procedure, not executed)
 
 ```bash
 cd /var/www/shopify-kiotviet
+pg_dump "$DATABASE_URL" -Fc -f "backup-$(date +%F-%H%M).dump"
 pm2 stop shopify-kiotviet-worker shopify-kiotviet-scheduler shopify-kiotviet-web
-# install the reviewed release with your normal process (git pull / rsync)
+# install the reviewed release (git pull / rsync)
 npm ci
-npx tsx --env-file=.env.production scripts/migrate.ts
+npx tsx --env-file=.env.production scripts/migrate.ts        # applies 010, 011 and 012 if not yet applied
 npm run typecheck && npm test && npm run build
 NODE_OPTIONS="--env-file=/var/www/shopify-kiotviet/.env.production" pm2 restart ecosystem.config.js --update-env
 pm2 save
 pm2 logs shopify-kiotviet-worker --lines 100
 npx tsx --env-file=.env.production scripts/build-kiotviet-invoice-index.ts --status
+# Read-only checks after the deploy:
+npx tsx --env-file=.env.production scripts/benchmark-invoice-lookup.ts --iterations 1000
+npx tsx --env-file=.env.production scripts/verify-kiotviet-invoice-order-filter.ts            # add --record to store the result
 ```
 
-Then, in Admin → Settings: keep the current trigger, tick **Product-Only Invoicing**, save. Watch the first new order end to end before relying on it unattended.
+Migration 012 creates three plain indexes inside the migration transaction. On these table sizes that takes seconds, but it locks writes to `invoice_mappings` and `order_mappings` while building, so run it with the worker stopped (as above). Rollback: `database/rollback/012_invoice_lookup_indexes.down.sql` (indexes only). The worker setting `INVOICE_UNCERTAIN_POLL_MS` (optional, default `1000,3000,8000`) goes in `.env.production`.
 
-Rollback: untick the mode (strict rules apply again immediately), or redeploy the previous release and run `database/rollback/010_product_only_invoicing.down.sql`. Invoices already created keep their audit in `reconciliation.productOnly`.
+Then, in Admin → Settings:
+
+1. Keep `shopify_fulfilled` and `USD`. Tick **Product-Only Invoicing** and save.
+2. Decide with accounting about **Allow Unverified Prepayment Inheritance**. Enable it only after reading and ticking the confirmation.
+3. Watch the first new Paid + Fulfilled order with the queries below: one invoice, `paymentVerification.status`, `stockVerified`, `shopifyStockSynchronized`, `timings`.
+4. If its payment shows `mismatch`, turn the policy off and settle that invoice in KiotViet manually. From then on, new orders are blocked again instead of being created unpaid.
+
+Rollback, fastest first:
+
+1. Untick **Allow Unverified Prepayment Inheritance**.
+2. Untick **Product-Only** (strict rules apply immediately).
+3. Set the trigger to Disabled.
+4. Redeploy the previous release and run `database/rollback/011_invoice_automation.down.sql`, then `010_…down.sql` if needed.
+
+Invoices already created stay in KiotViet and keep their audit.
 
 ## Verification queries (read-only)
 
 ```sql
--- Order and invoice for one Shopify order
-SELECT shopify_order_id,shopify_order_number,kiotviet_order_id,kiotviet_order_code,status,sync_status,invoice_check_at
+-- #1071 / #1082 and any new order
+SELECT shopify_order_id,shopify_order_number,kiotviet_order_id,kiotviet_order_code,status,invoice_id_floor,invoice_check_at
 FROM order_mappings WHERE shopify_order_id IN ('7107364880568','7133915545784');
 
 SELECT shopify_order_id,kiotviet_order_code,kiotviet_invoice_id,kiotviet_invoice_code,status,error_code,failure_stage,last_error,
-  reconciliation->>'invoicingMode' AS mode,
+  reconciliation->'productOnly'->>'prepaymentPolicy' AS prepayment_policy,
   reconciliation->'productOnly'->>'invoiceMerchandise' AS invoice_merchandise,
   reconciliation->'productOnly'->>'shopifyPaid' AS shopify_paid,
   reconciliation->'productOnly'->>'kiotVietPrepaid' AS kiotviet_prepaid,
+  reconciliation->'paymentVerification' AS payment_verification,
   reconciliation->'productOnly'->'differences' AS differences,
-  reconciliation->'checks' AS checks, reconciliation->>'stockVerified' AS stock_verified,
-  reconciliation->>'shopifyStockSynchronized' AS shopify_stock_synced
+  reconciliation->>'stockVerified' AS stock_verified, reconciliation->>'shopifyStockSynchronized' AS shopify_stock_synced,
+  reconciliation->'timings' AS timings
 FROM invoice_mappings WHERE shopify_order_id IN ('7107364880568','7133915545784');
 
-SELECT id,status,attempts,max_attempts,error_code,error,payload->>'triggerState' AS trigger_state,created_at,completed_at
-FROM sync_jobs WHERE type='shopify_invoice_create' AND payload->>'entityId' IN ('7107364880568','7133915545784')
-ORDER BY created_at;
+SELECT id,status,attempts,max_attempts,error_code,error,payload->>'triggerState' AS trigger_state,
+  payload->>'receivedAt' AS received_at,payload->>'admittedAt' AS admitted_at,created_at,completed_at
+FROM sync_jobs WHERE type='shopify_invoice_create' AND payload->>'entityId' IN ('7107364880568','7133915545784') ORDER BY created_at;
 
--- Overview: what blocks automatic invoicing right now
-SELECT status,error_code,failure_stage,count(*) FROM invoice_mappings
-WHERE kiotviet_invoice_id IS NULL GROUP BY 1,2,3 ORDER BY 4 DESC;
+-- Duplicate-lookup performance (last 7 days): latency, KiotViet requests, shared freshness
+SELECT count(*),percentile_cont(0.95) WITHIN GROUP (ORDER BY (l->>'localMs')::float8) AS local_p95_ms,
+  percentile_cont(0.95) WITHIN GROUP (ORDER BY (l->>'totalMs')::float8) AS total_p95_ms,
+  avg((l->>'apiCalls')::float8) AS api_calls_avg, count(*) FILTER (WHERE l->>'freshness' IN ('reused','joined')) AS shared
+FROM invoice_mappings, LATERAL (VALUES (reconciliation->'duplicateLookup'),(reconciliation->'prePostLookup')) v(l)
+WHERE updated_at>now()-interval '7 days' AND jsonb_typeof(l)='object';
 
--- Duplicate guard: must return no rows
+-- Invoices linked automatically after a timed-out POST
+SELECT shopify_order_id,kiotviet_invoice_code,status,reconciliation->'uncertainPost' FROM invoice_mappings WHERE reconciliation ? 'uncertainPost';
+
+-- Indexes used by the local lookup
+SELECT indexname FROM pg_indexes WHERE tablename IN ('invoice_mappings','order_mappings','kiotviet_invoice_index') ORDER BY 1;
+
+-- Duplicate guard: both must return no rows
 SELECT kiotviet_order_id,count(*) FROM invoice_mappings WHERE kiotviet_invoice_id IS NOT NULL GROUP BY 1 HAVING count(*)>1;
+SELECT kiotviet_invoice_id,count(*) FROM invoice_mappings WHERE kiotviet_invoice_id IS NOT NULL GROUP BY 1 HAVING count(*)>1;
+
+-- What blocks automation now
+SELECT status,error_code,failure_stage,count(*) FROM invoice_mappings WHERE kiotviet_invoice_id IS NULL GROUP BY 1,2,3 ORDER BY 4 DESC;
+
+-- Payment inheritance observed on created invoices (evidence for accounting)
+SELECT reconciliation->'productOnly'->>'prepaymentPolicy' AS policy,reconciliation->'paymentVerification'->>'status' AS payment,count(*)
+FROM invoice_mappings WHERE kiotviet_invoice_id IS NOT NULL GROUP BY 1,2;
+SELECT shopify_order_id,kiotviet_invoice_code,reconciliation->'paymentVerification'->'discrepancies'
+FROM invoice_mappings WHERE reconciliation->'paymentVerification'->>'status'='mismatch';
+
+-- Stock sync pending/failed
+SELECT shopify_order_id,reconciliation->>'stockSyncAttempts' AS attempts,reconciliation->>'stockRetryAt' AS retry_at,reconciliation->>'shopifyStockError' AS error
+FROM invoice_mappings WHERE reconciliation->>'shopifyStockSynchronized'='false';
+
+-- Latency SLO (last 7 days)
+SELECT count(*),round(avg(ms)) AS avg_ms,round(percentile_cont(0.95) WITHIN GROUP (ORDER BY ms)) AS p95_ms,
+  round(100.0*count(*) FILTER (WHERE ms<=60000)/NULLIF(count(*),0),1) AS pct_within_60s
+FROM (SELECT (reconciliation->'timings'->>'invoiceLatencyMs')::numeric AS ms FROM invoice_mappings
+  WHERE invoiced_at>now()-interval '7 days' AND reconciliation->'timings' ? 'invoiceLatencyMs') t;
 
 -- Index health
-SELECT scanned_count,remote_total,current_as_of,generation,reset_count,reposition_count,last_error FROM kiotviet_invoice_index_state;
-
--- Product-Only invoices whose financial differences remain open (expected; for accounting)
-SELECT shopify_order_id,kiotviet_invoice_code,reconciliation->'productOnly'->'differences' FROM invoice_mappings
-WHERE status='created' AND reconciliation->>'invoicingMode'='product_only' AND reconciliation->>'financiallyReconciled'='false';
+SELECT scanned_count,remote_total,remote_total-scanned_count AS lag,current_as_of,generation,reset_count,reposition_count,lease_owner,lease_until,last_error
+FROM kiotviet_invoice_index_state;
 ```
 
 ## #1071 and #1082 (dry runs only)
 
-An order created before the trigger's `invoiceTriggerEnabledAt` is never picked up by automation and needs an explicit recovery action. Dry run first (read-only):
+Automation never backfills orders created before `invoiceTriggerEnabledAt`; such orders need an explicit recovery action:
 
 ```bash
 npx tsx --env-file=.env.production scripts/recover-kiotviet-invoice.ts 7107364880568 7133915545784
 ```
 
-- **#1071 / DH031121**: expected output `invoice_merchandise=154 kiotviet_prepaid=164`, differences `shipping_excluded 10` and `kiotviet_prepaid_vs_invoice 10`, plan `blocked: prepayment_exceeds_invoice`. KiotViet holds 164 paid against a 154 product invoice; how it carries the extra 10 is unverified, so this needs accounting's decision (admin override, which stays `needs_review`) or a correction of the KiotViet payment first.
-- **#1082 / DH031389**: expected `invoice_merchandise=202 kiotviet_prepaid=202`. Blocked only by `prepayment_inheritance_unverified` (plus `invoice_lookup_incomplete` until the index is current). Once the inheritance evidence is recorded and accounting signs off, the dry run shows `create one invoice … additional payment 0`; only then run the same command with `--apply`.
+- **#1082 / DH031389**: the dry run is expected to show invoice 202, Shopify paid 210.42, `processing_fee_excluded 8.42` and additional payment 0.
+  - With `allowUnverifiedPrepaymentInheritance` on, the plan is `create one invoice`. Only then would `--apply` create it, and its payment is then verified or flagged `needs_review`.
+  - Otherwise it stays `blocked: prepayment_inheritance_unverified`.
+- **#1071 / DH031121**: invoice 154 against a 164 prepayment, with `shipping_excluded 10`. Always `blocked: prepayment_exceeds_invoice`. Under `prepaymentExceedsInvoicePolicy: manual_override` it can go through the admin override (stays `needs_review`). The 10 USD is never changed, deleted, duplicated or refunded.
 
-These expectations come from unit-test fixtures built from the reported totals; no live dry run was executed.
+These expectations come from unit-test fixtures built from the reported totals (the split into product lines is illustrative). No live dry run was executed.
 
-## Remaining safety blockers
+## Remaining risks
 
-1. **Prepayment inheritance is unverified.** KiotViet does not document whether an invoice created from an order (POST /invoices with `orderId`) inherits the order's prepayment. Until `scripts/verify-kiotviet-prepayment-inheritance.ts` records `carried` on a **sandbox** retailer and accounting sets `orders.invoicePrepaymentVerified`, every prepaid order — i.e. every normal paid order — stays `blocked`. This is the main gate to unattended invoicing.
-2. **Prepayment ≠ merchandise** (orders created before Product-Only, where KiotViet recorded shipping in the prepayment, like #1071) is never invoiced automatically; the over-carry behavior is untested.
-3. **Added product tax** still blocks. Tax is not a surcharge; dropping it silently was out of scope.
-4. **KiotViet orders that already carry a surcharge** block, because it is undocumented whether the invoice copies it.
-5. **Index soundness** still rests on KiotViet allocating increasing invoice ids and honoring `orderBy=id` (checked on every page; a violation forces a rebuild and blocks invoicing meanwhile).
-6. **Cross-system races**: a staff member can still create an invoice between the final lookup and the POST; Product-Only does not change this (see `docs/fulfillment-invoices.md`).
+1. **Unverified inheritance is a business decision.** With the policy on, an invoice can be created before KiotViet's behavior is known. If KiotViet does not carry the prepayment, every such invoice shows unpaid in KiotViet and is `needs_review` until accounting settles it. The first invoice reveals the behavior: check it before leaving the policy on.
+2. **The floor scan and the index both assume** KiotViet allocates increasing invoice ids and honors `orderBy=id` (checked on every page). A staff invoice created between the final check and the POST is still possible (see `docs/fulfillment-invoices.md`).
+3. **Overpaid historical orders (#1071)**, **added product tax** and **KiotViet orders that already carry a surcharge** still need people.
+4. **Latency targets are unmeasured.** Real values depend on KiotViet/Shopify response times and rate limits; Admin now shows them.
+5. **The migrations were not run against a real PostgreSQL in development**; run them in staging first.
