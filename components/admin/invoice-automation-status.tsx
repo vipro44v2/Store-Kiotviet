@@ -41,7 +41,7 @@ export function InvoiceAutomationStatus({ orders, index, stats }: {
           {" "}needs_review {counts.needs_review ?? 0} · failed {counts.failed ?? 0}
         </dd>
         <dt>Thanh toán sau khi tạo</dt>
-        <dd>khớp {counts.payment_verified ?? 0} · lệch {counts.payment_mismatch ?? 0} · tồn kho Shopify chưa đồng bộ {counts.stock_unsynced ?? 0}</dd>
+        <dd>khớp {counts.payment_verified ?? 0} · lệch {counts.payment_mismatch ?? 0} · chưa xác minh {counts.payment_unverified ?? 0} · tồn kho Shopify chưa đồng bộ {counts.stock_unsynced ?? 0}</dd>
         <dt>Độ trễ (7 ngày, webhook → hóa đơn đã kiểm tra)</dt>
         <dd>
           {latency && latency.samples

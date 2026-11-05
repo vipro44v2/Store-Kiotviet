@@ -112,12 +112,17 @@ async function syncInventoryNotificationLocked(
     throw new MappingError(`Inventory event for KiotViet product ${notification.ProductId} does not own SKU ${sku}`);
   if (!mapping.shopify_inventory_item_id)
     throw new MappingError(`Mapping ${sku} has no Shopify inventory item`);
+  // shared_branches: other enabled KiotViet branches writing the same Shopify location. Each
+  // branch sets the level to its own on-hand, so they would overwrite each other.
   let locations = await query<{
     shopify_location_id: string;
     safety_stock: string;
     created?: boolean;
+    shared_branches?: number;
   }>(
-    "SELECT shopify_location_id,safety_stock::text FROM branch_location_mappings WHERE kiotviet_branch_id=$1 AND enabled=true",
+    `SELECT shopify_location_id,safety_stock::text,(SELECT count(*) FROM branch_location_mappings o
+        WHERE o.shopify_location_id=b.shopify_location_id AND o.enabled AND o.kiotviet_branch_id<>b.kiotviet_branch_id)::int AS shared_branches
+      FROM branch_location_mappings b WHERE kiotviet_branch_id=$1 AND enabled=true`,
     [notification.BranchId],
   );
   if (!locations.length) {
@@ -140,7 +145,9 @@ async function syncInventoryNotificationLocked(
       `INSERT INTO branch_location_mappings(
         kiotviet_branch_id,kiotviet_branch_name,shopify_location_id,
         shopify_location_name,enabled,safety_stock
-      ) VALUES($1,$2,$3,$4,true,0)
+      ) SELECT $1,$2,$3,$4,true,0
+      -- Never auto-map a branch onto a location another enabled branch already writes.
+      WHERE NOT EXISTS (SELECT 1 FROM branch_location_mappings o WHERE o.shopify_location_id=$3 AND o.enabled AND o.kiotviet_branch_id<>$1)
       ON CONFLICT(kiotviet_branch_id,shopify_location_id) DO NOTHING
       RETURNING shopify_location_id,safety_stock::text,true AS created`,
       [
@@ -164,7 +171,7 @@ async function syncInventoryNotificationLocked(
       );
       if (!existing.length)
         throw new MappingError(
-          `Unable to create Shopify location mapping for KiotViet branch ${notification.BranchId}`,
+          `Unable to create Shopify location mapping for KiotViet branch ${notification.BranchId}: the only Shopify location may already be mapped to another KiotViet branch (one branch per location); map it manually`,
         );
       if (!existing[0].enabled)
         throw new MappingError(
@@ -186,6 +193,8 @@ async function syncInventoryNotificationLocked(
   if (locations.length > 1)
     throw new ConflictError(`KiotViet branch ${notification.BranchId} has multiple enabled Shopify location mappings`);
   const [location] = locations;
+  if (Number(location.shared_branches ?? 0) > 0)
+    throw new ConflictError(`Shopify location ${location.shopify_location_id} is mapped to KiotViet branch ${notification.BranchId} and ${location.shared_branches} other enabled branch(es); their stock would overwrite each other, so nothing is written (map one branch per location)`);
   const expected = calculateInventory(
     notification.OnHand,
     notification.Reserved,

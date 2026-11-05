@@ -4,16 +4,24 @@ import { DataTable } from "@/components/admin/data-table";
 import { InvoiceAutomationStatus, type InvoiceAutomationStats } from "@/components/admin/invoice-automation-status";
 import { query } from "@/lib/db/client";
 import { getInvoiceIndexHealth, type InvoiceIndexHealth } from "@/lib/kiotviet/invoice-index";
-import { INVOICE_DISPLAY_STATUS, invoicesRepository } from "@/repositories/invoices";
+import { INVOICE_DISPLAY_STATUS, invoicesRepository, type InvoiceFilter } from "@/repositories/invoices";
 
-export default async function InvoicesPage() {
+const FILTERS: Array<{ value: InvoiceFilter | undefined; label: string }> = [
+  { value: undefined, label: "Tất cả" },
+  { value: "payment_review", label: "Cần kiểm tra thanh toán (lệch / chưa xác minh)" },
+  { value: "needs_review", label: "Hóa đơn cần kiểm tra (needs_review)" },
+];
+
+export default async function InvoicesPage({ searchParams }: { searchParams: Promise<{ [key: string]: string | string[] | undefined }> }) {
   await connection();
+  const requested = (await searchParams).filter;
+  const filter = FILTERS.find((item) => item.value && item.value === requested)?.value;
   let rows: Record<string, unknown>[] = [], adjustments: Record<string, unknown>[] = [], stats: InvoiceAutomationStats | null = null;
   let index: InvoiceIndexHealth | null = null, orders: Record<string, unknown> | undefined, error = "";
   try {
     let settings: Array<{ value: Record<string, unknown> }>;
     [rows, stats, index, settings, adjustments] = await Promise.all([
-      invoicesRepository.recent(), invoicesRepository.automationStats(), getInvoiceIndexHealth(),
+      invoicesRepository.recent(100, filter), invoicesRepository.automationStats(), getInvoiceIndexHealth(),
       query<{ value: Record<string, unknown> }>("SELECT value FROM system_settings WHERE key='orders'"),
       invoicesRepository.lineAdjustments(),
     ]);
@@ -42,6 +50,22 @@ export default async function InvoicesPage() {
             {index?.lastError && <p><small>Lỗi chỉ mục gần nhất: {index.lastError}</small></p>}
           </section>
         </div>
+      )}
+      {!error && (
+        <nav aria-label="Lọc hóa đơn" style={{ display: "flex", gap: 12, flexWrap: "wrap", margin: "8px 0" }}>
+          {FILTERS.map((item) => (
+            <a key={item.label} href={item.value ? `?filter=${item.value}` : "?"} aria-current={item.value === filter ? "page" : undefined}
+              style={{ fontWeight: item.value === filter ? 700 : 400 }}>
+              {item.label}
+            </a>
+          ))}
+        </nav>
+      )}
+      {!error && (
+        <small>
+          status: hóa đơn KiotViet có tồn tại và đã được kiểm tra hay chưa. payment_status: xác minh thanh toán riêng (verified / mismatch / unverified /
+          not_applicable); outstanding là số còn nợ theo KiotViet. Hệ thống không bao giờ tự tạo hóa đơn hoặc thanh toán thứ hai để sửa chênh lệch.
+        </small>
       )}
       {!error && <DataTable rows={rows.map((row) => ({ ...row, status: INVOICE_DISPLAY_STATUS[String(row.status)] ?? row.status }))} />}
       {!error && adjustments.length > 0 && (

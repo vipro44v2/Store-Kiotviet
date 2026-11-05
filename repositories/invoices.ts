@@ -13,16 +13,28 @@ export const INVOICE_DISPLAY_STATUS: Record<string, string> = {
   failed: "failed",
 };
 
+export type InvoiceFilter = "payment_review" | "needs_review";
+
 export const invoicesRepository = {
   /** Most recently changed invoice states with their blocker and Product-Only amounts. */
-  async recent(limit = 100) {
+  /**
+   * Most recently changed invoice states. Invoice existence (invoice code, status) and payment
+   * verification (payment_status) are separate. filter: payment_review = payment mismatch or
+   * unverified on an existing invoice; needs_review = invoice verification needs a person.
+   */
+  async recent(limit = 100, filter?: InvoiceFilter) {
+    const where = filter === "payment_review" ? "WHERE i.kiotviet_invoice_id IS NOT NULL AND i.payment_status IN ('mismatch','unverified')"
+      : filter === "needs_review" ? "WHERE i.status='needs_review'" : "";
     return query<Record<string, unknown>>(
-      `SELECT concat_ws(' ',o.shopify_order_number,'('||i.shopify_order_id||')') AS shopify_order,i.kiotviet_order_code AS kiotviet_order,
-        i.kiotviet_invoice_code AS invoice,i.status,substring(i.last_error from '^([a-z][a-z0-9_]*):') AS error_code,
-        i.failure_stage,i.reconciliation->'productOnly'->>'invoiceMerchandise' AS invoice_merchandise,
-        i.reconciliation->'productOnly'->>'shopifyPaid' AS shopify_paid,i.last_error,i.updated_at
+      `SELECT concat_ws(' ',o.shopify_order_number,'('||i.shopify_order_id||')') AS shopify_order,
+        COALESCE(i.kiotviet_invoice_code,'—') AS invoice,i.status,i.payment_status,
+        i.reconciliation->'paymentVerification'->>'expectedPaid' AS expected_paid,
+        COALESCE(i.reconciliation->'paymentVerification'->>'invoiceTotalPayment',i.reconciliation->'invoice'->>'totalPayment') AS invoice_paid,
+        i.reconciliation->'paymentVerification'->>'remainingBalance' AS outstanding,
+        (SELECT string_agg(d,'; ') FROM jsonb_array_elements_text(COALESCE(i.reconciliation->'paymentVerification'->'discrepancies','[]'::jsonb)) d) AS payment_discrepancies,
+        i.last_error
       FROM invoice_mappings i LEFT JOIN order_mappings o ON o.shopify_order_id=i.shopify_order_id
-      ORDER BY i.updated_at DESC LIMIT $1`,
+      ${where} ORDER BY i.updated_at DESC LIMIT $1`,
       [limit],
     );
   },
@@ -45,8 +57,9 @@ export const invoicesRepository = {
         count(*) FILTER (WHERE status='pending')::text AS pending, count(*) FILTER (WHERE status='creating')::text AS processing,
         count(*) FILTER (WHERE status='created')::text AS created, count(*) FILTER (WHERE status='blocked')::text AS blocked,
         count(*) FILTER (WHERE status='needs_review')::text AS needs_review, count(*) FILTER (WHERE status='failed')::text AS failed,
-        count(*) FILTER (WHERE reconciliation->'paymentVerification'->>'status'='verified')::text AS payment_verified,
-        count(*) FILTER (WHERE reconciliation->'paymentVerification'->>'status'='mismatch')::text AS payment_mismatch,
+        count(*) FILTER (WHERE payment_status='verified')::text AS payment_verified,
+        count(*) FILTER (WHERE payment_status='mismatch')::text AS payment_mismatch,
+        count(*) FILTER (WHERE payment_status='unverified')::text AS payment_unverified,
         count(*) FILTER (WHERE reconciliation->>'shopifyStockSynchronized'='false')::text AS stock_unsynced
       FROM invoice_mappings`),
       query<{ samples: string; avg_ms: string | null; p95_ms: string | null; within_60s: string }>(`SELECT count(*)::text AS samples,

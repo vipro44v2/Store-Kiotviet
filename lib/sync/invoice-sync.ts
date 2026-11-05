@@ -259,17 +259,23 @@ export async function finalizeInvoice(
   const ok = Object.values(checks).every(Boolean) && reconciliation.stockVerified === true;
   const failed = Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);
   if (reconciliation.stockVerified !== true) failed.push("stock_movement_unverified");
+  // Payment verification is a separate status from invoice existence/verification:
+  // verified | mismatch | not_applicable (nothing expected, nothing paid).
+  const paymentStatus = expectedPayment === 0 && cents(detail.totalPayment) === 0 ? "not_applicable"
+    : productOnly ? (paymentDiscrepancies.length ? "mismatch" : "verified")
+    : checks.payment && checks.paymentRecords ? "verified" : "mismatch";
   const updated = await query(
     `UPDATE invoice_mappings SET kiotviet_invoice_id=$2,kiotviet_invoice_code=$3,status=$4,source=COALESCE($8,source),reconciliation=$5,
       last_error=$6,failure_stage=$7,claim_token=NULL,invoiced_at=now(),updated_at=now(),
-      kiotviet_order_id=COALESCE(kiotviet_order_id,$9),kiotviet_order_code=COALESCE(kiotviet_order_code,$10)
+      kiotviet_order_id=COALESCE(kiotviet_order_id,$9),kiotviet_order_code=COALESCE(kiotviet_order_code,$10),
+      payment_status=$11,payment_checked_at=now()
     WHERE shopify_order_id=$1 AND (kiotviet_invoice_id IS NULL OR kiotviet_invoice_id=$2) RETURNING shopify_order_id`,
     [
       row.shopify_order_id, detail.id, detail.code, ok ? "created" : "needs_review", JSON.stringify(reconciliation),
       // Payment discrepancies never decide the status; they are only mentioned alongside a real failure.
       ok ? null : `invoice_verification_failed: KiotViet invoice ${detail.code} does not match: ${failed.join(", ")}${paymentDiscrepancies.length ? ` (also informational payment differences: ${paymentDiscrepancies.join("; ")})` : ""}`,
       ok ? null : "verify_invoice",
-      options.source ?? null, kiotVietOrder.id, kiotVietOrder.code,
+      options.source ?? null, kiotVietOrder.id, kiotVietOrder.code, paymentStatus,
     ],
   );
   await log(ok && reconciliation.stockVerified !== false ? "info" : "warn", "KiotViet invoice verified", {
@@ -279,7 +285,7 @@ export async function finalizeInvoice(
     stockBefore: reconciliation.stockBefore, stockAfter: reconciliation.stockAfter, stockVerified: reconciliation.stockVerified,
     linked: updated.length > 0,
   });
-  return { status: ok ? "created" : "needs_review", invoice: detail, reconciliation, linked: updated.length > 0 };
+  return { status: ok ? "created" : "needs_review", paymentStatus, invoice: detail, reconciliation, linked: updated.length > 0 };
 }
 
 /**

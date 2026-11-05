@@ -73,12 +73,12 @@ function run(sql: string, params: unknown[]): Record<string, unknown>[] {
   if (sql.startsWith("UPDATE invoice_mappings SET last_error")) { Object.assign(row, { last_error: params[2], updated_at: now() }); return []; }
   if (sql.startsWith("UPDATE invoice_mappings SET kiotviet_invoice_id=$3")) {
     if (row.claim_token !== params[1] || (sql.includes("kiotviet_invoice_id IS NULL") && row.kiotviet_invoice_id)) return [];
-    Object.assign(row, { kiotviet_invoice_id: String(params[2]), kiotviet_invoice_code: params[3], status: "needs_review", updated_at: now() });
+    Object.assign(row, { kiotviet_invoice_id: String(params[2]), kiotviet_invoice_code: params[3], status: "needs_review", payment_status: sql.includes("payment_status='unverified'") ? "unverified" : row.payment_status, updated_at: now() });
     return [{ shopify_order_id: row.shopify_order_id }];
   }
   if (sql.startsWith("UPDATE invoice_mappings SET kiotviet_invoice_id=$2")) {
     if (row.kiotviet_invoice_id && row.kiotviet_invoice_id !== String(params[1])) return [];
-    Object.assign(row, { kiotviet_invoice_id: String(params[1]), kiotviet_invoice_code: params[2], status: params[3], reconciliation: JSON.parse(String(params[4])), last_error: params[5], updated_at: now() });
+    Object.assign(row, { kiotviet_invoice_id: String(params[1]), kiotviet_invoice_code: params[2], status: params[3], reconciliation: JSON.parse(String(params[4])), last_error: params[5], payment_status: params[10], updated_at: now() });
     return [{}];
   }
   throw new Error(`Unhandled SQL: ${sql.slice(0, 70)}`);
@@ -964,5 +964,26 @@ describe("merchant policy: a refunded product is never shipped", () => {
     expect((plan.action as { reasons: string[] }).reasons).toEqual(expect.arrayContaining([expect.stringContaining("refund_after_kiotviet_order: SKU E54 is 1")]));
     await applyInvoiceRecovery(plan);
     expect(mocks.createInvoice).not.toHaveBeenCalled();
+  });
+});
+
+describe("invoice payment status is independent of invoice existence", () => {
+  const allow = () => Object.assign(mocks.orderSettings, { allowUnverifiedPrepaymentInheritance: true, acknowledgeUnverifiedPrepaymentRisk: true });
+  it("created invoice + verified payment", async () => {
+    allow();
+    await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(mocks.invoice).toMatchObject({ status: "created", payment_status: "verified" });
+  });
+  it("created invoice + payment mismatch (exists, financially needs review)", async () => {
+    allow();
+    mocks.invoiceDetail.mockResolvedValue(invoiceDetail(fixture, { totalPayment: 0, payments: [] }));
+    await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(mocks.invoice).toMatchObject({ status: "created", payment_status: "mismatch", kiotviet_invoice_id: "8001" });
+  });
+  it("invoice saved but not yet readable: payment unverified (never assumed verified)", async () => {
+    allow();
+    mocks.invoiceDetail.mockRejectedValue(new Error("KiotViet 503"));
+    await applyInvoiceRecovery(await planInvoiceRecovery(ORDER_1082.orderId));
+    expect(mocks.invoice).toMatchObject({ status: "needs_review", payment_status: "unverified", kiotviet_invoice_id: "8001" });
   });
 });

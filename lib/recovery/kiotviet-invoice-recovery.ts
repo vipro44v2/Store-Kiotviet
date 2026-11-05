@@ -644,7 +644,7 @@ export async function applyInvoiceRecovery(
   // KiotViet returned an invoice: record its ID immediately (needs_review until verified),
   // so a failing read-back can never lose it or lead to a second invoice.
   await query(
-    "UPDATE invoice_mappings SET kiotviet_invoice_id=$3,kiotviet_invoice_code=$4,status='needs_review',last_error='Invoice created; verification pending',failure_stage='verify_invoice',invoiced_at=now(),updated_at=now() WHERE shopify_order_id=$1 AND claim_token=$2",
+    "UPDATE invoice_mappings SET kiotviet_invoice_id=$3,kiotviet_invoice_code=$4,status='needs_review',last_error='Invoice created; verification pending',failure_stage='verify_invoice',invoiced_at=now(),updated_at=now(),payment_status='unverified' WHERE shopify_order_id=$1 AND claim_token=$2",
     [orderId, token, created.id, created.code],
   );
   let result: Awaited<ReturnType<typeof finalizeInvoice>>;
@@ -710,7 +710,7 @@ async function settleUncertainInvoice(
       const owned = await transaction(async (client) => {
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`kiotviet-invoice:${orderId}`]);
         const result = await client.query(
-          "UPDATE invoice_mappings SET kiotviet_invoice_id=$3,kiotviet_invoice_code=$4,status='needs_review',last_error='Invoice found after an uncertain POST; verification pending',failure_stage='verify_invoice',invoiced_at=now(),updated_at=now() WHERE shopify_order_id=$1 AND claim_token=$2 AND kiotviet_invoice_id IS NULL RETURNING shopify_order_id",
+          "UPDATE invoice_mappings SET kiotviet_invoice_id=$3,kiotviet_invoice_code=$4,status='needs_review',last_error='Invoice found after an uncertain POST; verification pending',failure_stage='verify_invoice',invoiced_at=now(),updated_at=now(),payment_status='unverified' WHERE shopify_order_id=$1 AND claim_token=$2 AND kiotviet_invoice_id IS NULL RETURNING shopify_order_id",
           [orderId, token, found.id, found.code],
         );
         return result.rows.length > 0;

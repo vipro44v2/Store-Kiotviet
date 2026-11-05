@@ -286,3 +286,35 @@ describe("syncInventoryNotification", () => {
     );
   });
 });
+
+describe("one KiotViet branch per Shopify location (multi-branch safety)", () => {
+  it("writes nothing when another enabled branch also maps to the same Shopify location", async () => {
+    mocks.query.mockResolvedValueOnce([{ shopify_location_id: "location-1", safety_stock: "0", shared_branches: 1 }]);
+    await expect(syncInventoryNotification(notification)).rejects.toThrow("their stock would overwrite each other");
+    expect(mocks.setInventory).not.toHaveBeenCalled();
+  });
+
+  it("each branch keeps writing its own location", async () => {
+    mocks.query.mockImplementation(async (sql: string, params: unknown[]) =>
+      sql.includes("FROM branch_location_mappings b") ? [{ shopify_location_id: `location-${params[0]}`, safety_stock: "0", shared_branches: 0 }] : []);
+    await syncInventoryNotification(notification);
+    await syncInventoryNotification({ ...notification, BranchId: 20, OnHand: 4 });
+    expect(mocks.setInventory.mock.calls.map(([, location, quantity]) => [location, quantity])).toEqual([["location-10", 10], ["location-20", 4]]);
+  });
+
+  it("never auto-maps a branch onto a location another branch already writes", async () => {
+    mocks.query.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    mocks.getActiveLocations.mockResolvedValue([{ id: "location-1", name: "Primary" }]);
+    await expect(syncInventoryNotification(notification)).rejects.toThrow("may already be mapped to another KiotViet branch");
+    const insert = mocks.query.mock.calls.find(([sql]) => String(sql).includes("INSERT INTO branch_location_mappings"))![0] as string;
+    expect(insert).toContain("WHERE NOT EXISTS (SELECT 1 FROM branch_location_mappings o WHERE o.shopify_location_id=$3 AND o.enabled AND o.kiotviet_branch_id<>$1)");
+    expect(mocks.setInventory).not.toHaveBeenCalled();
+  });
+
+  it("a retried job after a successful write changes nothing (absolute quantities, no second write)", async () => {
+    mocks.query.mockResolvedValue([{ shopify_location_id: "location-1", safety_stock: "0", shared_branches: 0 }]);
+    mocks.getInventory.mockResolvedValue(10); // the first attempt already set 10
+    await expect(syncInventoryNotification(notification)).resolves.toMatchObject({ status: "synced" });
+    expect(mocks.setInventory).not.toHaveBeenCalled();
+  });
+});
