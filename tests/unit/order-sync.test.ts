@@ -28,6 +28,9 @@ const mocks = vi.hoisted(() => ({
   findInvoices: vi.fn(),
   invoiceDetail: vi.fn(),
   getProduct: vi.fn(),
+  freshOrder: vi.fn(),
+  snapshots: new Map<string, unknown>(),
+  pinned: new Set<string>(),
   db: {
     invoices: new Map<string, Record<string, unknown>>(),
     locationMapped: true,
@@ -43,6 +46,10 @@ function runInvoice(sql: string, params: unknown[]): Record<string, unknown>[] |
   const id = String(params[0]);
   const invoice = db.invoices.get(id);
   if (sql.includes("FROM branch_location_mappings")) return db.locationMapped ? [{ "?column?": 1 }] : [];
+  if (sql === "SELECT kiotviet_order_id::text FROM order_mappings WHERE shopify_order_id=$1") {
+    const row = db.rows.get(id);
+    return row ? [{ kiotviet_order_id: row.kiotviet_order_id }] : [];
+  }
   if (sql.startsWith("SELECT kiotviet_order_id::text,kiotviet_order_code FROM order_mappings")) {
     const row = db.rows.get(id);
     return row ? [{ kiotviet_order_id: row.kiotviet_order_id, kiotviet_order_code: row.kiotviet_order_code }] : [];
@@ -213,8 +220,19 @@ vi.mock("@/lib/kiotviet/invoices", () => ({
   KIOTVIET_INVOICE_CANCELLED: 2,
 }));
 vi.mock("@/lib/kiotviet/products", () => ({ getKiotVietProduct: mocks.getProduct }));
+vi.mock("@/lib/shopify/invoice-order", () => ({ getInvoiceOrder: mocks.freshOrder }));
 
-import { cancelShopifyOrder, syncShopifyOrder } from "@/lib/sync/order-sync";
+import { cancelShopifyOrder, syncShopifyOrder as syncShopifyOrderNow } from "@/lib/sync/order-sync";
+
+/**
+ * Shopify's current order (read before any KiotViet order is created) equals the webhook
+ * payload unless a test pins a different one in mocks.snapshots (mocks.pinned).
+ */
+function syncShopifyOrder(order: ShopifyOrderWebhook, context?: Parameters<typeof syncShopifyOrderNow>[1]) {
+  const id = String((order as Partial<ShopifyOrderWebhook> | null)?.id ?? "");
+  if (id && !mocks.pinned.has(id)) mocks.snapshots.set(id, structuredClone(order));
+  return syncShopifyOrderNow(order, context);
+}
 import { normalizeSku } from "@/lib/sync/mappings";
 import {
   ApiError,
@@ -241,6 +259,12 @@ function order(overrides: Partial<ShopifyOrderWebhook> = {}): ShopifyOrderWebhoo
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.snapshots.clear();
+  mocks.pinned.clear();
+  mocks.freshOrder.mockImplementation(async (id: string) => {
+    if (!mocks.snapshots.has(id)) throw new Error(`Shopify order ${id} unavailable`);
+    return structuredClone(mocks.snapshots.get(id));
+  });
   mocks.db.rows.clear();
   mocks.db.invoices.clear();
   mocks.db.locationMapped = true;
@@ -905,11 +929,16 @@ describe("Product-Only: refunded and cancelled units at KiotViet order creation"
     expect(mocks.createOrder).not.toHaveBeenCalled();
   });
 
-  it("keeps the original quantity when the refund cannot be tied to unshipped units (the invoice is blocked later)", async () => {
+  it("creates no KiotViet order when a refund cannot be tied to unshipped units, and records an actionable manual-review reason", async () => {
     mocks.db.orders = { ...mocks.db.orders, ...productOnly };
     const returned = { id: 1, refund_line_items: [{ line_item_id: 12, quantity: 1, restock_type: "return" }], transactions: [] };
-    await syncShopifyOrder(twoLines({ refunds: [returned], fulfillments: [{ status: "success", line_items: [{ id: 12, quantity: 3 }] }] }));
-    expect(mocks.createOrder.mock.calls[0][0].orderDetails[1]).toMatchObject({ productCode: "NU013", quantity: 3 });
+    const error = await syncShopifyOrder(twoLines({ refunds: [returned], fulfillments: [{ status: "success", line_items: [{ id: 12, quantity: 3 }] }] })).catch((e) => e);
+    expect(error).toBeInstanceOf(ConflictError);
+    expect(isManualReview(error)).toBe(true);
+    expect(mocks.createOrder).not.toHaveBeenCalled();
+    expect(mocks.db.rows.get("5001")).toMatchObject({ status: "create_failed", sync_status: "manual_review", failure_stage: "refund_adjustments",
+      kiotviet_order_id: null, last_error: expect.stringContaining("refund_requires_verification: line item 12 (SKU NU013)") });
+    expect(mocks.db.rows.get("5001")!.last_error).toContain("Restock: cancel");
   });
 
   it("strict mode keeps the original quantities and the existing paid-only rule", async () => {
@@ -923,5 +952,56 @@ describe("Product-Only: refunded and cancelled units at KiotViet order creation"
     expect(mocks.createOrder).toHaveBeenCalledOnce();
     await syncShopifyOrder(twoLines({ refunds: [cancel(12, 1)], fulfillments: [] }), { jobType: "shopify_order_update" });
     expect(mocks.createOrder).toHaveBeenCalledOnce();
+  });
+});
+
+describe("#1081: the worker creates KiotViet orders only from Shopify's current state", () => {
+  const productOnly = { invoiceCreationTrigger: "shopify_fulfilled", kiotVietCurrency: "VND", productOnlyInvoicing: true };
+  // Illustrative #1081 data: the stored webhook predates a refund of 1 cancelled unit.
+  const stored = (): ShopifyOrderWebhook => order({ id: 7128306221240, name: "#1081", financial_status: "paid", total_price: "309000",
+    line_items: [{ id: 11, sku: "NU012", quantity: 2, price: "150000", name: "Áo thun" },
+      { id: 99, sku: null, quantity: 1, price: "9000", title: "SVC Fee - Credit Card Processing Fee" }] });
+  const pin = (current: ShopifyOrderWebhook) => {
+    mocks.pinned.add(String(current.id));
+    mocks.snapshots.set(String(current.id), current);
+  };
+  const refundedNow = (): ShopifyOrderWebhook => ({ ...stored(), financial_status: "partially_refunded",
+    line_items: stored().line_items.map((line) => (line.id === 11 ? { ...line, current_quantity: 1 } : line)),
+    refunds: [{ id: 501, refund_line_items: [{ line_item_id: 11, quantity: 1, restock_type: "cancel" }], transactions: [{ kind: "refund", status: "success", amount: "150000" }] }],
+    fulfillments: [] });
+
+  it("replaying an outdated stored webhook creates the order with the current quantity and payment", async () => {
+    mocks.db.orders = { ...mocks.db.orders, ...productOnly };
+    pin(refundedNow());
+    await syncShopifyOrder(stored(), { jobType: "shopify_order_update" });
+    const input = mocks.createOrder.mock.calls[0][0];
+    expect(input.orderDetails).toEqual([expect.objectContaining({ productCode: "NU012", quantity: 1, price: 150000 })]);
+    // totalPayment, orderDetails (and later the invoice and stock check) use the same effective quantity.
+    expect(input.totalPayment).toBe(input.orderDetails.reduce((sum: number, detail: { price: number; quantity: number }) => sum + detail.price * detail.quantity, 0));
+    expect(input.totalPayment).toBe(150000);
+    expect(mocks.freshOrder).toHaveBeenCalledWith("7128306221240");
+  });
+
+  it("creates nothing when Shopify's current order cannot be read", async () => {
+    mocks.db.orders = { ...mocks.db.orders, ...productOnly };
+    mocks.freshOrder.mockRejectedValueOnce(new RetryableError("Shopify GraphQL unavailable"));
+    await expect(syncShopifyOrder(stored())).rejects.toBeInstanceOf(RetryableError);
+    expect(mocks.createOrder).not.toHaveBeenCalled();
+  });
+
+  it("does not create an order Shopify has cancelled since the stored webhook", async () => {
+    pin({ ...stored(), cancelled_at: "2026-11-05T03:00:00Z" });
+    await expect(syncShopifyOrder(stored())).resolves.toEqual({ action: "skipped", reason: "shopify_order_cancelled" });
+    expect(mocks.createOrder).not.toHaveBeenCalled();
+  });
+
+  it("repeated replays create one order and never re-read Shopify for a linked order", async () => {
+    mocks.db.orders = { ...mocks.db.orders, ...productOnly };
+    pin(refundedNow());
+    await syncShopifyOrder(stored(), { jobType: "shopify_order_update" });
+    mocks.freshOrder.mockClear();
+    await syncShopifyOrder(stored(), { jobType: "shopify_order_update" });
+    expect(mocks.createOrder).toHaveBeenCalledOnce();
+    expect(mocks.freshOrder).not.toHaveBeenCalled();
   });
 });

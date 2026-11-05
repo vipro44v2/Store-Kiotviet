@@ -34,6 +34,7 @@ import {
 } from "./default-branch";
 import { ensureProductMapping } from "./ensure-product-mapping";
 import { log } from "@/lib/logger";
+import { getInvoiceOrder } from "@/lib/shopify/invoice-order";
 import { resolveNewOrderSeller } from "@/lib/kiotviet/users";
 import {
   shippingChargedCents,
@@ -253,9 +254,59 @@ function productOnlyLines(lines: ValidatedOrderLine[]): ValidatedOrderLine[] {
  * Shopify says the customer paid. Product-Only also accepts partially_refunded: the order is
  * still paid, and refunded units are handled by the refund adjustments, never by this status.
  */
-function isPaid(order: ShopifyOrderWebhook, settings: OrderSettings) {
+export function isPaid(order: Pick<ShopifyOrderWebhook, "financial_status">, settings: OrderSettings) {
   return order.financial_status === "paid" ||
     (productOnlyPolicy(settings).enabled && order.financial_status === "partially_refunded");
+}
+
+/**
+ * The exact totalPayment sent with a new KiotViet order (also shown by the recovery dry run):
+ * 0 unless Shopify says paid; Product-Only: the merchandise of the effective lines (the same
+ * quantities as orderDetails, the invoice and the stock check); otherwise Shopify total − fees.
+ */
+export function plannedOrderPayment(order: ShopifyOrderWebhook, prepared: PreparedOrder, settings: OrderSettings) {
+  if (!isPaid(order, settings)) return 0;
+  return productOnlyPolicy(settings).enabled ? merchandisePaidCents(prepared.lines) / 100 : prepared.amounts.adjustedTotal;
+}
+
+/**
+ * The order as Shopify has it NOW, overlaid on a webhook payload that may be old (e.g. a
+ * stored event replayed by manual recovery). Financial status, cancellation, totals, refunds
+ * (with refunded quantities and restock types), current quantities and, when refunds name
+ * line items, fulfillments come from Shopify; customer and contact data stay from the webhook.
+ * A failed read throws, so no KiotViet order is ever created from stale data.
+ */
+export async function withFreshShopifyState(order: ShopifyOrderWebhook): Promise<ShopifyOrderWebhook> {
+  const fresh = await getInvoiceOrder(String(order.id));
+  const stored = new Map(order.line_items.map((line) => [String(line.id), line]));
+  return {
+    ...order,
+    name: fresh.name || order.name,
+    updated_at: fresh.updated_at ?? order.updated_at ?? null,
+    cancelled_at: fresh.cancelled_at ?? null,
+    financial_status: fresh.financial_status ?? null,
+    fulfillment_status: fresh.fulfillment_status ?? null,
+    currency: fresh.currency ?? order.currency ?? null,
+    total_price: fresh.total_price,
+    total_tip_received: fresh.total_tip_received ?? null,
+    taxes_included: fresh.taxes_included ?? null,
+    shipping_lines: fresh.shipping_lines ?? [],
+    refunds: fresh.refunds ?? [],
+    fulfillments: fresh.fulfillments ?? null,
+    line_items: fresh.line_items.map((line) => {
+      const old = stored.get(String(line.id));
+      // Stale quantity fields of the old payload are never kept.
+      return { ...old, ...line, name: old?.name ?? line.name ?? line.title ?? null,
+        current_quantity: line.current_quantity ?? null, fulfillable_quantity: undefined };
+    }),
+  };
+}
+
+/** Actionable manual-review text for refunds that cannot be tied to cancelled, unshipped units. */
+export function refundReviewMessage(order: ShopifyOrderWebhook, ambiguous: string[]) {
+  return `${ambiguous.join("; ")}. No KiotViet order was created. Check in Shopify whether these units were shipped or returned: ` +
+    `units never shipped should be refunded with "Restock: cancel"; shipped or returned units must be handled in KiotViet ` +
+    `(create the order there with description "Shopify ${order.name} (${order.id})" and link it with scripts/recover-shopify-order-sync.ts --link-kiotviet-order)`;
 }
 
 /** Merchandise paid for the remaining (effective) units of the product lines, in cents. */
@@ -456,6 +507,13 @@ async function runShopifyOrderSync(
   progress: { stage: string },
 ): Promise<OrderSyncResult> {
   const orderId = String(order.id);
+  // A KiotViet order is only ever created from Shopify's current state, never from a stored
+  // (possibly outdated) webhook alone: refunds, quantities and payment status are re-read first.
+  // Linked orders need no read (their lines are never changed automatically).
+  progress.stage = "fresh_shopify_state";
+  const [linked] = await query<{ kiotviet_order_id: string | null }>(
+    "SELECT kiotviet_order_id::text FROM order_mappings WHERE shopify_order_id=$1", [orderId]);
+  if (!linked?.kiotviet_order_id) order = await withFreshShopifyState(order);
   progress.stage = "claim";
   // Short transaction: the advisory lock serializes the decision, no HTTP inside.
   const decision = await transaction(async (client) => {
@@ -491,8 +549,12 @@ async function runShopifyOrderSync(
     try {
       prepared = prepareOrderForKiotViet(order, settings);
     } catch (error) {
-      return { kind: "invalid", error } as const;
+      return { kind: "invalid", error, stage: "validate_line_items" } as const;
     }
+    // Refunds that cannot be tied to cancelled, never-shipped units: no order is created.
+    if (prepared.adjustments?.ambiguous.length)
+      return { kind: "invalid", stage: "refund_adjustments", error: new ConflictError(refundReviewMessage(order, prepared.adjustments.ambiguous),
+        { shopifyOrderId: orderId, mappingStatus: "refund_requires_verification" }) } as const;
     // Never create an empty KiotViet order when only processing fees remain, or when every
     // product unit was cancelled by a confirmed refund (Product-Only).
     if (!prepared.lines.length)
@@ -532,7 +594,7 @@ async function runShopifyOrderSync(
       });
       return { action: "skipped", reason: decision.reason };
     case "invalid":
-      progress.stage = "validate_line_items";
+      progress.stage = decision.stage;
       await recordUnclaimedFailure(order, progress.stage, decision.error).catch(() => undefined);
       throw decision.error;
     case "update":
@@ -660,10 +722,7 @@ async function createMappedOrder(
       // excluded from the payment as well (see lib/sync/order-line-items.ts).
       // Product-Only records only the merchandise payment: shipping, tips and
       // other charges stay in Shopify and are never put on the KiotViet order.
-      totalPayment:
-        !isPaid(order, settings) ? 0
-          : productOnly ? merchandisePaidCents(prepared.lines) / 100
-          : prepared.amounts.adjustedTotal,
+      totalPayment: plannedOrderPayment(order, prepared, settings),
       // Documented: creates the invoice and its receipt from this order (deducts stock).
       makeInvoice: false,
       orderDetails,

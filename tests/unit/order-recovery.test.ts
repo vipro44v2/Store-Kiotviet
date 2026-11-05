@@ -18,6 +18,9 @@ const mocks = vi.hoisted(() => ({
   findOrder: vi.fn(),
   kiotVietGet: vi.fn(),
   syncEnabled: true,
+  /** Shopify's current order; undefined = same as the stored webhook. */
+  current: undefined as ShopifyOrderWebhook | undefined,
+  fresh: vi.fn(),
 }));
 
 function read(sql: string, params: unknown[]) {
@@ -77,6 +80,7 @@ vi.mock("@/lib/kiotviet/orders", () => ({ findKiotVietOrderByShopifyReference: m
 vi.mock("@/lib/kiotviet/client", () => ({ kiotVietClient: { get: mocks.kiotVietGet } }));
 vi.mock("@/lib/sync/sync-settings", () => ({ getSyncSettings: async () => ({ shopifyOrdersToKiotViet: mocks.syncEnabled }) }));
 vi.mock("@/lib/logger", () => ({ log: vi.fn() }));
+vi.mock("@/lib/shopify/invoice-order", () => ({ getInvoiceOrder: mocks.fresh }));
 
 import {
   applyOrderRecovery,
@@ -110,6 +114,8 @@ beforeEach(() => {
   mocks.sql = [];
   mocks.transactions = 0;
   mocks.syncEnabled = true;
+  mocks.current = undefined;
+  mocks.fresh.mockImplementation(async () => structuredClone(mocks.current ?? (mocks.event?.payload as ShopifyOrderWebhook)));
   mocks.findOrder.mockResolvedValue(undefined);
   mocks.enqueue.mockImplementation(async (_queue, _type, _payload, _priority, jobId) => ({ id: jobId }));
 });
@@ -160,7 +166,9 @@ describe("recovery plan (dry run)", () => {
     expect(plan.action).toEqual({ kind: "requeue", eventId: "event-1081", resetFrom: "creating" });
     const output = describeRecoveryPlan(plan).join("\n");
     expect(output).toContain('skipped processing fee: line 15977877143736 "SVC Fee - Credit Card Processing Fee" sku=null amount=9000 (exact_title_without_sku)');
-    expect(output).toContain("shopify_total=309000 excluded_fees=9000 kiotviet_payment=300000");
+    expect(output).toContain("shopify_total=309000 excluded_fees=9000");
+    expect(output).toContain("planned KiotViet totalPayment: 300000");
+    expect(output).toContain("current Shopify state: financial_status=paid cancelled=false payment_eligible=true");
     expect(output).toContain("lines to send: NU012×2");
     expect(output).toContain("PLAN: reset creating → create_failed, then enqueue one shopify_order_update job");
   });
@@ -269,6 +277,100 @@ describe("applying recovery", () => {
     const plan = await planOrderRecovery(ORDER_ID);
     mocks.mapping!.updated_at = "2026-11-04T00:00:00.000Z";
     await expect(applyOrderRecovery(plan)).resolves.toMatchObject({ applied: false });
+    expect(mocks.enqueue).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * #1081 (7128306221240) with an outdated stored webhook. Illustrative refund data (the
+ * reported case gives only the order): the stored orders/updated says "paid" with 2 × NU012,
+ * while Shopify now has a refund of 1 unit, so the order is PARTIALLY_REFUNDED.
+ */
+describe("#1081: recovery uses Shopify's current state, not the stored webhook", () => {
+  const productOnly = { invoiceCreationTrigger: "shopify_fulfilled", kiotVietCurrency: "VND", productOnlyInvoicing: true };
+  const refundedNow = (restockType: string, extra: Partial<ShopifyOrderWebhook> = {}): ShopifyOrderWebhook => ({
+    ...structuredClone(order1081), financial_status: "partially_refunded", updated_at: "2026-11-05T02:00:00Z",
+    line_items: order1081.line_items.map((line) => (line.id === 11 ? { ...line, current_quantity: 1 } : line)),
+    refunds: [{ id: 501, refund_line_items: [{ line_item_id: 11, quantity: 1, restock_type: restockType, subtotal: "150000.00" }],
+      transactions: [{ kind: "refund", status: "success", amount: "150000.00" }] }],
+    fulfillments: [], ...extra,
+  });
+  beforeEach(() => { mocks.orderSettings = productOnly; });
+
+  it("treats PARTIALLY_REFUNDED as paid in Product-Only and plans the remaining quantity and exact payment", async () => {
+    mocks.current = refundedNow("cancel");
+    const plan = await planOrderRecovery(ORDER_ID);
+    expect(plan.action).toEqual({ kind: "requeue", eventId: "event-1081", resetFrom: "creating" });
+    expect(plan.current).toMatchObject({ financialStatus: "partially_refunded", storedFinancialStatus: "paid", paymentEligible: true, plannedPayment: 150000 });
+    expect(plan.prepared!.lines.map(({ sku, quantity }) => [sku, quantity])).toEqual([["NU012", 1]]);
+    const output = describeRecoveryPlan(plan).join("\n");
+    expect(output).toContain("current Shopify state: financial_status=partially_refunded cancelled=false payment_eligible=true (stored webhook says paid: outdated, not used)");
+    expect(output).toContain("refunded line 11 SKU NU012: ordered=2 refunded=1 excluded=1 remaining=1 fulfilled=0 (cancelled_refund");
+    expect(output).toContain("lines to send: NU012×1");
+    expect(output).toContain("planned KiotViet totalPayment: 150000");
+  });
+
+  it("never plans from the stored webhook when Shopify cannot be read", async () => {
+    mocks.fresh.mockRejectedValue(new Error("Shopify GraphQL 503"));
+    const plan = await planOrderRecovery(ORDER_ID);
+    expect(plan.action).toMatchObject({ kind: "blocked", reason: expect.stringContaining("cannot read the current Shopify order (Shopify GraphQL 503)") });
+    expect(describeRecoveryPlan(plan).join("\n")).toContain("current Shopify state: UNAVAILABLE");
+    await applyOrderRecovery(plan);
+    expect(mocks.enqueue).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["return", "refunded as return/restock"],
+    ["no_restock", "refunded units may have been shipped"],
+  ])("requires manual review when the refunded unit may have been shipped (%s)", async (restockType, text) => {
+    mocks.current = refundedNow(restockType, { fulfillments: [{ id: 1, status: "success", line_items: [{ id: 11, quantity: 2 }] }] });
+    const plan = await planOrderRecovery(ORDER_ID);
+    expect(plan.action).toMatchObject({ kind: "manual_create_required", reason: expect.stringContaining("refund_requires_verification") });
+    expect(describeRecoveryPlan(plan).join("\n")).toContain(`refund ambiguity (blocks creation): refund_requires_verification: line item 11 (SKU NU012)`);
+    expect(describeRecoveryPlan(plan).join("\n")).toContain(text);
+    await applyOrderRecovery(plan);
+    expect(mocks.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("strict invoicing still requires financial status paid", async () => {
+    mocks.orderSettings = {};
+    mocks.current = refundedNow("cancel");
+    expect((await planOrderRecovery(ORDER_ID)).action).toMatchObject({ kind: "blocked", reason: expect.stringContaining("not_paid: Shopify financial status is partially_refunded") });
+  });
+
+  it("blocks a cancelled order and an order whose units were all cancelled", async () => {
+    mocks.current = { ...refundedNow("cancel"), cancelled_at: "2026-11-05T03:00:00Z" };
+    expect((await planOrderRecovery(ORDER_ID)).action).toMatchObject({ kind: "blocked", reason: "the Shopify order is cancelled" });
+    mocks.current = refundedNow("cancel");
+    mocks.current.line_items[0].current_quantity = 0;
+    mocks.current.refunds![0].refund_line_items![0].quantity = 2;
+    expect((await planOrderRecovery(ORDER_ID)).action).toMatchObject({ kind: "none", reason: expect.stringContaining("every product unit was cancelled") });
+  });
+
+  it("repeated recovery attempts enqueue at most one job and never a second order", async () => {
+    mocks.current = refundedNow("cancel");
+    const plan = await planOrderRecovery(ORDER_ID);
+    await expect(applyOrderRecovery(plan)).resolves.toMatchObject({ applied: true });
+    // The same dry run applied again, and a new dry run while the job is pending, change nothing.
+    await expect(applyOrderRecovery(plan)).resolves.toMatchObject({ applied: false });
+    mocks.activeJobs = [{ id: "job-1", status: "pending" }];
+    expect((await planOrderRecovery(ORDER_ID)).action).toMatchObject({ kind: "blocked", reason: expect.stringContaining("job job-1 (pending)") });
+    // Once the worker created and linked the order, recovery does nothing.
+    mocks.mapping = stuck({ kiotviet_order_id: "900", status: "created" });
+    expect((await planOrderRecovery(ORDER_ID)).action).toMatchObject({ kind: "none" });
+    expect(mocks.enqueue).toHaveBeenCalledOnce();
+  });
+
+  it("reports (never applies) a later refund against an existing KiotViet order", async () => {
+    mocks.mapping = stuck({ kiotviet_order_id: "900", status: "created" });
+    mocks.current = refundedNow("cancel");
+    mocks.kiotVietGet.mockResolvedValue({ id: 900, code: "DH900", orderDetails: [{ productCode: "NU012", quantity: 2 }] });
+    const plan = await planOrderRecovery(ORDER_ID);
+    expect(plan.action).toMatchObject({ kind: "none", reason: expect.stringContaining("never changed automatically") });
+    expect(plan.reconciliation).toEqual([{ sku: "NU012", kiotVietQuantity: 2, shopifyEffectiveQuantity: 1 }]);
+    expect(describeRecoveryPlan(plan).join("\n")).toContain("RECONCILE (manual, never automatic): SKU NU012 is 2 on the KiotViet order but 1 in Shopify now");
+    await applyOrderRecovery(plan);
+    expect(mocks.sql.filter((sql) => !sql.trimStart().startsWith("SELECT"))).toEqual([]);
     expect(mocks.enqueue).not.toHaveBeenCalled();
   });
 });

@@ -53,6 +53,24 @@ Audit: `reconciliation.productOnly.lineAdjustments` (also saved for blocked orde
 
 The invoice snapshot reads fulfillment line items only when a refund names line items, so normal orders need no extra Shopify request.
 
+**Fresh Shopify state before any KiotViet order.**
+
+- **Fresh read:** before claiming an unlinked order for creation, the worker re-reads the order from Shopify (`withFreshShopifyState`). That includes the financial status, cancellation, totals, refunds with refunded quantities and restock types, current quantities, and fulfillments when refunds name line items. This happens even when the job replays a stored (possibly outdated) webhook, such as a requeue from manual recovery. Customer data still comes from the webhook.
+- **Shopify unreadable:** if Shopify cannot be read, nothing is created and the job retries.
+- **Ambiguous refunds:** no KiotViet order is created. The mapping is `create_failed` / `manual_review` with `failure_stage = refund_adjustments` and an actionable `last_error`.
+- **Linked orders:** never re-read; their lines are never changed automatically.
+
+**Recovery dry run** (`scripts/recover-shopify-order-sync.ts <id>`) plans from the same fresh state and prints:
+
+- the current financial status, and the stored webhook's status when it is outdated;
+- payment eligibility (Product-Only: `paid` or `partially_refunded`);
+- per refunded line: ordered, refunded, excluded, remaining and fulfilled quantity;
+- any refund ambiguity;
+- the lines to send and the exact planned KiotViet `totalPayment`.
+
+It blocks when Shopify cannot be read, the order is cancelled, it is not paid, or a refund is ambiguous. For an already linked order it prints a read-only `RECONCILE (manual, never automatic)` line for every SKU whose KiotViet quantity differs from Shopify's current effective quantity. Apply stays guarded by the order advisory lock, the planned mapping version and a deterministic job ID, so repeated attempts enqueue at most one job and never a second order.
+
+
 ## Payment: the invoice never creates a payment
 
 The POST always sends `totalPayment: 0`. The existing KiotViet order payment is never altered, refunded or duplicated.

@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   ensureMapping: vi.fn(),
   resolveBranch: vi.fn(),
   createOrder: vi.fn(),
+  freshOrder: vi.fn(),
 }));
 
 vi.mock("@/lib/db/client", () => ({
@@ -34,6 +35,9 @@ vi.mock("@/lib/shopify/orders", () => ({
   fulfillShopifyOrderById: vi.fn(),
 }));
 
+// Shopify's current order is read before creating the KiotViet order.
+vi.mock("@/lib/shopify/invoice-order", () => ({ getInvoiceOrder: mocks.freshOrder }));
+
 import { syncShopifyOrder } from "@/lib/sync/order-sync";
 
 describe("Shopify order product auto-mapping", () => {
@@ -51,7 +55,7 @@ describe("Shopify order product auto-mapping", () => {
     mocks.ensureMapping.mockResolvedValue({ kiotviet_product_id: "501" });
     mocks.createOrder.mockResolvedValue({ id: 700, code: "DH700" });
 
-    await syncShopifyOrder({
+    const order = {
       id: 100,
       name: "#100",
       created_at: "2026-01-01T00:00:00Z",
@@ -60,7 +64,9 @@ describe("Shopify order product auto-mapping", () => {
       line_items: [
         { id: 1, sku: "NU012", quantity: 2, price: "60", name: "Product" },
       ],
-    });
+    };
+    mocks.freshOrder.mockResolvedValue(structuredClone(order));
+    await syncShopifyOrder(order);
 
     expect(mocks.ensureMapping).toHaveBeenCalledWith("NU012", undefined);
     expect(mocks.createOrder).toHaveBeenCalledWith(

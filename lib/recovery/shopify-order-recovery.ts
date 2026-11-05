@@ -4,11 +4,17 @@ import { kiotVietClient } from "@/lib/kiotviet/client";
 import { findKiotVietOrderByShopifyReference } from "@/lib/kiotviet/orders";
 import {
   isOrderRecoveryWindowOpen,
+  isPaid,
   ORDER_CLAIM_LEASE_MS,
+  plannedOrderPayment,
   prepareOrderForKiotViet,
+  refundReviewMessage,
+  withFreshShopifyState,
   type PreparedOrder,
 } from "@/lib/sync/order-sync";
 import type { OrderSettings } from "@/lib/sync/default-branch";
+import { normalizeSku } from "@/lib/sync/mappings";
+import { lineAdjustmentAudit, productOnlyPolicy } from "@/lib/sync/product-only-invoicing";
 import { getSyncSettings } from "@/lib/sync/sync-settings";
 import type { ShopifyOrderWebhook } from "@/types/shopify";
 
@@ -91,7 +97,50 @@ export interface RecoveryPlan {
   mapping?: MappingRow;
   eventId?: string;
   prepared?: PreparedOrder;
+  /** Shopify's current state (the stored webhook may be outdated), as the worker will see it. */
+  current?: {
+    financialStatus: string | null;
+    storedFinancialStatus: string | null;
+    cancelled: boolean;
+    paymentEligible: boolean;
+    /** Exact totalPayment the KiotViet order would be created with. */
+    plannedPayment: number | null;
+    readError?: string;
+  };
+  /** Refund ambiguities that block creation (empty when none). */
+  ambiguous?: string[];
+  /** Linked orders: KiotViet lines vs Shopify's current effective lines (report only, never applied). */
+  reconciliation?: Array<{ sku: string; kiotVietQuantity: number; shopifyEffectiveQuantity: number }>;
   action: RecoveryAction;
+}
+
+/**
+ * Report only: compares an existing KiotViet order's lines with Shopify's current effective
+ * lines (after confirmed cancelled refunds). Differences are never applied automatically; they
+ * are reconciled explicitly in KiotViet (refund_after_kiotviet_order also blocks the invoice).
+ */
+async function linkedReconciliation(orderId: string, kiotVietOrderId: number, stored: ShopifyOrderWebhook | undefined, settings: OrderSettings): Promise<Partial<RecoveryPlan>> {
+  try {
+    const order = await withFreshShopifyState(stored ?? ({ id: Number(orderId), name: "", total_price: "0", line_items: [] } as ShopifyOrderWebhook));
+    const prepared = prepareOrderForKiotViet(order, settings);
+    const kiotVietOrder = await kiotVietClient.get<{ orderDetails?: Array<{ productCode?: string; quantity: number }> }>(`/orders/${kiotVietOrderId}`);
+    const effective = new Map<string, number>();
+    for (const line of prepared.lines) effective.set(line.sku, (effective.get(line.sku) ?? 0) + line.quantity);
+    const onOrder = new Map<string, number>();
+    for (const detail of kiotVietOrder?.orderDetails ?? []) {
+      const sku = normalizeSku(detail.productCode);
+      onOrder.set(sku, (onOrder.get(sku) ?? 0) + Number(detail.quantity));
+    }
+    const reconciliation = [...new Set([...effective.keys(), ...onOrder.keys()])]
+      .filter((sku) => (effective.get(sku) ?? 0) !== (onOrder.get(sku) ?? 0))
+      .map((sku) => ({ sku, kiotVietQuantity: onOrder.get(sku) ?? 0, shopifyEffectiveQuantity: effective.get(sku) ?? 0 }));
+    return { prepared, reconciliation, ambiguous: prepared.adjustments?.ambiguous ?? [],
+      current: { financialStatus: order.financial_status ?? null, storedFinancialStatus: stored?.financial_status ?? null,
+        cancelled: Boolean(order.cancelled_at), paymentEligible: isPaid(order, settings), plannedPayment: null } };
+  } catch (error) {
+    return { current: { financialStatus: null, storedFinancialStatus: stored?.financial_status ?? null, cancelled: false, paymentEligible: false,
+      plannedPayment: null, readError: error instanceof Error ? error.message : String(error) } };
+  }
 }
 
 function referencesShopifyOrder(description: string | null | undefined, orderId: string) {
@@ -109,9 +158,6 @@ export async function planOrderRecovery(
   );
   const plan = (action: RecoveryAction, extra: Partial<RecoveryPlan> = {}): RecoveryPlan =>
     ({ shopifyOrderId: orderId, mapping, ...extra, action });
-  if (mapping?.kiotviet_order_id)
-    return plan({ kind: "none", reason: `already linked to KiotViet order ${mapping.kiotviet_order_id}` });
-
   const [event] = await query<{ id: string; payload: ShopifyOrderWebhook }>(
     `SELECT id,payload FROM webhook_events
     WHERE provider='shopify' AND external_resource_id=$1 AND event_type IN ('orders/updated','orders/create')
@@ -119,11 +165,31 @@ export async function planOrderRecovery(
     [orderId],
   );
   const [settingsRow] = await query<{ value: OrderSettings }>("SELECT value FROM system_settings WHERE key='orders'");
-  let prepared: PreparedOrder | undefined, invalid: unknown;
+  const settings = settingsRow?.value ?? {};
+  if (mapping?.kiotviet_order_id)
+    return plan({ kind: "none", reason: `already linked to KiotViet order ${mapping.kiotviet_order_id}; its lines are never changed automatically` },
+      await linkedReconciliation(orderId, Number(mapping.kiotviet_order_id), event?.payload, settings));
+
+  // Plan from Shopify's current state exactly as the worker will (withFreshShopifyState):
+  // a stored webhook may predate refunds, cancellations or payment changes.
+  let order: ShopifyOrderWebhook | undefined, readError: string | undefined;
   if (event)
-    try { prepared = prepareOrderForKiotViet(event.payload, settingsRow?.value ?? {}); }
+    try { order = await withFreshShopifyState(event.payload); }
+    catch (error) { readError = error instanceof Error ? error.message : String(error); }
+  let prepared: PreparedOrder | undefined, invalid: unknown;
+  if (order)
+    try { prepared = prepareOrderForKiotViet(order, settings); }
     catch (error) { invalid = error; }
-  const extra = { eventId: event?.id, prepared };
+  const paymentEligible = order ? settings.paidOnly === false || isPaid(order, settings) : false;
+  const extra: Partial<RecoveryPlan> = {
+    eventId: event?.id, prepared, ambiguous: prepared?.adjustments?.ambiguous ?? [],
+    current: event ? {
+      financialStatus: order?.financial_status ?? null, storedFinancialStatus: event.payload.financial_status ?? null,
+      cancelled: Boolean(order?.cancelled_at), paymentEligible,
+      plannedPayment: order && prepared ? plannedOrderPayment(order, prepared, settings) : null,
+      ...(readError ? { readError } : {}),
+    } : undefined,
+  };
 
   // Always look for an existing KiotViet order first: relinking beats recreating.
   const referenced = await findKiotVietOrderByShopifyReference(orderId);
@@ -157,13 +223,23 @@ export async function planOrderRecovery(
   }
 
   if (!event) return plan({ kind: "blocked", reason: "no stored orders/create or orders/updated webhook; wait for Shopify to send an update" });
+  if (readError || !order)
+    return plan({ kind: "blocked", reason: `cannot read the current Shopify order (${readError}); nothing is planned from the stored webhook alone` }, extra);
   if (invalid)
     return plan({
       kind: "manual_create_required",
       reason: `${invalid instanceof Error ? invalid.message : String(invalid)}. Shopify keeps a line item's SKU as it was at purchase; create the order in KiotViet with description "Shopify ${event.payload.name} (${orderId})" and link it with --link-kiotviet-order`,
     }, extra);
+  if (order.cancelled_at) return plan({ kind: "blocked", reason: "the Shopify order is cancelled" }, extra);
+  if (settings.autoCreate === false) return plan({ kind: "blocked", reason: "orders.autoCreate is off; the worker would skip this order" }, extra);
+  if (!paymentEligible)
+    return plan({ kind: "blocked", reason: `not_paid: Shopify financial status is ${order.financial_status ?? "unknown"} (paid${productOnlyPolicy(settings).enabled ? " or partially_refunded" : ""} required)` }, extra);
+  if (prepared!.adjustments?.ambiguous.length)
+    return plan({ kind: "manual_create_required", reason: refundReviewMessage(order, prepared!.adjustments.ambiguous) }, extra);
   if (!prepared!.lines.length)
-    return plan({ kind: "none", reason: "only processing-fee lines remain; nothing to create in KiotViet" }, extra);
+    return plan({ kind: "none", reason: prepared!.originalLines?.length
+      ? "every product unit was cancelled by a confirmed refund; nothing to create in KiotViet"
+      : "only processing-fee lines remain; nothing to create in KiotViet" }, extra);
   if (!(await getSyncSettings()).shopifyOrdersToKiotViet)
     return plan({ kind: "blocked", reason: "Shopify → KiotViet order sync is disabled" }, extra);
   if (mapping?.status === "pending_create" && mapping.claimed_at &&
@@ -256,13 +332,26 @@ export function describeRecoveryPlan(plan: RecoveryPlan): string[] {
     ? `mapping: status=${plan.mapping.status} sync_status=${plan.mapping.sync_status} kiotviet_order_id=${plan.mapping.kiotviet_order_id ?? "null"}`
     : "mapping: none");
   if (plan.eventId) lines.push(`latest webhook event: ${plan.eventId}`);
+  const current = plan.current;
+  if (current) {
+    lines.push(current.readError
+      ? `current Shopify state: UNAVAILABLE (${current.readError})`
+      : `current Shopify state: financial_status=${current.financialStatus} cancelled=${current.cancelled} payment_eligible=${current.paymentEligible}` +
+        (current.storedFinancialStatus !== current.financialStatus ? ` (stored webhook says ${current.storedFinancialStatus}: outdated, not used)` : ""));
+  }
   for (const fee of plan.prepared?.fees ?? [])
     lines.push(`skipped processing fee: line ${fee.line.id} "${fee.line.title ?? fee.line.name ?? ""}" sku=${fee.line.sku ?? "null"} amount=${fee.chargedCents / 100} (${fee.reason})`);
+  for (const line of lineAdjustmentAudit(plan.prepared?.adjustments))
+    lines.push(`refunded line ${line.lineItemId} SKU ${line.sku}: ordered=${line.originalQuantity} refunded=${line.refundedQuantity} excluded=${line.excludedQuantity} remaining=${line.remainingQuantity} fulfilled=${line.fulfilledQuantity ?? "n/a"} (${line.reason}: ${line.detail})`);
+  for (const reason of plan.ambiguous ?? []) lines.push(`refund ambiguity (blocks creation): ${reason}`);
   if (plan.prepared) {
-    const { shopifyTotal, excludedFeeTotal, adjustedTotal, consistent, expectedAdjustedTotal } = plan.prepared.amounts;
-    lines.push(`amounts: shopify_total=${shopifyTotal} excluded_fees=${excludedFeeTotal} kiotviet_payment=${adjustedTotal}${consistent ? "" : ` (line/shipping sum ${expectedAdjustedTotal} differs; review)`}`);
+    const { shopifyTotal, excludedFeeTotal, consistent, expectedAdjustedTotal } = plan.prepared.amounts;
+    lines.push(`amounts: shopify_total=${shopifyTotal} excluded_fees=${excludedFeeTotal}${consistent ? "" : ` (line/shipping sum ${expectedAdjustedTotal} differs; review)`}`);
     lines.push(`lines to send: ${plan.prepared.lines.map(({ sku, quantity }) => `${sku}×${quantity}`).join(", ") || "none"}`);
   }
+  if (current?.plannedPayment != null) lines.push(`planned KiotViet totalPayment: ${current.plannedPayment}`);
+  for (const item of plan.reconciliation ?? [])
+    lines.push(`RECONCILE (manual, never automatic): SKU ${item.sku} is ${item.kiotVietQuantity} on the KiotViet order but ${item.shopifyEffectiveQuantity} in Shopify now`);
   const action = plan.action;
   lines.push(
     action.kind === "link" ? `PLAN: link to existing KiotViet order ${action.kiotVietOrder.code} (${action.source}); no new order is created`
