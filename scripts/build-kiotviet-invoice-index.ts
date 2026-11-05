@@ -7,7 +7,7 @@
  *   npx tsx --env-file=.env.production scripts/build-kiotviet-invoice-index.ts [--max-pages 200]
  */
 import { closeDatabase } from "../lib/db/client";
-import { advanceInvoiceIndex, getInvoiceIndexState } from "../lib/kiotviet/invoice-index";
+import { advanceInvoiceIndex, getInvoiceIndexHealth, getInvoiceIndexState } from "../lib/kiotviet/invoice-index";
 
 const print = (line: string) => process.stdout.write(`${line}\n`);
 
@@ -17,6 +17,8 @@ async function main() {
   if (unknown.length) throw new Error(`Unknown argument(s): ${unknown.join(" ")}. Use --status or --max-pages <n>.`);
   const state = await getInvoiceIndexState();
   print(`index: ${state.scanned_count}/${state.remote_total ?? "?"} invoices, current as of ${state.current_as_of ?? "never"}, generation ${state.generation}${state.last_error ? `, last error: ${state.last_error}` : ""}`);
+  const health = await getInvoiceIndexHealth();
+  print(`health: ${health.usable ? "usable for duplicate detection" : "NOT usable (rebuilding)"}${health.stale ? ", stale (is the scheduler running?)" : ""}`);
   if (args.includes("--status")) return;
   const limitIndex = args.indexOf("--max-pages");
   const maxPages = limitIndex >= 0 ? Number(args[limitIndex + 1]) : 200;

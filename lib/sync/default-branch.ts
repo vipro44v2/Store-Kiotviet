@@ -35,6 +35,18 @@ export interface OrderSettings {
   processingFeeProductIds?: Array<number | string>;
   /** Exact titles; applied only to lines without a SKU. Defaults to DEFAULT_PROCESSING_FEE_TITLES. */
   processingFeeTitles?: string[];
+  /**
+   * Product-Only Invoicing: KiotViet orders and invoices carry only product
+   * merchandise; excluded charges are recorded as differences instead of
+   * blocking. See lib/sync/product-only-invoicing.ts. Default false (strict).
+   */
+  productOnlyInvoicing?: boolean;
+  /** Authority for "the customer has paid". Only Shopify is supported. */
+  paymentSource?: "shopify";
+  ignoreFinancialMismatch?: boolean;
+  excludeShipping?: boolean;
+  excludeProcessingFees?: boolean;
+  excludeOtherSurcharges?: boolean;
   [key: string]: unknown;
 }
 

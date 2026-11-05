@@ -10,6 +10,7 @@ const m = vi.hoisted(() => ({
   blocked: undefined as Record<string, unknown> | undefined,
   jobs: [] as Job[],
   checkAt: undefined as string | undefined,
+  indexHealth: { usable: true, scanned: 100, total: 100, lastError: null } as Record<string, unknown>,
 }));
 
 function run(sql: string, params: unknown[] = []): Record<string, unknown>[] {
@@ -47,6 +48,13 @@ function run(sql: string, params: unknown[] = []): Record<string, unknown>[] {
     return m.mapped && !m.invoice?.kiotviet_invoice_id && !active ? [{ shopify_order_id: "1" }] : [];
   }
   if (sql.startsWith("SELECT * FROM invoice_mappings")) return m.invoice ? [m.invoice] : [];
+  if (sql.startsWith("SELECT status FROM invoice_mappings")) return m.invoice ? [{ status: m.invoice.status }] : m.blocked ? [{ status: m.blocked.status }] : [];
+  if (sql.startsWith("SELECT shopify_order_id FROM invoice_mappings"))
+    return m.blocked?.status === "blocked" && m.blocked.failure_stage === params[0] ? [{ shopify_order_id: "1" }] : [];
+  if (sql.startsWith("UPDATE invoice_mappings SET failure_stage='invoice_index_retried'")) {
+    if (m.blocked?.status === "blocked" && m.blocked.failure_stage === params[1]) m.blocked.failure_stage = "invoice_index_retried";
+    return [];
+  }
   if (sql.startsWith("UPDATE invoice_mappings")) return [];
   throw new Error(`Unhandled SQL: ${sql.slice(0, 70)}`);
 }
@@ -60,11 +68,13 @@ vi.mock("@/lib/logger", () => ({ log: vi.fn() }));
 vi.mock("@/lib/recovery/kiotviet-invoice-recovery", () => ({ planInvoiceRecovery: m.plan, applyInvoiceRecovery: m.apply }));
 vi.mock("@/lib/sync/sync-settings", () => ({ getSyncSettings: async () => ({ kiotVietInventoryToShopify: true, inventoryConflictStrategy: "hold" }) }));
 vi.mock("@/lib/sync/inventory-sync", () => ({ syncInventoryNotification: m.stock }));
+vi.mock("@/lib/kiotviet/invoice-index", () => ({ getInvoiceIndexHealth: async () => m.indexHealth }));
 
 import {
   dispatchInvoiceOutbox,
   invoiceTriggerDecision,
   processFulfillmentInvoice,
+  readmitIndexDeferredInvoices,
   reconcileFulfillmentInvoices,
   requestFulfillmentInvoice,
 } from "@/lib/sync/fulfillment-invoice";
@@ -86,6 +96,7 @@ beforeEach(() => {
   m.blocked = undefined;
   m.jobs = [];
   m.checkAt = undefined;
+  m.indexHealth = { usable: true, scanned: 100, total: 100, lastError: null };
   m.live.mockResolvedValue(live());
   m.add.mockResolvedValue({});
   m.plan.mockResolvedValue({ action: { kind: "create_invoice" } });
@@ -247,6 +258,70 @@ describe("processing an invoice job", () => {
     m.plan.mockResolvedValue({ action: { kind: "none" } });
     m.stock.mockResolvedValue({ status: "held" });
     await expect(processFulfillmentInvoice("1")).rejects.toThrow("inventory synchronization requires review");
+    expect(m.apply).not.toHaveBeenCalled();
+  });
+});
+
+describe("invoice index automation (invoice_lookup_incomplete without manual commands)", () => {
+  it("defers cheaply while the index is rebuilding: no plan, no remote reads, no attempt consumed", async () => {
+    m.indexHealth = { usable: false, scanned: 2_000, total: 13_215, lastError: "overlap mismatch" };
+    await expect(processFulfillmentInvoice("1")).resolves.toBeUndefined();
+    expect(m.plan).not.toHaveBeenCalled();
+    expect(m.apply).not.toHaveBeenCalled();
+    expect(m.blocked).toMatchObject({ status: "blocked", failure_stage: "invoice_index", last_error: expect.stringContaining("invoice_index_not_ready") });
+  });
+
+  it("re-admits the deferred job exactly once after the index becomes current, then invoices", async () => {
+    await requestFulfillmentInvoice("1");
+    m.indexHealth = { usable: false, scanned: 0, total: null, lastError: null };
+    await processFulfillmentInvoice("1");
+    m.jobs[0].status = "completed";
+    // Same Shopify/settings state: the rescan alone does not loop on it.
+    await expect(requestFulfillmentInvoice("1")).resolves.toBe("already_admitted");
+
+    m.indexHealth = { usable: true, scanned: 13_215, total: 13_215, lastError: null };
+    const asOf = new Date("2026-11-05T01:00:00Z");
+    await expect(readmitIndexDeferredInvoices(asOf)).resolves.toEqual({ "1": "admitted" });
+    expect(m.jobs[1].triggerState).toContain("|index:2026-11-05T01:00:00.000Z");
+    await processFulfillmentInvoice("1");
+    expect(m.apply).toHaveBeenCalledOnce();
+    // The deferral is consumed: a later index run does not re-admit it again.
+    m.jobs[1].status = "completed";
+    await expect(readmitIndexDeferredInvoices(new Date())).resolves.toEqual({});
+  });
+
+  it("never defers an attempt whose POST may have been sent; it keeps the retry → link/review path", async () => {
+    m.indexHealth = { usable: false, scanned: 10, total: 13_215, lastError: null };
+    m.invoice = { status: "creating" };
+    await expect(processFulfillmentInvoice("1")).rejects.toBeInstanceOf(RetryableError);
+    expect(m.blocked).toBeUndefined();
+    expect(m.apply).not.toHaveBeenCalled();
+  });
+
+  it("backs off re-checks of an order whose jobs keep failing", async () => {
+    await requestFulfillmentInvoice("1");
+    expect(m.checkAt).toBe("+30m"); // interval '30 minutes' × 2^(exhausted jobs), capped at 24 hours
+  });
+});
+
+describe("Shopify payment status as the trigger authority", () => {
+  it.each([
+    ["PAID", "shopify_paid", "UNFULFILLED", "ready"],
+    ["PARTIALLY_REFUNDED", "shopify_paid", "UNFULFILLED", "ready"],
+    ["PENDING", "shopify_paid", "UNFULFILLED", "waiting"],
+    ["AUTHORIZED", "shopify_paid", "UNFULFILLED", "waiting"],
+    ["PARTIALLY_PAID", "shopify_fulfilled", "FULFILLED", "waiting"],
+    ["PAID", "shopify_fulfilled", "UNFULFILLED", "waiting"],
+    ["PAID", "shopify_fulfilled", "FULFILLED", "ready"],
+    ["REFUNDED", "shopify_paid", "UNFULFILLED", "blocked"],
+  ])("%s with trigger %s and %s → %s", (financial, trigger, fulfillment, expected) => {
+    expect(invoiceTriggerDecision({ ...config, invoiceCreationTrigger: trigger as "shopify_paid" },
+      live({ displayFinancialStatus: financial, displayFulfillmentStatus: fulfillment }))).toBe(expected);
+  });
+
+  it("re-checks the live trigger right before applying (payment status changed during validation)", async () => {
+    m.live.mockResolvedValueOnce(live()).mockResolvedValueOnce(live({ displayFinancialStatus: "REFUNDED" }));
+    await expect(processFulfillmentInvoice("1")).rejects.toThrow("Invoice trigger changed during validation");
     expect(m.apply).not.toHaveBeenCalled();
   });
 });

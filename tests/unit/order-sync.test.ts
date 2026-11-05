@@ -818,6 +818,39 @@ describe("Shopify shipping on new KiotViet orders", () => {
   });
 });
 
+describe("Product-Only Invoicing: new KiotViet orders carry merchandise only", () => {
+  const productOnly = { invoiceCreationTrigger: "shopify_fulfilled", kiotVietCurrency: "VND", productOnlyInvoicing: true, shippingSurcharge: { id: 3, code: "SHIP" } };
+  const svcFee = { id: 99, sku: null, quantity: 1, price: "9000", title: "SVC Fee - Credit Card Processing Fee" };
+
+  it("leaves shipping, fees and tips off the order and records only the merchandise payment", async () => {
+    mocks.db.orders = { ...mocks.db.orders, ...productOnly };
+    await syncShopifyOrder(order({ total_price: "344000", total_tip_received: "5000", line_items: [...order().line_items, svcFee],
+      shipping_lines: [{ price: "30000", discounted_price: "30000" }] }));
+    const input = mocks.createOrder.mock.calls[0][0];
+    expect(input).not.toHaveProperty("surchages");
+    expect(input.orderDetails).toEqual([expect.objectContaining({ productCode: "NU012", price: 150000, quantity: 2, discount: 0 })]);
+    expect(input).toMatchObject({ totalPayment: 300000, makeInvoice: false });
+  });
+
+  it("records discounted unit prices so the KiotViet order equals the merchandise paid", async () => {
+    mocks.db.orders = { ...mocks.db.orders, ...productOnly };
+    await syncShopifyOrder(order({ total_price: "280000", line_items: [{ id: 11, sku: "NU012", quantity: 2, price: "150000", name: "Áo thun", discount_allocations: [{ amount: "20000" }] }] }));
+    expect(mocks.createOrder.mock.calls[0][0]).toMatchObject({ totalPayment: 280000, orderDetails: [expect.objectContaining({ price: 140000, quantity: 2 })] });
+  });
+
+  it("keeps the list price when a discount cannot be split into whole units (the invoice is then blocked)", async () => {
+    mocks.db.orders = { ...mocks.db.orders, ...productOnly };
+    await syncShopifyOrder(order({ line_items: [{ id: 11, sku: "NU012", quantity: 3, price: "10.00", name: "Áo thun", discount_allocations: [{ amount: "0.10" }] }], total_price: "29.90" }));
+    expect(mocks.createOrder.mock.calls[0][0]).toMatchObject({ totalPayment: 29.9, orderDetails: [expect.objectContaining({ price: 10 })] });
+  });
+
+  it("does not record a payment for an unpaid order", async () => {
+    mocks.db.orders = { ...mocks.db.orders, ...productOnly, paidOnly: false };
+    await syncShopifyOrder(order({ financial_status: "pending" }));
+    expect(mocks.createOrder.mock.calls[0][0].totalPayment).toBe(0);
+  });
+});
+
 describe("seller on new KiotViet orders", () => {
   it("sends the verified default seller as soldById", async () => {
     await syncShopifyOrder(order());

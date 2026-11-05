@@ -32,3 +32,16 @@ it("explains the legacy fallback before migration 006 has run", () => {
   expect(html).toContain("migration 006");
   expect(html.match(/checked=""/g)).toHaveLength(5);
 });
+
+it("shows Product-Only Invoicing off by default and its options once selected", () => {
+  const off = renderToStaticMarkup(createElement(SyncSettingsCard, { stored: undefined, orders: { invoiceCreationTrigger: "shopify_paid" } }));
+  expect(off).toContain("Product-Only Invoicing");
+  expect(off).not.toContain("excludeShipping");
+  const on = renderToStaticMarkup(createElement(SyncSettingsCard, {
+    stored: undefined, orders: { invoiceCreationTrigger: "shopify_paid", productOnlyInvoicing: true, excludeShipping: false },
+  }));
+  for (const key of ["excludeShipping", "excludeProcessingFees", "excludeOtherSurcharges", "ignoreFinancialMismatch", "Shopify (paymentSource)"])
+    expect(on).toContain(key);
+  // 5 sync/customer flags + the mode + 3 exclusions that default on (excludeShipping was turned off).
+  expect(on.match(/checked=""/g)).toHaveLength(9);
+});

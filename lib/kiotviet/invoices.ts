@@ -1,7 +1,7 @@
-import { UncertainResultError } from "@/lib/errors";
+import { ApiError, UncertainResultError } from "@/lib/errors";
 import { kiotVietClient } from "./client";
 import type { KiotVietInvoice, KiotVietInvoicesResponse } from "./types";
-import { advanceInvoiceIndex, indexedInvoicesForOrder } from "./invoice-index";
+import { advanceInvoiceIndex, forgetIndexedInvoice, indexedInvoicesForOrder } from "./invoice-index";
 
 /** POST /invoices (Public API 2.12). `orderId` invoices an existing KiotViet order. */
 export interface KiotVietInvoiceInput {
@@ -79,7 +79,14 @@ export async function findKiotVietInvoicesForOrder(
   for (const row of await indexedInvoicesForOrder(order.code)) candidates.add(Number(row.invoice_id));
   const invoices: KiotVietInvoice[] = [];
   for (const id of candidates) {
-    const detail = await getKiotVietInvoiceDetail(id);
+    let detail: KiotVietInvoiceDetail;
+    try {
+      detail = await getKiotVietInvoiceDetail(id);
+    } catch (error) {
+      // An invoice deleted in KiotViet: it no longer exists, so it is not a duplicate.
+      if (error instanceof ApiError && error.status === 404) { await forgetIndexedInvoice(id); continue; }
+      throw error;
+    }
     if (detail?.orderCode === order.code) invoices.push({ id: detail.id, code: detail.code, orderCode: detail.orderCode, status: detail.status, statusValue: detail.statusValue });
   }
   const complete = index.current && index.currentAsOf !== null && index.currentAsOf.getTime() >= lookupStart.getTime();

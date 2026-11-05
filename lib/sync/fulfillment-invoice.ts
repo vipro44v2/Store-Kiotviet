@@ -6,6 +6,7 @@ import { getQueue } from "@/lib/queue/queues";
 import { isRedisEnabled } from "@/lib/redis/client";
 import { getEnv } from "@/lib/env";
 import { applyInvoiceRecovery, planInvoiceRecovery } from "@/lib/recovery/kiotviet-invoice-recovery";
+import { getInvoiceIndexHealth } from "@/lib/kiotviet/invoice-index";
 import { getSyncSettings } from "./sync-settings";
 import { syncInventoryNotification } from "./inventory-sync";
 import type { OrderSettings } from "./default-branch";
@@ -58,7 +59,10 @@ async function parkOrder(orderId: string, interval: "infinity" | "30 minutes") {
   await query(
     interval === "infinity"
       ? "UPDATE order_mappings SET invoice_check_at='infinity'::timestamptz WHERE shopify_order_id=$1"
-      : "UPDATE order_mappings SET invoice_check_at=now()+interval '30 minutes' WHERE shopify_order_id=$1",
+      // Doubles per exhausted job of this order (max 24 h), so a persistent failure never polls every 30 minutes.
+      : `UPDATE order_mappings SET invoice_check_at=now()+LEAST(interval '24 hours',interval '30 minutes'*power(2,LEAST(6,(
+          SELECT count(*) FROM sync_jobs WHERE type='shopify_invoice_create' AND payload->>'entityId'=$1 AND status='failed' AND attempts>=max_attempts))))
+        WHERE shopify_order_id=$1`,
     [orderId],
   );
 }
@@ -71,7 +75,7 @@ export type InvoiceAdmission =
  * Called for Shopify fulfillment/order events and by the rescan. Admits at most
  * one active invoice job per order (PostgreSQL outbox; Redis loss cannot drop it).
  */
-export async function requestFulfillmentInvoice(orderId: string): Promise<InvoiceAdmission> {
+export async function requestFulfillmentInvoice(orderId: string, options: { retryKey?: string } = {}): Promise<InvoiceAdmission> {
   const { config, settingsVersion } = await orderSettings();
   if (!config.invoiceCreationTrigger || config.invoiceCreationTrigger === "disabled") return "disabled";
   const [mapping] = await query<{ invoice_id: string | null }>(
@@ -106,7 +110,8 @@ export async function requestFulfillmentInvoice(orderId: string): Promise<Invoic
   }
   if (decision === "waiting") return "waiting";
 
-  const triggerState = invoiceTriggerState(live, settingsVersion);
+  // retryKey admits one new job for an unchanged order (e.g. after the invoice index recovered).
+  const triggerState = invoiceTriggerState(live, settingsVersion) + (options.retryKey ? `|${options.retryKey}` : "");
   const admitted = await query(
     `INSERT INTO sync_jobs(type,payload,priority,max_attempts)
     SELECT 'shopify_invoice_create',jsonb_build_object('entityId',$1::text,'triggerState',$3::text),'high',$2
@@ -158,6 +163,34 @@ export async function reconcileFulfillmentInvoices() {
 /** Remote-state reasons that resolve by themselves; retried instead of manual review. */
 const TRANSIENT_REASONS = ["order_not_synced", "invoice_in_flight", "invoice_lookup_incomplete"];
 
+export const INDEX_DEFERRED_STAGE = "invoice_index";
+
+/**
+ * Called by the invoice index job once the index is current: re-admits invoice
+ * jobs that were deferred because duplicate detection was not yet possible.
+ * Each deferral is re-admitted once (the stage is consumed when the job runs).
+ */
+export async function readmitIndexDeferredInvoices(currentAsOf: Date) {
+  const rows = await query<{ shopify_order_id: string }>(
+    `SELECT shopify_order_id FROM invoice_mappings WHERE status='blocked' AND failure_stage=$1 AND kiotviet_invoice_id IS NULL
+    ORDER BY updated_at LIMIT 50`,
+    [INDEX_DEFERRED_STAGE],
+  );
+  const results: Record<string, InvoiceAdmission> = {};
+  for (const row of rows)
+    results[row.shopify_order_id] = await requestFulfillmentInvoice(row.shopify_order_id, { retryKey: `index:${currentAsOf.toISOString()}` });
+  if (rows.length)
+    await log("info", "Invoice jobs re-admitted after invoice index recovery", {
+      action: "invoice_index_readmitted", provider: "kiotviet", entityType: "invoice", results,
+    });
+  return results;
+}
+
+/** Structured log for each stage of the automatic invoice workflow. */
+function stage(orderId: string, name: string, details: Record<string, unknown> = {}) {
+  return log("info", `Invoice workflow: ${name}`, { action: `invoice_stage_${name}`, provider: "kiotviet", entityType: "invoice", entityId: orderId, ...details });
+}
+
 export async function processFulfillmentInvoice(orderId: string) {
   const { config } = await orderSettings();
   const live = await getShopifyOrderPaymentState(orderId);
@@ -177,7 +210,24 @@ export async function processFulfillmentInvoice(orderId: string) {
     await recordBlocked(orderId, "cancelled_or_refunded: cancelled or fully refunded orders are never invoiced", "fulfillment_trigger");
     return;
   }
+  await stage(orderId, "trigger_ready", { trigger: config.invoiceCreationTrigger, productOnly: config.productOnlyInvoicing === true, financialStatus: live.displayFinancialStatus });
+  // Without a usable index duplicate detection is inconclusive. Defer cheaply (no
+  // Shopify/KiotViet reads, no attempt consumed); the index job re-admits it.
+  const index = await getInvoiceIndexHealth();
+  if (!index.usable) {
+    // An attempt that may already have sent its POST keeps the retry → link/review path.
+    const [attempt] = await query<{ status: string }>("SELECT status FROM invoice_mappings WHERE shopify_order_id=$1", [orderId]);
+    if (attempt && !["blocked", "failed"].includes(attempt.status))
+      throw new RetryableError(`invoice_lookup_incomplete: invoice index not current; previous attempt is ${attempt.status}`);
+    await recordBlocked(orderId, `invoice_index_not_ready: duplicate detection is inconclusive until the KiotViet invoice index is current (${index.scanned}/${index.total ?? "?"} indexed${index.lastError ? `; ${index.lastError}` : ""}); retried automatically`, INDEX_DEFERRED_STAGE);
+    await stage(orderId, "deferred_for_index", { scanned: index.scanned, total: index.total, lastError: index.lastError });
+    return;
+  }
+  await query(`UPDATE invoice_mappings SET failure_stage='invoice_index_retried',updated_at=now()
+    WHERE shopify_order_id=$1 AND status='blocked' AND failure_stage=$2`, [orderId, INDEX_DEFERRED_STAGE]);
   const plan = await planInvoiceRecovery(orderId);
+  await stage(orderId, "planned", { plan: plan.action.kind, productOnly: plan.productOnly ?? null,
+    reasons: plan.action.kind === "blocked" ? plan.action.reasons : undefined });
   if (plan.action.kind === "blocked") {
     const reason = plan.action.reasons.join("; ");
     if (TRANSIENT_REASONS.some((code) => reason.includes(code))) throw new RetryableError(reason);
@@ -189,7 +239,12 @@ export async function processFulfillmentInvoice(orderId: string) {
     const latest = await getShopifyOrderPaymentState(orderId);
     if (!latest || invoiceTriggerDecision((await orderSettings()).config, latest) !== "ready") throw new ConflictError("Invoice trigger changed during validation");
     const result = await applyInvoiceRecovery(plan);
-    if (!result.applied) throw new RetryableError(result.message);
+    await stage(orderId, "applied", { applied: result.applied, status: result.status ?? null, invoiceCode: result.invoiceCode ?? null, message: result.message });
+    if (!result.applied) {
+      // An unknown POST outcome is never retried by sending again: the next run only
+      // re-plans, which links the invoice or reports invoice_outcome_unknown.
+      throw new RetryableError(result.message);
+    }
   }
   const [row] = await query<InvoiceRow>("SELECT * FROM invoice_mappings WHERE shopify_order_id=$1", [orderId]);
   if (!row?.kiotviet_invoice_id) throw new RetryableError("Invoice ID not yet verified; reconcile before retrying");
@@ -204,6 +259,7 @@ export async function processFulfillmentInvoice(orderId: string) {
       if (result?.status !== "synced") throw new ConflictError("Invoice exists; inventory synchronization requires review");
     }
     await query("UPDATE invoice_mappings SET reconciliation=reconciliation || '{\"shopifyStockSynchronized\":true}'::jsonb WHERE shopify_order_id=$1", [orderId]);
+    await stage(orderId, "inventory_synchronized", { lines: row.reconciliation.expectedLines.length });
   } catch (error) {
     await query(`UPDATE invoice_mappings SET reconciliation=reconciliation || $2::jsonb,
       last_error=$3,failure_stage='shopify_inventory',updated_at=now() WHERE shopify_order_id=$1`,

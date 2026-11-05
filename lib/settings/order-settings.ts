@@ -15,6 +15,13 @@ export const ordersSettingsSchema = z
       })
       .strict()
       .optional(),
+    // Product-Only Invoicing (lib/sync/product-only-invoicing.ts). Absent = strict invoicing.
+    productOnlyInvoicing: z.boolean().optional(),
+    paymentSource: z.enum(["shopify"]).optional(),
+    ignoreFinancialMismatch: z.boolean().optional(),
+    excludeShipping: z.boolean().optional(),
+    excludeProcessingFees: z.boolean().optional(),
+    excludeOtherSurcharges: z.boolean().optional(),
   })
   .passthrough()
   .refine(
@@ -22,6 +29,11 @@ export const ordersSettingsSchema = z
       (!orders.invoiceCreationTrigger && orders.autoInvoice !== true) ||
       Boolean(orders.kiotVietCurrency),
     { message: "orders.kiotVietCurrency is required when invoice creation is enabled" },
+  )
+  .refine(
+    // Product-Only runs only through the invoice-trigger pipeline, never the legacy makeInvoice path.
+    (orders) => orders.productOnlyInvoicing !== true || Boolean(orders.invoiceCreationTrigger),
+    { message: "Product-Only Invoicing requires an explicit Invoice Creation Trigger" },
   );
 
 export type OrdersSettingsInput = z.infer<typeof ordersSettingsSchema>;

@@ -9,6 +9,7 @@ const m = vi.hoisted(() => ({
   ignoreOrderBy: false,
   failAfter: Infinity,
   calls: 0,
+  repositions: 0,
 }));
 
 vi.mock("@/lib/db/client", () => ({
@@ -18,6 +19,16 @@ vi.mock("@/lib/db/client", () => ({
     if (sql.startsWith("UPDATE kiotviet_invoice_index_state SET scanned_count=0")) {
       if (s.generation !== params[0]) return [];
       Object.assign(s, { scanned_count: 0, last_invoice_id: null, remote_total: null, current_as_of: null, generation: s.generation + 1, last_error: params[1] });
+      return [];
+    }
+    if (sql.includes("reposition_count=reposition_count+1")) {
+      if (s.generation !== params[0] || s.scanned_count !== params[1]) return [];
+      Object.assign(s, { scanned_count: params[2], last_invoice_id: params[3] == null ? null : String(params[3]), remote_total: params[4], last_error: params[5] });
+      m.repositions++;
+      return [{ id: 1 }];
+    }
+    if (sql.startsWith("UPDATE kiotviet_invoice_index_state SET last_error")) {
+      if (s.generation === params[0]) s.last_error = String(params[1]);
       return [];
     }
     if (sql.startsWith("UPDATE kiotviet_invoice_index_state SET scanned_count=$3")) {
@@ -64,6 +75,7 @@ beforeEach(() => {
   m.ignoreOrderBy = false;
   m.failAfter = Infinity;
   m.calls = 0;
+  m.repositions = 0;
   m.get.mockReset().mockImplementation(async (url: string) => serve(url));
 });
 
@@ -87,13 +99,46 @@ describe("KiotViet invoice index (13,215 invoices)", () => {
     expect(m.index.get(20_000)).toMatchObject({ order_code: "DH1072" });
   });
 
-  it("rebuilds from scratch when an already indexed invoice disappears (overlap mismatch)", async () => {
+  it("repositions by binary search (no full rebuild) when an already indexed invoice disappears", async () => {
     await advanceInvoiceIndex({ maxPages: 200 });
-    m.remote = m.remote.filter((invoice) => invoice.id !== 13_215);
+    m.remote = m.remote.filter((invoice) => invoice.id !== 13_215 && invoice.id !== 500);
     m.remote.push({ id: 30_000, code: "HD30000", orderCode: "DH9", status: 1 });
-    const progress = await advanceInvoiceIndex({ maxPages: 1 });
-    expect(progress.current).toBe(false);
-    expect(m.state).toMatchObject({ generation: 2, scanned_count: 0, current_as_of: null });
+    m.calls = 0;
+    const progress = await advanceInvoiceIndex({ maxPages: 3 });
+    expect(progress).toMatchObject({ current: true, scanned: 13_214, total: 13_214 });
+    expect(m.state).toMatchObject({ generation: 1, last_invoice_id: "30000" });
+    expect(m.repositions).toBe(1);
+    expect(m.calls).toBeLessThan(25); // ~log2(13k) single-row reads, never ~133 pages
+    expect(m.index.get(30_000)).toMatchObject({ order_code: "DH9" });
+  });
+
+  it("repositions mid-build after deletions and still indexes every remaining invoice", async () => {
+    await advanceInvoiceIndex({ maxPages: 20 });
+    m.remote = m.remote.filter((invoice) => invoice.id % 97 !== 0 || invoice.id > 5_000);
+    await expect(advanceInvoiceIndex({ maxPages: 300 })).resolves.toMatchObject({ current: true, total: m.remote.length });
+    expect(m.remote.every((invoice) => m.index.has(invoice.id))).toBe(true);
+    expect(m.state.generation).toBe(1);
+  });
+
+  it("never claims completeness when the reposition itself fails", async () => {
+    await advanceInvoiceIndex({ maxPages: 200 });
+    const before = m.state.current_as_of;
+    m.remote = m.remote.filter((invoice) => invoice.id !== 100);
+    m.failAfter = m.calls + 3;
+    const progress = await advanceInvoiceIndex({ maxPages: 3 });
+    expect(progress).toMatchObject({ current: false, error: expect.stringContaining("reposition failed") });
+    expect(m.state).toMatchObject({ scanned_count: 13_215, current_as_of: before, last_error: expect.stringContaining("overlap mismatch") });
+    // The next scheduler run (API healthy again) recovers on its own.
+    m.failAfter = Infinity;
+    await expect(advanceInvoiceIndex({ maxPages: 3 })).resolves.toMatchObject({ current: true, scanned: 13_214 });
+  });
+
+  it("proves absence again after a reposition only with a fresh confirmation", async () => {
+    await advanceInvoiceIndex({ maxPages: 200 });
+    m.remote = m.remote.filter((invoice) => invoice.id !== 7);
+    const result = await findKiotVietInvoicesForOrder({ id: 5555, code: "DH-NOT-INVOICED" });
+    expect(result).toEqual({ invoices: [], complete: true });
+    await expect(findKiotVietInvoicesForOrder({ id: 1, code: "DH7" })).resolves.toMatchObject({ invoices: [] });
   });
 
   it("refuses to use the index when KiotViet ignores orderBy=id", async () => {

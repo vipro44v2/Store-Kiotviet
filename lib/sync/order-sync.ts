@@ -42,6 +42,7 @@ import {
   type ExcludedFeeLine,
   type OrderAmounts,
 } from "./order-line-items";
+import { discountedUnitPriceCents, lineDiscountCents, productOnlyPolicy } from "./product-only-invoicing";
 import {
   attachKiotVietOrderToInvoice,
   blockAutoInvoice,
@@ -202,6 +203,25 @@ function feeLogContext(prepared: PreparedOrder) {
       amount: fee.chargedCents / 100,
     })),
   };
+}
+
+/**
+ * Product-Only: each line carries its discounted unit price (discount 0), so
+ * the KiotViet order total is exactly the merchandise the customer paid for.
+ * A discount that cannot be split into whole cents keeps the list price; the
+ * invoice planner then blocks that order (discount_not_representable).
+ */
+function productOnlyLines(lines: ValidatedOrderLine[]): ValidatedOrderLine[] {
+  return lines.map((line) => {
+    const unit = discountedUnitPriceCents(line.line, line.quantity);
+    return unit === null ? line : { ...line, price: unit / 100 };
+  });
+}
+
+/** Σ (price × quantity − discounts) of the product lines, in cents. */
+function merchandisePaidCents(lines: ValidatedOrderLine[]) {
+  return lines.reduce((sum, { line, quantity }) =>
+    sum + Math.round(Number(line.price) * 100) * quantity - lineDiscountCents(line), 0);
 }
 
 async function buildOrderDetails(
@@ -570,7 +590,8 @@ async function createMappedOrder(
     progress.stage = "sync_customer";
     const customerId = await resolveOrderCustomerId(order, settings, branchId);
     progress.stage = "product_mapping";
-    const orderDetails = await buildOrderDetails(order, prepared.lines, context.jobId);
+    const productOnly = productOnlyPolicy(settings).enabled;
+    const orderDetails = await buildOrderDetails(order, productOnly ? productOnlyLines(prepared.lines) : prepared.lines, context.jobId);
     if (invoiceRequested) {
       progress.stage = "read_stock_before";
       invoiceReconciliation = {
@@ -589,12 +610,16 @@ async function createMappedOrder(
       method: "Transfer",
       // Processing fees are not KiotViet products, so their charged amount is
       // excluded from the payment as well (see lib/sync/order-line-items.ts).
+      // Product-Only records only the merchandise payment: shipping, tips and
+      // other charges stay in Shopify and are never put on the KiotViet order.
       totalPayment:
-        order.financial_status === "paid" ? prepared.amounts.adjustedTotal : 0,
+        order.financial_status !== "paid" ? 0
+          : productOnly ? merchandisePaidCents(prepared.lines) / 100
+          : prepared.amounts.adjustedTotal,
       // Documented: creates the invoice and its receipt from this order (deducts stock).
       makeInvoice: false,
       orderDetails,
-      ...shippingSurcharges(order, settings),
+      ...(productOnly ? {} : shippingSurcharges(order, settings)),
     };
   } catch (error) {
     // Nothing was sent to KiotViet yet, so the order can be claimed again.

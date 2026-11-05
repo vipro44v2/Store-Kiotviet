@@ -27,6 +27,11 @@ import type { ShopifyOrderWebhook } from "@/types/shopify";
 import { RecoveryArgsError } from "./shopify-order-recovery";
 import { PREPAYMENT_EVIDENCE_KEY, prepaymentInheritanceStatus } from "@/lib/kiotviet/prepayment-evidence";
 import { resolveInvoiceSeller, type VerifiedSeller } from "@/lib/kiotviet/users";
+import {
+  productOnlyPaymentDecision,
+  productOnlyPolicy,
+  type FinancialDifference,
+} from "@/lib/sync/product-only-invoicing";
 
 export const INVOICE_RECOVERY_USAGE = `Usage:
   recover-kiotviet-invoice.ts --list
@@ -99,7 +104,25 @@ export interface InvoiceRecoveryPlan {
   /** Verified seller (soldById) sent with the invoice; candidates that failed verification. */
   seller?: VerifiedSeller;
   sellerRejected?: string[];
+  /** Product-Only audit: amounts by source and every difference left after invoicing. */
+  productOnly?: ProductOnlyAudit;
   action: InvoiceRecoveryAction;
+}
+
+export interface ProductOnlyAudit {
+  mode: "product_only";
+  paymentSource: "shopify";
+  /** What Shopify collected (total − refunds); the customer-payment authority. */
+  shopifyPaid: number;
+  shopifyTotal: number;
+  /** KiotViet invoice value: Σ product lines of the existing KiotViet order. */
+  invoiceMerchandise: number;
+  kiotVietPrepaid: number;
+  /** Always 0: an invoice never creates a payment transaction in Product-Only mode. */
+  additionalPayment: 0;
+  differences: FinancialDifference[];
+  /** True only when no difference at all remains; excluded charges are never "reconciled". */
+  financiallyReconciled: boolean;
 }
 
 export interface InvoiceProposal {
@@ -167,6 +190,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
   plan.validationReasons = reasons;
   const [settingsRow] = await query<{ value: OrderSettings }>("SELECT value FROM system_settings WHERE key='orders'");
   const settings = settingsRow?.value ?? {};
+  const policy = productOnlyPolicy(settings);
   // KiotViet rejects an invoice whose seller was deleted (HTTP 420), so the seller is
   // verified before planning; this is never overridable.
   const sellerResolution = await resolveInvoiceSeller(kiotVietOrder);
@@ -203,7 +227,9 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
   // Every physical line must match the existing KiotViet order exactly (product, quantity, price).
   if (plan.prepared) {
     const expected = new Map<number, { sku: string; quantity: number; price: number }>();
-    for (const { sku, quantity, price } of plan.prepared.lines) {
+    for (const { line: shopifyLine, sku, quantity, price: listPrice } of plan.prepared.lines) {
+      // Product-Only compares against the discounted unit price the order was created with.
+      const price = policy.enabled ? plan.financials?.unitPrices?.[String(shopifyLine.id)] ?? listPrice : listPrice;
       const owners = (await mappingsRepository.findBySku(normalizeSku(sku))).filter((row) => row.sync_status !== "archived");
       const productId = Number(owners[0]?.kiotviet_product_id);
       if (owners.length !== 1 || !Number.isSafeInteger(productId) || productId <= 0) {
@@ -234,24 +260,41 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
     for (const productId of actual.keys())
       if (!expected.has(productId)) reasons.push(`extra_line: KiotViet order has product ${productId} that is not a Shopify physical line`);
     plan.expectedLines = [...expected].map(([productId, line]) => ({ productId, ...line }));
-    // Shipping must already be on the KiotViet order as the configured surcharge;
-    // the invoice never invents it and product prices never absorb it.
-    const shippingCents = cents(plan.financials?.shippingTotal ?? 0);
-    const surchargeId = Number(settings.shippingSurcharge?.id);
-    let orderShippingCents = 0;
-    for (const surcharge of kiotVietOrder.invoiceOrderSurcharges ?? []) {
-      if (Number(surcharge?.surchargeId) === surchargeId) orderShippingCents += cents(surcharge?.price);
-      else reasons.push(`unexpected_surcharge: KiotViet order has surcharge ${surcharge?.surchargeId} (${surcharge?.surchargeName ?? ""}) that is not Shopify shipping`);
+    if (policy.enabled) {
+      // Product-Only: the invoice holds product lines only. Whether KiotViet copies an
+      // order surcharge onto the invoice is undocumented, so an order carrying one
+      // (created before Product-Only) cannot produce a product-only invoice safely.
+      let surchargeCents = 0;
+      for (const surcharge of kiotVietOrder.invoiceOrderSurcharges ?? []) {
+        surchargeCents += cents(surcharge?.price);
+        reasons.push(`kiotviet_order_has_surcharge: KiotViet order has surcharge ${surcharge?.surchargeId} (${surcharge?.surchargeName ?? ""}) ${cents(surcharge?.price) / 100}; a product-only invoice cannot be guaranteed`);
+      }
+      const linesCents = [...expected.values()].reduce((sum, line) => sum + cents(line.price) * line.quantity, 0);
+      const orderTotalCents = cents(kiotVietOrder.total);
+      if (orderTotalCents !== linesCents) {
+        if (policy.ignoreFinancialMismatch && surchargeCents > 0 && orderTotalCents === linesCents + surchargeCents) { /* explained by the surcharge reported above */ }
+        else reasons.push(`total_mismatch: KiotViet order total ${kiotVietOrder.total} differs from its product lines ${linesCents / 100}`);
+      }
+    } else {
+      // Shipping must already be on the KiotViet order as the configured surcharge;
+      // the invoice never invents it and product prices never absorb it.
+      const shippingCents = cents(plan.financials?.shippingTotal ?? 0);
+      const surchargeId = Number(settings.shippingSurcharge?.id);
+      let orderShippingCents = 0;
+      for (const surcharge of kiotVietOrder.invoiceOrderSurcharges ?? []) {
+        if (Number(surcharge?.surchargeId) === surchargeId) orderShippingCents += cents(surcharge?.price);
+        else reasons.push(`unexpected_surcharge: KiotViet order has surcharge ${surcharge?.surchargeId} (${surcharge?.surchargeName ?? ""}) that is not Shopify shipping`);
+      }
+      if (shippingCents > 0 && orderShippingCents === 0)
+        reasons.push(`shipping_not_on_kiotviet_order: Shopify charged ${shippingCents / 100} shipping but the KiotViet order has no shipping surcharge (orders created before orders.shippingSurcharge was configured); invoice it manually in KiotViet`);
+      else if (orderShippingCents !== shippingCents)
+        reasons.push(`shipping_mismatch: KiotViet order shipping surcharge ${orderShippingCents / 100} differs from Shopify shipping ${shippingCents / 100}`);
+      // KiotViet's order `total` may or may not include surcharges (undocumented); both are
+      // consistent once the surcharge itself was verified above.
+      if (plan.expectedTotal !== undefined &&
+          ![cents(plan.expectedTotal), cents(plan.expectedTotal) - orderShippingCents].includes(cents(kiotVietOrder.total)))
+        reasons.push(`total_mismatch: KiotViet order total ${kiotVietOrder.total} differs from expected ${plan.expectedTotal}`);
     }
-    if (shippingCents > 0 && orderShippingCents === 0)
-      reasons.push(`shipping_not_on_kiotviet_order: Shopify charged ${shippingCents / 100} shipping but the KiotViet order has no shipping surcharge (orders created before orders.shippingSurcharge was configured); invoice it manually in KiotViet`);
-    else if (orderShippingCents !== shippingCents)
-      reasons.push(`shipping_mismatch: KiotViet order shipping surcharge ${orderShippingCents / 100} differs from Shopify shipping ${shippingCents / 100}`);
-    // KiotViet's order `total` may or may not include surcharges (undocumented); both are
-    // consistent once the surcharge itself was verified above.
-    if (plan.expectedTotal !== undefined &&
-        ![cents(plan.expectedTotal), cents(plan.expectedTotal) - orderShippingCents].includes(cents(kiotVietOrder.total)))
-      reasons.push(`total_mismatch: KiotViet order total ${kiotVietOrder.total} differs from expected ${plan.expectedTotal}`);
     plan.stockNow = await readBranchStock([...expected.keys()], Number(kiotVietOrder.branchId));
     if (Object.values(plan.stockNow).some(value => value === null || !Number.isFinite(value))) reasons.push("branch_stock_unavailable: cannot establish stock before invoicing");
   }
@@ -266,17 +309,36 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
   if (kiotVietOrder.totalPayment != null && kiotVietOrder.payments?.length &&
       kiotVietOrder.payments.reduce((sum, payment) => sum + cents(payment.amount), 0) !== prepaidCents)
     reasons.push("payment_mismatch: KiotViet payment rows disagree with totalPayment");
-  if (plan.expectedTotal !== undefined && prepaidCents > cents(plan.expectedTotal))
+  if (!policy.enabled && plan.expectedTotal !== undefined && prepaidCents > cents(plan.expectedTotal))
     reasons.push(`overpaid: KiotViet order already records ${plan.prepaid} paid, more than ${plan.expectedTotal}`);
   // Undocumented KiotViet behavior: never invoice a prepaid order (automatically or by
   // override) without sandbox evidence that the invoice inherits the prepayment.
-  let inheritanceVerified = true;
+  let inheritanceVerified = true, inheritanceReason: string | undefined;
   if (prepaidCents > 0) {
     const [evidenceRow] = await query<{ value: unknown }>("SELECT value FROM system_settings WHERE key=$1", [PREPAYMENT_EVIDENCE_KEY]);
     const inheritance = prepaymentInheritanceStatus(evidenceRow?.value, settings.invoicePrepaymentVerified);
     inheritanceVerified = inheritance.verified;
-    if (!inheritance.verified)
+    inheritanceReason = inheritance.reason;
+    if (!policy.enabled && !inheritance.verified)
       reasons.push(`prepayment_inheritance_unverified: KiotViet already records ${plan.prepaid} paid on this order and it is undocumented whether an invoice created from it inherits that payment; ${inheritance.reason}`);
+  }
+  if (policy.enabled && plan.financials) {
+    // Product-Only payment safety: Shopify says the customer paid; the invoice never adds a
+    // payment, so the existing KiotViet prepayment must be carried exactly (verified case only).
+    const invoiceCents = (kiotVietOrder.orderDetails ?? []).reduce((sum, detail) => sum + cents(detail.price) * Number(detail.quantity), 0);
+    const shopifyPaidCents = cents(plan.financials.shopifyPaidTotal);
+    const payment = productOnlyPaymentDecision({ prepaidCents, invoiceTotalCents: invoiceCents, shopifyPaidCents, inheritanceVerified, inheritanceReason });
+    if (!payment.safe) reasons.push(payment.reason);
+    const differences = [...(plan.financials.differences ?? [])];
+    if (prepaidCents !== invoiceCents)
+      differences.push({ code: "kiotviet_prepaid_vs_invoice", amount: (prepaidCents - invoiceCents) / 100,
+        message: `KiotViet order prepayment ${(prepaidCents / 100).toFixed(2)} vs product-only invoice ${(invoiceCents / 100).toFixed(2)}` });
+    plan.productOnly = {
+      mode: "product_only", paymentSource: "shopify",
+      shopifyPaid: shopifyPaidCents / 100, shopifyTotal: plan.prepared?.amounts.shopifyTotal ?? 0,
+      invoiceMerchandise: invoiceCents / 100, kiotVietPrepaid: prepaidCents / 100, additionalPayment: 0,
+      differences, financiallyReconciled: differences.length === 0,
+    };
   }
 
   // Never issue an invoice before proving none exists.
@@ -302,7 +364,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
       return block(`invoice_outcome_unknown: a previous attempt is ${invoiceRow.status} and no invoice is visible; check KiotViet, then run with --reset-uncertain --apply`);
     return { ...plan, action: { kind: "reset_uncertain" } };
   }
-  if (plan.prepared && plan.expectedLines) plan.proposal = buildInvoiceProposal(plan.prepared, plan.financials, kiotVietOrder, prepaidCents, settings, inheritanceVerified, plan.seller);
+  if (plan.prepared && plan.expectedLines) plan.proposal = buildInvoiceProposal(plan.prepared, plan.financials, kiotVietOrder, prepaidCents, settings, inheritanceVerified, plan.seller, plan.productOnly);
   if (reasons.length) return block(...reasons);
   return {
     ...plan,
@@ -314,7 +376,8 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
         ...(kiotVietOrder.customerId ? { customerId: Number(kiotVietOrder.customerId) } : {}),
         ...(plan.seller ? { soldById: plan.seller.soldById } : {}),
         discount: 0,
-        totalPayment: (cents(plan.expectedTotal) - prepaidCents) / 100,
+        // Product-Only never creates a payment transaction: the verified prepayment is carried.
+        totalPayment: plan.productOnly ? 0 : (cents(plan.expectedTotal) - prepaidCents) / 100,
         method: "Transfer",
         invoiceDetails: (kiotVietOrder.orderDetails ?? []).map((detail) => ({
           productId: Number(detail.productId), productCode: String(detail.productCode ?? ""),
@@ -332,7 +395,7 @@ export async function planInvoiceRecovery(orderId: string, options: { resetUncer
  * received for goods, minus what KiotViet already recorded, so a payment is
  * never invented or recorded twice. Product prices are never changed.
  */
-function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinancials | undefined, kiotVietOrder: KiotVietOrderDetail, prepaidCents: number, settings: OrderSettings, inheritanceVerified: boolean, seller: VerifiedSeller | undefined): InvoiceProposal {
+function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinancials | undefined, kiotVietOrder: KiotVietOrderDetail, prepaidCents: number, settings: OrderSettings, inheritanceVerified: boolean, seller: VerifiedSeller | undefined, productOnly?: ProductOnlyAudit): InvoiceProposal {
   const invoiceDetails = (kiotVietOrder.orderDetails ?? []).map((detail) => ({
     productId: Number(detail.productId), productCode: String(detail.productCode ?? ""),
     productName: String(detail.productName ?? detail.productCode ?? ""),
@@ -346,10 +409,11 @@ function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinanc
   if (surchargeCents > 0 && settings.shippingSurcharge?.invoiceInheritsFromOrder !== true)
     blockers.push("surcharge_inheritance_unverified: confirm in KiotViet that an invoice created from an order keeps its surcharges");
   const invoiceTotalCents = detailsCents + surchargeCents;
-  const paidCents = cents(prepared.amounts.adjustedTotal);
+  const paidCents = productOnly ? cents(productOnly.shopifyPaid) : cents(prepared.amounts.adjustedTotal);
   // While prepayment inheritance is unverified, never record any further payment:
   // the manual exception sends totalPayment 0 and leaves the rest to accounting.
-  const additionalCents = inheritanceVerified ? Math.max(0, Math.min(invoiceTotalCents, paidCents) - prepaidCents) : 0;
+  // Product-Only never creates a payment transaction at all.
+  const additionalCents = inheritanceVerified && !productOnly ? Math.max(0, Math.min(invoiceTotalCents, paidCents) - prepaidCents) : 0;
   const recordedCents = prepaidCents + additionalCents;
   const shopifyMerchandiseCents = cents(financials?.merchandiseTotal ?? 0);
   const shopifyShippingCents = cents(financials?.shippingTotal ?? 0);
@@ -360,7 +424,8 @@ function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinanc
   };
   add("merchandise_difference", shopifyMerchandiseCents - detailsCents,
     `Shopify merchandise ${money(shopifyMerchandiseCents)} vs KiotViet invoice lines ${money(detailsCents)}`);
-  add("shipping_unrecorded", shopifyShippingCents - surchargeCents,
+  if (productOnly) differences.push(...productOnly.differences.filter((difference) => difference.code !== "kiotviet_prepaid_vs_invoice"));
+  else add("shipping_unrecorded", shopifyShippingCents - surchargeCents,
     `Shopify shipping ${money(shopifyShippingCents)} vs KiotViet invoice surcharges ${money(surchargeCents)}`);
   add("overpayment", Math.max(0, recordedCents - invoiceTotalCents),
     `KiotViet will record ${money(recordedCents)} paid for an invoice of ${money(invoiceTotalCents)}`);
@@ -369,7 +434,7 @@ function buildInvoiceProposal(prepared: PreparedOrder, financials: InvoiceFinanc
   if (!inheritanceVerified && prepaidCents > 0)
     differences.push({ code: "prepayment_inheritance_unverified", amount: prepaidCents / 100,
       message: `KiotViet holds ${money(prepaidCents)} prepaid on the order; whether the invoice inherits it is verified only after the POST` });
-  add("payment_not_recorded", paidCents - recordedCents,
+  if (!productOnly) add("payment_not_recorded", paidCents - recordedCents,
     `Customer paid ${money(paidCents)} in Shopify (excluding fees); KiotViet will record ${money(recordedCents)}`);
   return {
     input: {
@@ -402,7 +467,9 @@ function invoiceSearchStart(order: KiotVietOrderDetail) {
 }
 
 function reconciliationFor(plan: InvoiceRecoveryPlan, extra: Record<string, unknown> = {}): InvoiceReconciliation {
-  return { ...plan.invoiceRow?.reconciliation, ...extra, branchId: Number(plan.kiotVietOrder?.branchId), expectedLines: plan.expectedLines, prepaid: plan.prepaid, shippingTotal: plan.financials?.shippingTotal ?? 0, validationReasons: plan.validationReasons };
+  // Product-Only: the invoice must report exactly the carried prepayment as paid.
+  const productOnly = plan.productOnly ? { invoicingMode: "product_only", productOnly: plan.productOnly, expectedPaymentTotal: plan.productOnly.kiotVietPrepaid } : { invoicingMode: "strict" };
+  return { ...plan.invoiceRow?.reconciliation, ...productOnly, ...extra, branchId: Number(plan.kiotVietOrder?.branchId), expectedLines: plan.expectedLines, prepaid: plan.prepaid, shippingTotal: plan.financials?.shippingTotal ?? 0, validationReasons: plan.validationReasons };
 }
 
 /**
@@ -563,6 +630,11 @@ export function describeInvoiceRecoveryPlan(plan: InvoiceRecoveryPlan): string[]
     lines.push(`amounts: shopify_total=${plan.prepared.amounts.shopifyTotal} excluded_fees=${plan.prepared.amounts.excludedFeeTotal} expected_invoice_total=${plan.expectedTotal} currency=${plan.currency ?? "?"}`);
   for (const line of plan.expectedLines ?? [])
     lines.push(`line: SKU ${line.sku} product ${line.productId} qty=${line.quantity} price=${line.price} stock_now=${plan.stockNow?.[String(line.productId)] ?? "?"}`);
+  if (plan.productOnly) {
+    const audit = plan.productOnly;
+    lines.push(`product-only: payment_source=shopify shopify_paid=${audit.shopifyPaid} invoice_merchandise=${audit.invoiceMerchandise} kiotviet_prepaid=${audit.kiotVietPrepaid} additional_payment=0`);
+    for (const difference of audit.differences) lines.push(`difference (recorded, not reconciled): ${difference.code} ${difference.amount} — ${difference.message}`);
+  }
   for (const reason of plan.validationReasons ?? []) lines.push(`validation: ${reason}`);
   const action = plan.action;
   if (action.kind === "blocked") lines.push("PLAN: blocked", ...action.reasons.map((reason) => `  - ${reason}`));

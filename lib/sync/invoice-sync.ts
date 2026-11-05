@@ -168,7 +168,11 @@ export async function finalizeInvoice(
   const expected = cents(row.expected_total);
   // An approved override may leave a balance (payment capped at what Shopify received).
   const expectedPayment = typeof reconciliation.expectedPaymentTotal === "number" ? cents(reconciliation.expectedPaymentTotal) : expected;
-  const checks = {
+  // Product-Only (automatic): the invoice holds product lines only; excluded charges are
+  // recorded in reconciliation.productOnly and never block or count as reconciled.
+  const productOnly = reconciliation.invoicingMode === "product_only" && !reconciliation.manualOverride;
+  const invoiceSurchargeCents = (detail.invoiceOrderSurcharges ?? []).reduce((sum, surcharge) => sum + cents(surcharge?.price), 0);
+  const checks: Record<string, boolean> = {
     branch: Number(detail.branchId) === reconciliation.branchId,
     // Validation reasons must be absent, or each one explicitly approved by an admin override.
     financialValidation: !Array.isArray(reconciliation.validationReasons) || reconciliation.validationReasons.every((reason) =>
@@ -182,9 +186,11 @@ export async function finalizeInvoice(
     completed: Number(detail.status) === 1,
     // An order-linked invoice may report its total with or without the shipping surcharge;
     // the surcharge itself must then match the expected shipping exactly.
-    total: row.expected_total !== null && (cents(detail.total) === expected ||
-      (cents(reconciliation.shippingTotal) > 0 && cents(detail.total) === expected - cents(reconciliation.shippingTotal) &&
-        (detail.invoiceOrderSurcharges ?? []).reduce((sum, surcharge) => sum + cents(surcharge?.price), 0) === cents(reconciliation.shippingTotal))),
+    total: row.expected_total !== null && (productOnly
+      ? cents(detail.total) === expected && invoiceSurchargeCents === 0
+      : cents(detail.total) === expected ||
+        (cents(reconciliation.shippingTotal) > 0 && cents(detail.total) === expected - cents(reconciliation.shippingTotal) &&
+          invoiceSurchargeCents === cents(reconciliation.shippingTotal))),
     // KiotViet may report the invoice payment alone or including the order's prepayment.
     // "Khách đã trả" must equal prepayment + new payment. A prepaid order is only invoiced
     // after sandbox evidence showed the invoice inherits the prepayment, so a value that
@@ -203,6 +209,11 @@ export async function finalizeInvoice(
     total: detail.total ?? null, totalPayment: detail.totalPayment ?? null, status: detail.status ?? null,
     paymentRows: Array.isArray(detail.payments) ? detail.payments.map((row) => ({ amount: Number(row?.amount ?? 0), method: row?.method ?? null })) : null,
   };
+  if (productOnly) {
+    // Kept visible for accounting, but not a creation gate in Product-Only mode.
+    reconciliation.financiallyReconciled = checks.financiallyReconciled && (reconciliation.productOnly as { financiallyReconciled?: boolean } | undefined)?.financiallyReconciled === true;
+    delete checks.financiallyReconciled;
+  }
   reconciliation.checks = checks;
   if (reconciliation.branchId && reconciliation.expectedLines?.length) {
     try {

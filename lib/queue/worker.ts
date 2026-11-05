@@ -333,8 +333,20 @@ export async function processSyncJob(
       const orders = (await query<{ value: Record<string, unknown> }>("SELECT value FROM system_settings WHERE key='orders'"))[0]?.value ?? {};
       const invoicing = orders.autoInvoice === true || ["shopify_fulfilled", "shopify_paid"].includes(String(orders.invoiceCreationTrigger));
       if (!invoicing) break;
-      const { advanceInvoiceIndex } = await import("@/lib/kiotviet/invoice-index");
-      await advanceInvoiceIndex({ maxPages: 30, deadlineMs: 50_000 });
+      const { advanceInvoiceIndex, getInvoiceIndexHealth } = await import("@/lib/kiotviet/invoice-index");
+      const progress = await advanceInvoiceIndex({ maxPages: 30, deadlineMs: 50_000 });
+      if (progress.current && progress.currentAsOf) {
+        // Invoice jobs deferred while duplicate detection was inconclusive run again now.
+        const { readmitIndexDeferredInvoices } = await import("@/lib/sync/fulfillment-invoice");
+        await readmitIndexDeferredInvoices(progress.currentAsOf);
+      } else {
+        const health = await getInvoiceIndexHealth();
+        if (health.stale)
+          await log("warn", "KiotViet invoice index is stale", {
+            action: "invoice_index_stale", provider: "kiotviet", scanned: health.scanned, total: health.total,
+            currentAsOf: health.currentAsOf, error: progress.error ?? health.lastError,
+          });
+      }
       break;
     }
     case "shopify_refund":

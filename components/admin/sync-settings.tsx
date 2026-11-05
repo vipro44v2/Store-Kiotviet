@@ -34,6 +34,15 @@ const flags: Array<{ key: Flag; label: string; description: string }> = [
   },
 ];
 
+type ProductOnlyFlag = "ignoreFinancialMismatch" | "excludeShipping" | "excludeProcessingFees" | "excludeOtherSurcharges";
+
+const productOnlyOptions: Array<{ key: ProductOnlyFlag; label: string }> = [
+  { key: "excludeShipping", label: "Không đưa phí vận chuyển vào hóa đơn" },
+  { key: "excludeProcessingFees", label: "Không đưa phí xử lý thanh toán vào hóa đơn" },
+  { key: "excludeOtherSurcharges", label: "Không đưa tip và các khoản thu khác vào hóa đơn" },
+  { key: "ignoreFinancialMismatch", label: "Chênh lệch tổng tiền do các khoản đã loại trừ không chặn tạo hóa đơn" },
+];
+
 const strategies: Array<{ value: InventoryConflictStrategy; label: string }> = [
   { value: "hold", label: "Giữ số lượng Shopify và tạo xung đột để đối soát (khuyến nghị)" },
   { value: "kiotviet_wins", label: "Ghi đè bằng tồn KiotViet và vẫn tạo xung đột (hành vi cũ)" },
@@ -57,6 +66,10 @@ export function SyncSettingsCard({
   const [surchargeCode, setSurchargeCode] = useState(storedSurcharge.code ?? "");
   const [surchargeVerified, setSurchargeVerified] = useState(storedSurcharge.invoiceInheritsFromOrder === true);
   const [prepaymentVerified, setPrepaymentVerified] = useState(orders?.invoicePrepaymentVerified === true);
+  const [productOnly, setProductOnly] = useState(orders?.productOnlyInvoicing === true);
+  // Selecting Product-Only turns every exclusion on unless it was explicitly turned off.
+  const [productOnlyFlags, setProductOnlyFlags] = useState(() =>
+    Object.fromEntries(productOnlyOptions.map((option) => [option.key, orders?.[option.key] !== false])) as Record<ProductOnlyFlag, boolean>);
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -84,11 +97,19 @@ export function SyncSettingsCard({
       if (currency) nextOrders.kiotVietCurrency = currency;
       else delete nextOrders.kiotVietCurrency;
       if (surchargeId.trim() || surchargeCode.trim()) {
-        if (!/^d+$/.test(surchargeId.trim()) || !surchargeCode.trim())
+        if (!/^\d+$/.test(surchargeId.trim()) || !surchargeCode.trim())
           throw new Error("Nhập cả ID và mã thu khác KiotViet cho phí vận chuyển, hoặc để trống cả hai");
         nextOrders.shippingSurcharge = { id: Number(surchargeId.trim()), code: surchargeCode.trim(), invoiceInheritsFromOrder: surchargeVerified };
       } else delete nextOrders.shippingSurcharge;
       nextOrders.invoicePrepaymentVerified = prepaymentVerified;
+      if (productOnly && invoiceCreationTrigger === "legacy")
+        throw new Error("Chọn Invoice Creation Trigger trước khi bật Product-Only Invoicing");
+      // Written only when the mode is (or was) selected, so saving other settings never changes orders.
+      if (productOnly || orders?.productOnlyInvoicing === true) {
+        nextOrders.productOnlyInvoicing = productOnly;
+        nextOrders.paymentSource = "shopify";
+        for (const option of productOnlyOptions) nextOrders[option.key] = productOnlyFlags[option.key];
+      }
       if (JSON.stringify(nextOrders) !== JSON.stringify(orders ?? {})) await put("orders", nextOrders);
       setMessage("Đã lưu. Áp dụng cho cả các job đang chờ trong hàng đợi.");
       router.refresh();
@@ -138,6 +159,39 @@ export function SyncSettingsCard({
           </select>
           <p>Applies only to Shopify orders created after this trigger is enabled. Partial fulfillment and financial mismatches require manual review. Invoices deduct KiotViet stock.</p>
         </label>
+        <fieldset style={{ marginBottom: 12 }}>
+          <legend><strong>Product-Only Invoicing</strong></legend>
+          <label>
+            <input type="checkbox" checked={productOnly} onChange={(event) => setProductOnly(event.target.checked)} />{" "}
+            Hóa đơn KiotViet chỉ gồm giá trị sản phẩm (đã trừ giảm giá)
+          </label>
+          <br />
+          <small>
+            Lưu tại orders.productOnlyInvoicing. Phí vận chuyển, phí xử lý thanh toán, tiền tip và các khoản thu khác không đưa vào đơn/hóa đơn KiotViet;
+            chênh lệch so với tổng Shopify được ghi lại (không bao giờ đánh dấu là đã đối soát). Hóa đơn không bao giờ tạo thêm thanh toán;
+            đơn đã trả trước chỉ được tạo hóa đơn tự động khi tiền trả trước bằng đúng giá trị hóa đơn và đã có bằng chứng KiotViet kế thừa thanh toán.
+          </small>
+          {productOnly && (
+            <div style={{ marginTop: 8 }}>
+              <label style={{ display: "block" }}>
+                Nguồn xác nhận thanh toán{" "}
+                <select value="shopify" disabled>
+                  <option value="shopify">Shopify (paymentSource)</option>
+                </select>
+              </label>
+              {productOnlyOptions.map((option) => (
+                <label key={option.key} style={{ display: "block" }}>
+                  <input
+                    type="checkbox"
+                    checked={productOnlyFlags[option.key]}
+                    onChange={(event) => setProductOnlyFlags({ ...productOnlyFlags, [option.key]: event.target.checked })}
+                  />{" "}
+                  {option.label} <small>({option.key})</small>
+                </label>
+              ))}
+            </div>
+          )}
+        </fieldset>
         <label style={{ display: "block", marginBottom: 12 }}>
           <strong>Tiền tệ của giá trên KiotViet</strong>{" "}
           <input

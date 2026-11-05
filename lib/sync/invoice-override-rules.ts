@@ -16,6 +16,11 @@ export const OVERRIDABLE_INVOICE_WARNINGS: Readonly<Record<string, string>> = {
   // Manual single-order exception only: the invoice is sent with no additional
   // payment and is always stored as needs_review (inheritance is checked after the POST).
   prepayment_inheritance_unverified: "It is unverified whether the invoice inherits the KiotViet order prepayment",
+  // Product-Only payment cases outside the verified one; the invoice is sent with no payment
+  // and the remaining difference keeps it needs_review (never automatic).
+  prepayment_exceeds_invoice: "The KiotViet order prepayment is larger than the product-only invoice",
+  prepayment_below_invoice: "The KiotViet order prepayment is smaller than the product-only invoice",
+  kiotviet_payment_missing: "Shopify reports paid but the KiotViet order records no payment",
 };
 
 export function invoiceReasonCode(reason: string) {
