@@ -228,7 +228,7 @@ describe("settings", () => {
   it("turns every exclusion on when the mode is explicitly selected", () => {
     expect(productOnlyPolicy({ productOnlyInvoicing: true })).toEqual({
       enabled: true, paymentSource: "shopify", ignoreFinancialMismatch: true, excludeShipping: true, excludeProcessingFees: true, excludeOtherSurcharges: true,
-      allowUnverifiedPrepaymentInheritance: false, prepaymentExceedsInvoicePolicy: "block",
+      allowUnverifiedPrepaymentInheritance: false, prepaymentExceedsInvoicePolicy: "block", refundedItemsPolicy: "verify_unshipped",
     });
     expect(productOnlyPolicy({ productOnlyInvoicing: true, excludeShipping: false }).excludeShipping).toBe(false);
   });
@@ -825,5 +825,144 @@ describe("refunded-item quantity adjustments (Product-Only)", () => {
       const plan = await planInvoiceRecovery(TWO_LINES.orderId);
       expect((plan.action as { reasons: string[] }).reasons).toEqual(expect.arrayContaining([expect.stringContaining("refund_after_kiotviet_order: SKU 1082-B is 3")]));
     });
+  });
+});
+
+/**
+ * Merchant policy orders.refundedItemsPolicy = "refund_means_not_shipped".
+ * #1081 (7128306221240): SKUs, quantities, the E54 line item id and the totals (9 units,
+ * 325.20 → 297.20, E54 28.00) are from the incident; the per-SKU unit prices are illustrative
+ * values that add up to those totals (SKU 1331 carries a 4.00 discount: 2 × 31.60).
+ */
+describe("merchant policy: a refunded product is never shipped", () => {
+  const policySettings = { ...productOnlySettings, refundedItemsPolicy: "refund_means_not_shipped" as const };
+  const E54_LINE = 15977877045432;
+  const SHIPPED_1081: Fixture = {
+    orderId: "7128306221240", name: "#1081", kiotVietOrderId: 31200, kiotVietOrderCode: "DH031200", prepaid: 297.2, total: "344.96",
+    lines: [
+      { sku: "860", productId: 8600, quantity: 1, price: "39.00" },
+      { sku: "834", productId: 8340, quantity: 1, price: "32.00" },
+      { sku: "460", productId: 4600, quantity: 1, price: "26.00" },
+      { sku: "424", productId: 4240, quantity: 2, price: "24.50" },
+      { sku: "1331", productId: 13310, quantity: 2, price: "33.60", discount: "4.00" },
+      { sku: "E38", productId: 3800, quantity: 1, price: "45.00" },
+      { sku: "1241", productId: 12410, quantity: 1, price: "43.00" },
+    ],
+  };
+  const e54 = { id: E54_LINE, sku: "E54", quantity: 1, price: "28.00", title: "E54", current_quantity: 0, discount_allocations: [] };
+  const fee = { id: 999, sku: null, quantity: 1, price: "9.76", title: "SVC Fee - Credit Card Processing Fee" };
+  const e54Refund = { id: 9001, refund_line_items: [{ id: 7001, line_item_id: E54_LINE, quantity: 1, restock_type: "no_restock", subtotal: "28.00" }],
+    transactions: [{ kind: "refund", status: "success", amount: "28.00" }] };
+  /** Shopify's current #1081: everything fulfilled (E54 included), E54 refunded afterwards. */
+  const order1081 = (overrides: Partial<ShopifyOrderWebhook> = {}): ShopifyOrderWebhook => {
+    const base = shopifyOrder(SHIPPED_1081, { financial_status: "partially_refunded" });
+    const line_items = [...base.line_items, { ...e54 }, { ...fee }];
+    return { ...base, line_items, shipping_lines: [{ price: "10.00", discounted_price: "10.00" }], refunds: [e54Refund],
+      fulfillments: [{ id: 1, status: "success", line_items: line_items.filter((line) => line.sku).map((line) => ({ id: line.id, quantity: line.quantity })) }],
+      ...overrides };
+  };
+  const evaluate = (order: ShopifyOrderWebhook, settings: Record<string, unknown> = policySettings) => {
+    const prepared = prepareOrderForKiotViet(order, settings);
+    return { prepared, financials: evaluateInvoiceFinancials(order, prepared, settings) };
+  };
+
+  it("#1081: E54 (fulfilled, then refunded) is excluded: 9 units and 297.20 are sent", () => {
+    const { prepared, financials } = evaluate(order1081());
+    expect(prepared.lines.map(({ sku, quantity }) => `${sku}×${quantity}`)).toEqual(["860×1", "834×1", "460×1", "424×2", "1331×2", "E38×1", "1241×1"]);
+    expect(prepared.lines.reduce((sum, line) => sum + line.quantity, 0)).toBe(9);
+    expect(prepared.adjustments!.lines.get(String(E54_LINE))).toMatchObject({
+      sku: "E54", originalQuantity: 1, refundedQuantity: 1, fulfilledQuantity: 1, excludedQuantity: 1, remainingQuantity: 0, reason: "refunded_not_shipped" });
+    expect(financials).toMatchObject({ eligible: true, merchandiseTotal: 297.2, expectedPayment: 297.2, unitPrices: { "104": 31.6 } });
+    expect(financials.differences).toEqual(expect.arrayContaining([expect.objectContaining({ code: "cancelled_items_excluded", amount: 28 })]));
+    expect(financials.reasons).toEqual([]);
+  });
+
+  it("#1081 under the default policy still needs verification (the setting is what changes it)", () => {
+    expect(evaluate(order1081(), productOnlySettings).financials.reasons).toEqual(expect.arrayContaining([expect.stringContaining("refund_requires_verification: line item 15977877045432 (SKU E54)")]));
+  });
+
+  it.each([
+    [1, [1], 0],
+    [3, [1], 2],
+    [5, [2], 3],
+    [5, [1, 1], 3],
+  ])("ordered %i, refunded %j → %i sent, whatever the fulfillment and restock type", (ordered, refunds, expected) => {
+    const fixture: Fixture = { ...ORDER_1082, fee: undefined, lines: [{ sku: "A", productId: 1, quantity: ordered, price: "10.00" }, { sku: "B", productId: 2, quantity: 1, price: "5.00" }],
+      total: (ordered * 10 + 5).toFixed(2) };
+    const order = shopifyOrder(fixture, { financial_status: "partially_refunded",
+      refunds: refunds.map((quantity, index) => ({ id: 50 + index, refund_line_items: [{ id: 80 + index, line_item_id: 100, quantity, restock_type: index ? "return" : "no_restock", subtotal: (quantity * 10).toFixed(2) }],
+        transactions: [{ kind: "refund", status: "success", amount: (quantity * 10).toFixed(2) }] })),
+      fulfillments: [{ id: 1, status: "success", line_items: [{ id: 100, quantity: ordered }, { id: 101, quantity: 1 }] }] });
+    const { prepared, financials } = evaluate(order);
+    expect(prepared.lines.find((line) => line.sku === "A")?.quantity ?? 0).toBe(expected);
+    expect(prepared.lines.find((line) => line.sku === "B")?.quantity).toBe(1); // not refunded: stays
+    expect(financials).toMatchObject({ eligible: true, merchandiseTotal: expected * 10 + 5 });
+  });
+
+  it("counts repeated refund webhooks once (same refund id, or the same refund line item in two refunds)", () => {
+    const duplicateRefund = order1081({ refunds: [e54Refund, structuredClone(e54Refund)] });
+    // The same refund line item delivered again inside another refund record (no new money).
+    const sameItemTwice = order1081({ refunds: [e54Refund, { ...structuredClone(e54Refund), id: 9002, transactions: [] }] });
+    for (const order of [duplicateRefund, sameItemTwice]) {
+      const { prepared, financials } = evaluate(order);
+      expect(prepared.adjustments!.lines.get(String(E54_LINE))).toMatchObject({ refundedQuantity: 1, remainingQuantity: 0 });
+      expect(financials).toMatchObject({ eligible: true, merchandiseTotal: 297.2 });
+    }
+  });
+
+  it("never subtracts twice: current_quantity already reflects the refund", () => {
+    const order = order1081();
+    expect(order.line_items.find((line) => line.id === E54_LINE)?.current_quantity).toBe(0);
+    expect(evaluate(order).prepared.lines.reduce((sum, line) => sum + line.quantity, 0)).toBe(9);
+  });
+
+  it("a monetary-only refund removes no product", () => {
+    const moneyOnly = (amount: string) => {
+      const order = order1081({ refunds: [{ id: 9100, refund_line_items: [], transactions: [{ kind: "refund", status: "success", amount }] }] });
+      order.line_items.find((line) => line.id === E54_LINE)!.current_quantity = 1; // no product refunded
+      return evaluate(order);
+    };
+    const small = moneyOnly("10.00");
+    expect(small.prepared.lines.reduce((sum, line) => sum + line.quantity, 0)).toBe(10); // E54 included again
+    expect(small.financials).toMatchObject({ eligible: true, merchandiseTotal: 325.2 });
+    const large = moneyOnly("60.00");
+    expect(large.financials.reasons).toEqual([expect.stringContaining("refund_exceeds_excluded_charges")]);
+  });
+
+  it("still blocks invalid refund data and missing refund details", () => {
+    const tooMany = order1081({ refunds: [{ ...e54Refund, refund_line_items: [{ ...e54Refund.refund_line_items[0], quantity: 2 }] }] });
+    const invalid = evaluate(tooMany).financials.reasons.find((reason) => reason.startsWith("refund_data_invalid: line item 15977877045432 (SKU E54)"));
+    expect(invalid).toContain("refunded 2 of 1 ordered unit(s)");
+    const edited = order1081();
+    edited.line_items[0].current_quantity = 0; // 860 reduced without any refund
+    expect(evaluate(edited).financials.reasons).toEqual(expect.arrayContaining([expect.stringContaining("refund_data_invalid: line item 100 (SKU 860)")]));
+    expect(evaluate(order1081({ refunds: [] })).financials.reasons).toEqual(expect.arrayContaining([expect.stringContaining("refund_details_missing")]));
+  });
+
+  it("#1081 invoice: same 9 units for the invoice lines, expected total, payment check and stock movement", async () => {
+    mocks.evidence = carriedEvidence;
+    Object.assign(mocks.orderSettings, { invoicePrepaymentVerified: true, refundedItemsPolicy: "refund_means_not_shipped" });
+    use(SHIPPED_1081, { snapshot: order1081() });
+    const plan = await planInvoiceRecovery(SHIPPED_1081.orderId);
+    expect(plan.action).toMatchObject({ kind: "create_invoice", input: { totalPayment: 0 } });
+    const input = (plan.action as { input: { invoiceDetails: Array<{ quantity: number; price: number }> } }).input;
+    expect(input.invoiceDetails.reduce((sum, detail) => sum + detail.quantity, 0)).toBe(9);
+    expect(Math.round(input.invoiceDetails.reduce((sum, detail) => sum + detail.price * 100 * detail.quantity, 0))).toBe(29_720);
+    expect(plan.productOnly).toMatchObject({ invoiceMerchandise: 297.2, kiotVietPrepaid: 297.2,
+      lineAdjustments: [expect.objectContaining({ sku: "E54", excludedQuantity: 1, remainingQuantity: 0, reason: "refunded_not_shipped" })] });
+    await applyInvoiceRecovery(plan);
+    expect(mocks.invoice).toMatchObject({ status: "created", expected_total: "297.2", reconciliation: expect.objectContaining({ stockVerified: true }) });
+    expect(mocks.createInvoice).toHaveBeenCalledOnce();
+  });
+
+  it("an existing KiotViet order with E54 is never changed or re-invoiced: reconcile separately", async () => {
+    mocks.evidence = carriedEvidence;
+    Object.assign(mocks.orderSettings, { invoicePrepaymentVerified: true, refundedItemsPolicy: "refund_means_not_shipped" });
+    const withE54: Fixture = { ...SHIPPED_1081, prepaid: 325.2, lines: [...SHIPPED_1081.lines, { sku: "E54", productId: 5400, quantity: 1, price: "28.00" }] };
+    use(SHIPPED_1081, { snapshot: order1081(), kiotViet: kiotVietOrder(withE54) });
+    const plan = await planInvoiceRecovery(SHIPPED_1081.orderId);
+    expect((plan.action as { reasons: string[] }).reasons).toEqual(expect.arrayContaining([expect.stringContaining("refund_after_kiotviet_order: SKU E54 is 1")]));
+    await applyInvoiceRecovery(plan);
+    expect(mocks.createInvoice).not.toHaveBeenCalled();
   });
 });

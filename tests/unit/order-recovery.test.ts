@@ -374,3 +374,33 @@ describe("#1081: recovery uses Shopify's current state, not the stored webhook",
     expect(mocks.enqueue).not.toHaveBeenCalled();
   });
 });
+
+describe("#1081 dry run under the merchant policy (refund means not shipped)", () => {
+  // SKUs, quantities, E54 line item id and totals from #1081; unit prices illustrative.
+  const skus: Array<[number, string, number, string]> = [
+    [1, "860", 1, "39.00"], [2, "834", 1, "32.00"], [3, "460", 1, "26.00"], [4, "424", 2, "24.50"],
+    [5, "1331", 2, "31.60"], [6, "E38", 1, "45.00"], [7, "1241", 1, "43.00"], [15977877045432, "E54", 1, "28.00"],
+  ];
+  const storedPaid: ShopifyOrderWebhook = { id: 7128306221240, name: "#1081", financial_status: "paid", currency: "USD", total_price: "335.20",
+    line_items: skus.map(([id, sku, quantity, price]) => ({ id, sku, quantity, price, title: sku, name: sku })),
+    shipping_lines: [{ price: "10.00", discounted_price: "10.00" }] };
+  const now: ShopifyOrderWebhook = { ...structuredClone(storedPaid), financial_status: "partially_refunded",
+    line_items: storedPaid.line_items.map((line) => ({ ...line, current_quantity: line.sku === "E54" ? 0 : line.quantity })),
+    refunds: [{ id: 9001, refund_line_items: [{ id: 7001, line_item_id: 15977877045432, quantity: 1, restock_type: "no_restock", subtotal: "28.00" }],
+      transactions: [{ kind: "refund", status: "success", amount: "28.00" }] }],
+    fulfillments: [{ id: 1, status: "success", line_items: skus.map(([id, , quantity]) => ({ id, quantity })) }] };
+
+  it("plans 9 units and a 297.20 payment from Shopify's current state, without manual approval", async () => {
+    mocks.orderSettings = { invoiceCreationTrigger: "shopify_fulfilled", kiotVietCurrency: "USD", productOnlyInvoicing: true, refundedItemsPolicy: "refund_means_not_shipped" };
+    mocks.event = { id: "event-1081", payload: storedPaid };
+    mocks.current = now;
+    const plan = await planOrderRecovery(ORDER_ID);
+    expect(plan.action).toMatchObject({ kind: "requeue" });
+    expect(plan.current).toMatchObject({ financialStatus: "partially_refunded", paymentEligible: true, plannedPayment: 297.2 });
+    const output = describeRecoveryPlan(plan).join("\n");
+    expect(output).toContain("lines to send: 860×1, 834×1, 460×1, 424×2, 1331×2, E38×1, 1241×1");
+    expect(output).toContain("refunded line 15977877045432 SKU E54: ordered=1 refunded=1 excluded=1 remaining=0 fulfilled=1 (refunded_not_shipped");
+    expect(output).toContain("planned KiotViet totalPayment: 297.2");
+    expect(output).not.toContain("refund ambiguity");
+  });
+});

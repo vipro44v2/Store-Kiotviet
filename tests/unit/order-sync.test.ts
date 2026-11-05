@@ -1005,3 +1005,79 @@ describe("#1081: the worker creates KiotViet orders only from Shopify's current 
     expect(mocks.freshOrder).not.toHaveBeenCalled();
   });
 });
+
+describe("merchant policy (refund means not shipped): #1081 through the normal webhook pipeline", () => {
+  const policy = { invoiceCreationTrigger: "shopify_fulfilled", kiotVietCurrency: "USD", productOnlyInvoicing: true, refundedItemsPolicy: "refund_means_not_shipped" };
+  // SKUs, quantities, E54 line item id and totals from #1081; unit prices illustrative (sum 325.20 → 297.20).
+  const lines: Array<[number, string, number, string, string?]> = [
+    [1, "860", 1, "39.00"], [2, "834", 1, "32.00"], [3, "460", 1, "26.00"], [4, "424", 2, "24.50"],
+    [5, "1331", 2, "33.60", "4.00"], [6, "E38", 1, "45.00"], [7, "1241", 1, "43.00"], [15977877045432, "E54", 1, "28.00"],
+  ];
+  const order1081 = (): ShopifyOrderWebhook => order({
+    id: 7128306221240, name: "#1081", financial_status: "partially_refunded", currency: "USD", total_price: "344.96",
+    line_items: [
+      ...lines.map(([id, sku, quantity, price, discount]) => ({ id, sku, quantity, price, name: sku,
+        current_quantity: sku === "E54" ? 0 : quantity, discount_allocations: discount ? [{ amount: discount }] : [] })),
+      { id: 99, sku: null, quantity: 1, price: "9.76", title: "SVC Fee - Credit Card Processing Fee" },
+    ],
+    shipping_lines: [{ price: "10.00", discounted_price: "10.00" }],
+    refunds: [{ id: 9001, refund_line_items: [{ id: 7001, line_item_id: 15977877045432, quantity: 1, restock_type: "no_restock", subtotal: "28.00" }],
+      transactions: [{ kind: "refund", status: "success", amount: "28.00" }] }],
+    fulfillments: [{ id: 1, status: "success", line_items: lines.map(([id, , quantity]) => ({ id, quantity })) }],
+  });
+  beforeEach(() => {
+    mocks.db.orders = { ...mocks.db.orders, ...policy };
+    mocks.ensureMapping.mockImplementation(async (sku: string) => ({ kiotviet_product_id: String(1000 + sku.length * 7 + sku.charCodeAt(0)) }));
+  });
+
+  it("creates the KiotViet order with exactly the 9 non-refunded units and pays 297.20", async () => {
+    await syncShopifyOrder(order1081());
+    const input = mocks.createOrder.mock.calls[0][0];
+    expect(input.orderDetails.map((detail: { productCode: string; quantity: number }) => `${detail.productCode}×${detail.quantity}`))
+      .toEqual(["860×1", "834×1", "460×1", "424×2", "1331×2", "E38×1", "1241×1"]);
+    expect(input.orderDetails.reduce((sum: number, detail: { quantity: number }) => sum + detail.quantity, 0)).toBe(9);
+    expect(input.orderDetails.find((detail: { productCode: string }) => detail.productCode === "1331")).toMatchObject({ price: 31.6, discount: 0 });
+    // Integer cents: Σ price × quantity of the sent lines equals the payment.
+    const linesCents = input.orderDetails.reduce((sum: number, detail: { price: number; quantity: number }) => sum + Math.round(detail.price * 100) * detail.quantity, 0);
+    expect(linesCents).toBe(29_720);
+    expect(input.totalPayment).toBe(297.2);
+    expect(input).not.toHaveProperty("surchages");
+  });
+
+  it("logs the excluded SKU, quantity and refund amount (no manual approval needed)", async () => {
+    await syncShopifyOrder(order1081());
+    expect(mocks.log).toHaveBeenCalledWith("info", "Shopify order amounts adjusted for KiotViet", expect.objectContaining({
+      lineAdjustments: [expect.objectContaining({ sku: "E54", originalQuantity: 1, excludedQuantity: 1, remainingQuantity: 0,
+        fulfilledQuantity: 1, reason: "refunded_not_shipped", excludedRefundSubtotal: 28 })],
+    }));
+  });
+
+  it("repeated webhooks create one KiotViet order", async () => {
+    await syncShopifyOrder(order1081());
+    await syncShopifyOrder(order1081(), { jobType: "shopify_order_update" });
+    const duplicateRefund = order1081();
+    duplicateRefund.refunds = [...duplicateRefund.refunds!, structuredClone(duplicateRefund.refunds![0])];
+    await syncShopifyOrder(duplicateRefund, { jobType: "shopify_order_update" });
+    expect(mocks.createOrder).toHaveBeenCalledOnce();
+  });
+
+  it("ordered 1, refunded 1 (already shipped and returned): nothing to send, no KiotViet order", async () => {
+    // Still partially_refunded because the shipping was not refunded.
+    await expect(syncShopifyOrder(order({ id: 5100, financial_status: "partially_refunded", total_price: "160000",
+      line_items: [{ id: 11, sku: "NU012", quantity: 1, price: "150000", name: "Áo thun", current_quantity: 0 }],
+      shipping_lines: [{ price: "10000", discounted_price: "10000" }],
+      refunds: [{ id: 1, refund_line_items: [{ id: 2, line_item_id: 11, quantity: 1, restock_type: "return" }], transactions: [{ kind: "refund", status: "success", amount: "150000" }] }],
+      fulfillments: [{ status: "success", line_items: [{ id: 11, quantity: 1 }] }],
+    }))).resolves.toEqual({ action: "skipped", reason: "all_items_cancelled" });
+    expect(mocks.createOrder).not.toHaveBeenCalled();
+  });
+
+  it("still blocks invalid refund data with an actionable reason", async () => {
+    const invalid = order1081();
+    invalid.refunds![0].refund_line_items![0].quantity = 2;
+    await expect(syncShopifyOrder(invalid)).rejects.toBeInstanceOf(ConflictError);
+    expect(mocks.createOrder).not.toHaveBeenCalled();
+    expect(mocks.db.rows.get("7128306221240")).toMatchObject({ sync_status: "manual_review", failure_stage: "refund_adjustments",
+      last_error: expect.stringContaining("refund_data_invalid: line item 15977877045432 (SKU E54)") });
+  });
+});

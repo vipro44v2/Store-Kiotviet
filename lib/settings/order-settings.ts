@@ -28,6 +28,8 @@ export const ordersSettingsSchema = z
     acknowledgeUnverifiedPrepaymentRisk: z.boolean().optional(),
     // KiotViet prepayment larger than the product-only invoice (e.g. #1071): never automatic.
     prepaymentExceedsInvoicePolicy: z.enum(["block", "manual_override"]).optional(),
+    // Product-Only: how refunded product units are treated (lib/sync/product-only-invoicing.ts).
+    refundedItemsPolicy: z.enum(["verify_unshipped", "refund_means_not_shipped"]).optional(),
   })
   .passthrough()
   .refine(

@@ -168,8 +168,9 @@ export function prepareOrderForKiotViet(
   const { purchased, fees } = partitionOrderLines(order, settings);
   // Product-Only: units of confirmed cancelled refunds are not merchandise. Ambiguous
   // refunds keep the original quantity here; their reasons block invoicing later.
-  const adjustments = productOnlyPolicy(settings).enabled
-    ? computeRefundAdjustments(order, purchased.map(({ line }) => line))
+  const policy = productOnlyPolicy(settings);
+  const adjustments = policy.enabled
+    ? computeRefundAdjustments(order, purchased.map(({ line }) => line), { refundMeansNotShipped: policy.refundedItemsPolicy === "refund_means_not_shipped" })
     : undefined;
   const remaining = (line: ShopifyOrderLineItem) => adjustments?.lines.get(String(line.id))?.remainingQuantity ?? Number(line.quantity);
   const lines = purchased.filter(({ line }) => !adjustments || remaining(line) > 0).map(({ line, index }) => {
@@ -304,6 +305,9 @@ export async function withFreshShopifyState(order: ShopifyOrderWebhook): Promise
 
 /** Actionable manual-review text for refunds that cannot be tied to cancelled, unshipped units. */
 export function refundReviewMessage(order: ShopifyOrderWebhook, ambiguous: string[]) {
+  if (ambiguous.every((reason) => reason.startsWith("refund_data_invalid")))
+    return `${ambiguous.join("; ")}. No KiotViet order was created. The refund data is inconsistent (more units refunded than ordered, or quantities changed outside a refund): ` +
+      `check the order in Shopify; the order is created automatically once the refunds are consistent`;
   return `${ambiguous.join("; ")}. No KiotViet order was created. Check in Shopify whether these units were shipped or returned: ` +
     `units never shipped should be refunded with "Restock: cancel"; shipped or returned units must be handled in KiotViet ` +
     `(create the order there with description "Shopify ${order.name} (${order.id})" and link it with scripts/recover-shopify-order-sync.ts --link-kiotviet-order)`;

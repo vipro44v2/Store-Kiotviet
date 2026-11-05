@@ -12,7 +12,7 @@ interface InvoiceOrder {
     variant: { id: string; product: { id: string } } | null; originalUnitPriceSet: Money;
     discountAllocations: Array<{ allocatedAmountSet: Money }>; taxLines: Array<{ priceSet: Money }> }>;
   shippingLines: Connection<{ discountedPriceSet: Money; taxLines: Array<{ priceSet: Money }> }>;
-  refunds: Array<{ id: string; refundLineItems: Connection<{ quantity: number; restockType?: string | null; lineItem: { id: string }; subtotalSet?: Money | null }>;
+  refunds: Array<{ id: string; refundLineItems: Connection<{ id?: string; quantity: number; restockType?: string | null; lineItem: { id: string }; subtotalSet?: Money | null }>;
     transactions: Connection<{ kind: string; status: string; amountSet: Money }> }>;
   fulfillments?: Array<{ id: string; status: string }>;
 }
@@ -42,7 +42,7 @@ export async function getInvoiceOrder(orderId: string): Promise<ShopifyOrderWebh
   const refunds: InvoiceOrder["refunds"] = [];
   for (const reference of order.refunds) {
     const { refund } = await shopifyGraphql<{ refund: InvoiceOrder["refunds"][number] | null }>(      `query InvoiceRefund($id:ID!){refund(id:$id){id
-        refundLineItems(first:100){pageInfo{hasNextPage} nodes{quantity restockType lineItem{id} subtotalSet{shopMoney{amount}}}}
+        refundLineItems(first:100){pageInfo{hasNextPage} nodes{id quantity restockType lineItem{id} subtotalSet{shopMoney{amount}}}}
         transactions(first:100){pageInfo{hasNextPage} nodes{kind status amountSet{shopMoney{amount}}}}
       }}`, { id: reference.id });
     if (!refund) throw new PermanentError("invoice_snapshot_incomplete: refund missing");
@@ -83,7 +83,7 @@ export async function getInvoiceOrder(orderId: string): Promise<ShopifyOrderWebh
     shipping_lines: order.shippingLines.nodes.map(s => ({ discounted_price: s.discountedPriceSet.shopMoney.amount,
       tax_lines: s.taxLines.map(t => ({ price: t.priceSet.shopMoney.amount })) })),
     refunds: refunds.map(r => ({ id: numericId(r.id),
-      refund_line_items: r.refundLineItems.nodes.map(l => ({ line_item_id: numericId(l.lineItem.id), quantity: l.quantity,
+      refund_line_items: r.refundLineItems.nodes.map(l => ({ ...(l.id ? { id: numericId(l.id) } : {}), line_item_id: numericId(l.lineItem.id), quantity: l.quantity,
         ...(l.restockType ? { restock_type: l.restockType.toLowerCase() } : {}),
         ...(l.subtotalSet ? { subtotal: l.subtotalSet.shopMoney.amount } : {}) })),
       transactions: r.transactions.nodes.map(t => ({ kind: t.kind.toLowerCase(), status: t.status.toLowerCase(), amount: t.amountSet.shopMoney.amount })) })),

@@ -59,6 +59,13 @@ export interface OrderSettings {
   unverifiedPrepaymentAcceptedBy?: string;
   /** block (default): never invoiced; manual_override: admin override per order (stays needs_review). */
   prepaymentExceedsInvoicePolicy?: "block" | "manual_override";
+  /**
+   * Product-Only, merchant business policy for refunded product units:
+   * - verify_unshipped (default): excluded only when Shopify proves they were never shipped;
+   * - refund_means_not_shipped: this merchant never ships a refunded product, so every refunded
+   *   unit is excluded regardless of fulfillment or restock type (no manual approval).
+   */
+  refundedItemsPolicy?: "verify_unshipped" | "refund_means_not_shipped";
   [key: string]: unknown;
 }
 

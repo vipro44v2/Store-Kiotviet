@@ -28,6 +28,8 @@ export interface ProductOnlyPolicy {
   /** Exact prepayment may be invoiced before inheritance is proven (checked after creation). */
   allowUnverifiedPrepaymentInheritance: boolean;
   prepaymentExceedsInvoicePolicy: "block" | "manual_override";
+  /** Merchant policy for refunded product units (orders.refundedItemsPolicy). */
+  refundedItemsPolicy: "verify_unshipped" | "refund_means_not_shipped";
 }
 
 export function productOnlyPolicy(settings: OrderSettings): ProductOnlyPolicy {
@@ -45,6 +47,7 @@ export function productOnlyPolicy(settings: OrderSettings): ProductOnlyPolicy {
     allowUnverifiedPrepaymentInheritance: enabled && settings.allowUnverifiedPrepaymentInheritance === true &&
       settings.acknowledgeUnverifiedPrepaymentRisk === true,
     prepaymentExceedsInvoicePolicy: settings.prepaymentExceedsInvoicePolicy === "manual_override" ? "manual_override" : "block",
+    refundedItemsPolicy: settings.refundedItemsPolicy === "refund_means_not_shipped" ? "refund_means_not_shipped" : "verify_unshipped",
   };
 }
 
@@ -80,7 +83,7 @@ export interface LineAdjustment {
   remainingQuantity: number;
   /** Successfully fulfilled units, or null when Shopify did not provide fulfillments. */
   fulfilledQuantity: number | null;
-  reason: "unchanged" | "cancelled_refund" | "requires_verification";
+  reason: "unchanged" | "cancelled_refund" | "refunded_not_shipped" | "requires_verification" | "invalid_refund_data";
   detail: string;
   /** Shopify's refunded subtotal for the excluded units (after discounts), in cents. */
   excludedRefundSubtotalCents: number;
@@ -110,18 +113,25 @@ const UNIT_NO_RESTOCK = new Set(["no_restock"]);
  * original − refunded, otherwise (e.g. an order edit removed units) it is ambiguous.
  * Refunds are de-duplicated by id, so repeated refund events count once.
  * An ambiguous line keeps its original quantity; the reasons block invoicing.
+ *
+ * Merchant policy orders.refundedItemsPolicy = "refund_means_not_shipped" (this merchant
+ * never ships a refunded product): every refunded unit is excluded, effectiveQuantity =
+ * originalQuantity − refundedQuantity, whatever the fulfillment or restock type. Only invalid
+ * refund data (more refunded than ordered, current_quantity inconsistent) still blocks.
  */
 export function computeRefundAdjustments(
   order: Pick<ShopifyOrderWebhook, "refunds" | "fulfillments">,
   productLines: ShopifyOrderLineItem[],
+  options: { refundMeansNotShipped?: boolean } = {},
 ): RefundAdjustments {
   const refundLines = new Map<string, Array<{ quantity: number; type: string; subtotalCents: number }>>();
   const seenRefunds = new Set<string>();
+  // Refund line item ids are unique across refunds: the same item delivered twice counts once.
+  const seenItems = new Set<string>();
   for (const refund of order.refunds ?? []) {
     const refundKey = String(refund?.id ?? "");
     if (refundKey && seenRefunds.has(refundKey)) continue;
     if (refundKey) seenRefunds.add(refundKey);
-    const seenItems = new Set<string>();
     for (const item of refund?.refund_line_items ?? []) {
       const quantity = Number(item?.quantity);
       if (!Number.isSafeInteger(quantity) || quantity <= 0) continue;
@@ -157,10 +167,26 @@ export function computeRefundAdjustments(
     const base = { lineItemId: key, sku: line.sku ?? null, originalQuantity: original, refundedQuantity: refunded, fulfilledQuantity };
     const keep = (reason: LineAdjustment["reason"], detail: string): LineAdjustment =>
       ({ ...base, excludedQuantity: 0, remainingQuantity: original, reason, detail, excludedRefundSubtotalCents: 0 });
-    const problems: string[] = [];
+    // Invalid refund data blocks under every policy (the base is never current_quantity).
+    const invalid: string[] = [];
     if (line.current_quantity != null && Number(line.current_quantity) !== original - refunded)
-      problems.push(`current quantity ${line.current_quantity} is not ordered ${original} − refunded ${refunded} (units removed outside a refund, e.g. an order edit)`);
-    if (refunded > original) problems.push(`refunded ${refunded} of ${original} ordered unit(s)`);
+      invalid.push(`current quantity ${line.current_quantity} is not ordered ${original} − refunded ${refunded} (units removed outside a refund, e.g. an order edit)`);
+    if (refunded > original) invalid.push(`refunded ${refunded} of ${original} ordered unit(s)`);
+    if (options.refundMeansNotShipped) {
+      // Merchant policy: a refunded product is never shipped, so every refunded unit is
+      // excluded whatever its fulfillment or restock type; no manual approval.
+      if (invalid.length) {
+        ambiguous.push(`refund_data_invalid: line item ${key}${line.sku ? ` (SKU ${line.sku})` : ""}: ${invalid.join("; ")}`);
+        lines.set(key, keep("invalid_refund_data", invalid.join("; ")));
+      } else if (refunded === 0) lines.set(key, keep("unchanged", "no refunded units"));
+      else lines.set(key, {
+        ...base, excludedQuantity: refunded, remainingQuantity: original - refunded, reason: "refunded_not_shipped",
+        detail: `${refunded} unit(s) refunded; merchant policy: refunded products are not shipped (fulfilled ${fulfilledQuantity ?? "n/a"})`,
+        excludedRefundSubtotalCents: refunds.reduce((total, item) => total + item.subtotalCents, 0),
+      });
+      continue;
+    }
+    const problems = [...invalid];
     if (other > 0) problems.push(`${other} unit(s) refunded as return/restock (delivered or unknown); use the KiotViet return workflow`);
     if (noRestock > 0 && fulfilledQuantity === null) problems.push(`${noRestock} unit(s) refunded without restock and no fulfillment data proves they were not shipped`);
     if (fulfilledQuantity !== null && fulfilledQuantity > original - cancelled - noRestock)

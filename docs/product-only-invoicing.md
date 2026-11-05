@@ -37,6 +37,24 @@ The server records `unverifiedPrepaymentAcceptedBy/At` (the browser cannot set t
 | money refunded with no refund line items | no quantity change; if it exceeds the excluded charges and cancelled units → `refund_exceeds_excluded_charges` |
 | `current_quantity` ≠ ordered − refunded (e.g. units removed by an order edit) | `refund_requires_verification` (blocked) |
 
+**Merchant policy: refund means not shipped** (`orders.refundedItemsPolicy = "refund_means_not_shipped"`, Admin → Settings → Product-Only → *Sản phẩm đã hoàn tiền*).
+
+This is a merchant-specific business rule, not Shopify semantics: this merchant never ships a refunded product. With it selected:
+
+- **Quantity:** `effectiveQuantity = originalQuantity − refundedQuantity` for every line. Fulfilled status, restock type and tracking are ignored, and no manual approval is needed. Examples: 1 − 1 → 0 (line left out), 3 − 1 → 2, 5 − 2 → 3.
+- **Deduplication:** refunds are de-duplicated by refund id, and refund line items by their id (also across refunds). The base is the original quantity, never `current_quantity`.
+- **Monetary-only refunds** (no refund line items) never remove products.
+- **Still blocked** (`refund_data_invalid`, `refund_exceeds_excluded_charges`, `refund_details_missing`): more units refunded than ordered, `current_quantity` inconsistent with the refunds, money refunded beyond the excluded charges and refunded units, or a partially refunded order without refund details.
+- **One amount everywhere:** `merchandiseTotal = Σ effectiveQuantity × original discounted unit price` (integer cents). The same lines and amounts drive KiotViet `orderDetails`, `totalPayment`, the invoice lines and expected total, and the stock-movement check.
+- **Logging:** the order-creation log lists each excluded SKU with original, excluded and remaining quantity, fulfilled quantity and the refunded amount (`lineAdjustments`).
+- **Existing KiotViet orders and invoices** are never changed; a later refund is `refund_after_kiotviet_order` plus the dry-run `RECONCILE` report.
+
+The default (`verify_unshipped`, also when the key is absent) keeps the conservative rule in the table above. Enable the policy in Admin, or, if configuration is managed in SQL:
+
+```sql
+UPDATE system_settings SET value = value || '{"refundedItemsPolicy":"refund_means_not_shipped"}'::jsonb, updated_at = now() WHERE key = 'orders';
+```
+
 - **Base quantity:** always the original `quantity`. `current_quantity` is only a cross-check, so a cancellation is never subtracted twice.
 - **Repeated refunds:** de-duplicated by id, in both quantity and money.
 - **Ambiguous lines:** keep their original quantity.

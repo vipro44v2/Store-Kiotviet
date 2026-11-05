@@ -167,7 +167,8 @@ export function evaluateProductOnlyFinancials(
   // The discounted unit price always comes from the ORIGINAL quantity, so a cancelled unit takes
   // its own share of the line discount with it and nothing is shifted onto the remaining units.
   const originalLines = prepared.originalLines ?? prepared.lines.map(({ line }) => line);
-  const adjustments = prepared.adjustments ?? computeRefundAdjustments(order, originalLines);
+  const adjustments = prepared.adjustments ?? computeRefundAdjustments(order, originalLines,
+    { refundMeansNotShipped: policy.refundedItemsPolicy === "refund_means_not_shipped" });
   let merchandiseCents = 0, originalMerchandiseCents = 0, productTaxCents = 0;
   const unitPrices: Record<string, number> = {};
   for (const line of originalLines) {

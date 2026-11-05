@@ -71,6 +71,7 @@ export function SyncSettingsCard({
   const [allowUnverified, setAllowUnverified] = useState(orders?.allowUnverifiedPrepaymentInheritance === true);
   // Already accepted settings stay accepted; a new enablement needs a fresh confirmation.
   const [riskConfirmed, setRiskConfirmed] = useState(orders?.allowUnverifiedPrepaymentInheritance === true && orders?.acknowledgeUnverifiedPrepaymentRisk === true);
+  const [refundedItemsPolicy, setRefundedItemsPolicy] = useState(orders?.refundedItemsPolicy === "refund_means_not_shipped" ? "refund_means_not_shipped" : "verify_unshipped");
   const [overpaymentPolicy, setOverpaymentPolicy] = useState(orders?.prepaymentExceedsInvoicePolicy === "manual_override" ? "manual_override" : "block");
   const [productOnlyFlags, setProductOnlyFlags] = useState(() =>
     Object.fromEntries(productOnlyOptions.map((option) => [option.key, orders?.[option.key] !== false])) as Record<ProductOnlyFlag, boolean>);
@@ -120,6 +121,7 @@ export function SyncSettingsCard({
         if (enableUnverified) nextOrders.acknowledgeUnverifiedPrepaymentRisk = true;
         else delete nextOrders.acknowledgeUnverifiedPrepaymentRisk;
         nextOrders.prepaymentExceedsInvoicePolicy = overpaymentPolicy;
+        nextOrders.refundedItemsPolicy = refundedItemsPolicy;
       }
       if (JSON.stringify(nextOrders) !== JSON.stringify(orders ?? {})) await put("orders", nextOrders);
       setMessage("Đã lưu. Áp dụng cho cả các job đang chờ trong hàng đợi.");
@@ -223,6 +225,19 @@ export function SyncSettingsCard({
                   <small>Đã bật bởi {String(orders.unverifiedPrepaymentAcceptedBy ?? "?")} lúc {String(orders.unverifiedPrepaymentAcceptedAt ?? "?")}.</small>
                 )}
               </fieldset>
+              <label style={{ display: "block", marginTop: 8 }}>
+                Sản phẩm đã hoàn tiền{" "}
+                <select value={refundedItemsPolicy} onChange={(event) => setRefundedItemsPolicy(event.target.value)}>
+                  <option value="verify_unshipped">Chỉ loại khi Shopify chứng minh chưa giao (mặc định)</option>
+                  <option value="refund_means_not_shipped">Hoàn tiền = không giao hàng: luôn loại số lượng đã hoàn (chính sách cửa hàng)</option>
+                </select>
+                <br />
+                <small>
+                  Lưu tại orders.refundedItemsPolicy. &ldquo;Hoàn tiền = không giao hàng&rdquo;: số lượng gửi KiotViet = số lượng đặt − số lượng đã hoàn tiền, kể cả khi
+                  sản phẩm đã Fulfilled, không cần duyệt thủ công. Hoàn tiền chỉ bằng tiền (không có sản phẩm) không bao giờ làm giảm số lượng; dữ liệu hoàn tiền
+                  không hợp lệ vẫn bị chặn. Đơn/hóa đơn KiotViet đã tạo không bao giờ bị sửa tự động.
+                </small>
+              </label>
               <label style={{ display: "block", marginTop: 8 }}>
                 Tiền trả trước lớn hơn hóa đơn sản phẩm (đơn cũ, ví dụ #1071){" "}
                 <select value={overpaymentPolicy} onChange={(event) => setOverpaymentPolicy(event.target.value)}>
